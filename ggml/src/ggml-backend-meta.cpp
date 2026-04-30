@@ -871,6 +871,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_RESHAPE: {
                 split_state = handle_reshape(src_ss);
             } break;
+            case GGML_OP_TURBO_WHT: {
+                split_state = handle_reshape(src_ss);
+            } break;
             case GGML_OP_VIEW: {
                 split_state = handle_view(src_ss);
             } break;
