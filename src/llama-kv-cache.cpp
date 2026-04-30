@@ -304,6 +304,21 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
         }
+
+        // ------ SWA KV Cache type override ------
+        if (hparams.is_swa(il)) {
+            layer_type_k = GGML_TYPE_BF16; 
+            layer_type_v = GGML_TYPE_BF16; 
+
+            // Log to see if its working
+            static bool logged_swa = false;
+            if (!logged_swa) {
+                LLAMA_LOG_INFO("%s: SWA detected - forcing SWA layer KV caches to BF16\n", __func__);
+                logged_swa = true;
+            }
+        }
+        // -----------------------------------------
+
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
         const bool k_is_turbo = (layer_type_k == GGML_TYPE_TURBO3_0 || layer_type_k == GGML_TYPE_TURBO4_0 || layer_type_k == GGML_TYPE_TURBO2_0);
