@@ -307,8 +307,8 @@ llama_kv_cache::llama_kv_cache(
 
         // ------ SWA KV Cache type override ------
         if (hparams.is_swa(il)) {
-            layer_type_k = GGML_TYPE_BF16; 
-            layer_type_v = GGML_TYPE_BF16; 
+            layer_type_k = GGML_TYPE_Q8_0; 
+            layer_type_v = GGML_TYPE_Q8_0; 
 
             // Log to see if its working
             static bool logged_swa = false;
