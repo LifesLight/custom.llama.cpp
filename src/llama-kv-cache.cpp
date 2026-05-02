@@ -123,12 +123,6 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    // Auto-asymmetric: when symmetric turbo K+V is requested and the model has
-    // high GQA ratio (few KV heads serving many Q heads), upgrade K to q8_0.
-    // Turbo K quantization error gets amplified by the GQA broadcast factor.
-    // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
-    // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
-    // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
     {
         const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
         if (k_is_turbo) {
@@ -151,7 +145,6 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
             return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
@@ -159,12 +152,10 @@ llama_kv_cache::llama_kv_cache(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
-    // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
                 /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 3)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
@@ -195,7 +186,6 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
-    // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 
     if (n_stream > 1) {
@@ -217,9 +207,9 @@ llama_kv_cache::llama_kv_cache(
     // FIRST_N_FULL / LAST_N_FULL / FULL_KV_TYPE  →  override first/last N full-attn layers
     // FIRST_N_SWA  / LAST_N_SWA  / SWA_KV_TYPE   →  override first/last N SWA layers
     //
-    // FULL_KV_TYPE / SWA_KV_TYPE accept either a single type (applied to both K and V)
-    // or "ktype,vtype" for asymmetric K/V (e.g. "q8_0,turbo2").
-    // Valid type names: q4_0 q5_0 q8_0 f16 bf16 f32 turbo2 turbo3 turbo4
+    // FULL_KV_TYPE / SWA_KV_TYPE accept either a single type (both K and V) or
+    // "ktype,vtype" for asymmetric K/V (e.g. "q8_0,turbo4").
+    // Valid type names: q8_0  f16  bf16  turbo2  turbo3  turbo4
     // Layers outside the first/last ranges keep the globally selected type_k/type_v.
     // ---------------------------------------------------------------------------------
     auto kv_parse_one_type = [](const char * s, ggml_type fallback) -> ggml_type {
@@ -280,7 +270,6 @@ llama_kv_cache::llama_kv_cache(
         else                    full_layer_ids.push_back(il);
     }
 
-    // Build per-layer-index bool: is this layer inside the override range?
     std::vector<bool> ovr_apply_full(hparams.n_layer, false);
     std::vector<bool> ovr_apply_swa (hparams.n_layer, false);
     for (int i = 0; i < (int)full_layer_ids.size(); ++i) {
@@ -309,9 +298,11 @@ llama_kv_cache::llama_kv_cache(
             ggml_type_name(ovr_swa_type_k), ggml_type_name(ovr_swa_type_v));
     }
 
-    // Accumulate per-layer info for the pretty-print after the loop
-    struct LayerKVInfo { uint32_t il; bool is_swa; ggml_type tk; ggml_type tv; };
+    // seq = nth-of-type index (1-based), used in the pretty-print table
+    struct LayerKVInfo { uint32_t il; uint32_t seq; bool is_swa; ggml_type tk; ggml_type tv; };
     std::vector<LayerKVInfo> layer_kv_log;
+    uint32_t full_seq_ctr = 0;
+    uint32_t swa_seq_ctr  = 0;
     // ---- End per-layer KV type override setup ---------------------------------------
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
@@ -371,8 +362,8 @@ llama_kv_cache::llama_kv_cache(
         // Per-layer KV type: start from global type, apply env-var range overrides.
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
+        const bool is_swa_layer = hparams.is_swa(il);
         {
-            const bool is_swa_layer = hparams.is_swa(il);
             if (is_swa_layer && ovr_apply_swa[il]) {
                 layer_type_k = ovr_swa_type_k;
                 layer_type_v = ovr_swa_type_v;
@@ -382,8 +373,11 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // Record for pretty-print
-        layer_kv_log.push_back({il, hparams.is_swa(il), layer_type_k, layer_type_v});
+        // Record for pretty-print: seq is 1-based nth-of-type index
+        {
+            uint32_t seq = is_swa_layer ? ++swa_seq_ctr : ++full_seq_ctr;
+            layer_kv_log.push_back({il, seq, is_swa_layer, layer_type_k, layer_type_v});
+        }
 
         // For turbo types, pad K head_dim to next multiple of 128 for full WHT groups
         uint32_t n_embd_k_gqa_eff = n_embd_k_gqa;
@@ -434,30 +428,31 @@ llama_kv_cache::llama_kv_cache(
         if (turbo_rotation == nullptr &&
             (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0)) {
             turbo_rotation = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
-            ggml_format_name(turbo_rotation, "turbo_rotation");  // R^T
+            ggml_format_name(turbo_rotation, "turbo_rotation");
             turbo_rotation_inv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 128);
-            ggml_format_name(turbo_rotation_inv, "turbo_rotation_inv");  // R
+            ggml_format_name(turbo_rotation_inv, "turbo_rotation_inv");
 
-            // InnerQ: per-channel scale_inv tensor (128 floats, initialized to all 1.0)
             turbo_innerq_scale_inv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, INNERQ_MAX_CHANNELS);
             ggml_format_name(turbo_innerq_scale_inv, "turbo_innerq_scale_inv");
         }
     }
 
-    // Pretty-print per-layer KV type assignments
+    // Pretty-print per-layer KV type assignments.
+    // # = nth layer of that attention type (1-based), l = absolute layer index.
     {
         LLAMA_LOG_INFO("%s: KV cache layer types:\n", __func__);
-        LLAMA_LOG_INFO("%s:   ┌────────┬────────┬────────────┬────────────┐\n", __func__);
-        LLAMA_LOG_INFO("%s:   │ layer  │  attn  │   K-type   │   V-type   │\n", __func__);
-        LLAMA_LOG_INFO("%s:   ├────────┼────────┼────────────┼────────────┤\n", __func__);
+        LLAMA_LOG_INFO("%s:   ┌──────┬────────┬────────┬────────────┬────────────┐\n", __func__);
+        LLAMA_LOG_INFO("%s:   │  #   │  l=    │  attn  │   K-type   │   V-type   │\n", __func__);
+        LLAMA_LOG_INFO("%s:   ├──────┼────────┼────────┼────────────┼────────────┤\n", __func__);
         for (auto & info : layer_kv_log) {
-            LLAMA_LOG_INFO("%s:   │  %4u  │  %4s  │ %10s │ %10s │\n", __func__,
+            LLAMA_LOG_INFO("%s:   │ %3u  │  %4u  │  %4s  │ %10s │ %10s │\n", __func__,
+                info.seq,
                 info.il,
                 info.is_swa ? "SWA" : "FULL",
                 ggml_type_name(info.tk),
                 ggml_type_name(info.tv));
         }
-        LLAMA_LOG_INFO("%s:   └────────┴────────┴────────────┴────────────┘\n", __func__);
+        LLAMA_LOG_INFO("%s:   └──────┴────────┴────────┴────────────┴────────────┘\n", __func__);
     }
 
     if (reuse) {
@@ -488,12 +483,12 @@ llama_kv_cache::llama_kv_cache(
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
         if (model.hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+                t->buffer = buf;
             }
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
@@ -503,19 +498,11 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
 
-        // Fill turbo rotation matrices AFTER buffer clear (clear zeroes everything)
         if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr && !model.hparams.no_alloc) {
             #include "turbo-rotation-data.h"
-            // ggml is column-major; C arrays are row-major. Storing a row-major matrix
-            // into ggml implicitly transposes it. ggml_mul_mat(A, x) computes A^T @ x.
-            // To get R @ q: store R^T → ggml sees (R^T)^T_col = R → mul_mat gives R @ q. Wait no —
-            // store R so ggml col-major reads it as R^T, then mul_mat gives (R^T)^T = R. ✓
-            // Store R for Q forward rotation, R^T for V inverse rotation
-            // ggml_mul_mat(A,x) computes A@x for row-major stored A (verified by test)
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
 
-            // Initialize InnerQ scale_inv to all 1.0 (identity scaling)
             if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
                 float ones[INNERQ_MAX_CHANNELS];
                 for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
@@ -537,48 +524,12 @@ llama_kv_cache::llama_kv_cache(
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
-    // TurboQuant: master's #21038 attention rotation is OFF by default on this
-    // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
-    // LLAMA_ATTN_ROT_V_OVERRIDE=1 if your specific model+KV combo benefits.
-    //
-    // Why default OFF: empirical PPL+KLD testing on 7 model families
-    // (gemma-4 26B-A4B/31B/E2B, Qwen2.5-7B, Qwen3.5-2B, Mistral-Small-24B,
-    // phi-4, on q8/turbo4 KV) showed the optimal rotation policy is highly
-    // model-and-quant specific:
-    //
-    //   • gemma-4 31B Q8 q8/turbo4: V-only rotation gives -43% PPL (huge win).
-    //   • gemma-4 26B-A4B Q8 q8/turbo4: V-only gives -3.9%.
-    //   • gemma-4 E2B Q4_K_L q8/turbo4: V-only HURTS by +6.7%.
-    //   • phi-4 Q8 q8/turbo4: V-side rotation crashes (graph hash overflow).
-    //   • Qwen2.5/3.5/Mistral: rotation effect is within standard error.
-    //
-    // No single default is correct everywhere, including within the same
-    // architecture family (gemma-4 above shows three distinct optima across
-    // three sizes). Per-arch heuristics in code would silently regress users
-    // on variants we haven't tested. Default OFF + per-side env knobs lets
-    // each user tune for their specific config; documented findings in the
-    // README guide the choice.
-    //
-    // Reported by @erazortt (TheTom/turboquant_plus#88).
-    //
-    // LLAMA_ATTN_ROT_DISABLE retained as a no-op alias (default OFF makes it
-    // redundant but historical scripts may set it).
-    // Default attn_rot_disable=false now that rotation is OFF by default. The
-    // env var is preserved as a hard lock-out (=1 forces rotation off and
-    // blocks overrides), useful for users who want to guarantee no rotation
-    // regardless of any LLAMA_ATTN_ROT_*_OVERRIDE settings.
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
     const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? (atoi(LLAMA_ATTN_ROT_DISABLE) != 0) : false;
 
-    // Default: rotation OFF on both sides (safe across all tested model families).
-    // Override per side via env vars below.
     attn_rot_k = false;
     attn_rot_v = false;
 
-    // Per-side overrides. Set LLAMA_ATTN_ROT_K_OVERRIDE=1 / LLAMA_ATTN_ROT_V_OVERRIDE=1
-    // to enable rotation. The cache type and head-dim alignment guards below
-    // still apply: rotation only takes effect on quantized types with
-    // head_dim % 64 == 0 (master's #21038 requirements).
     const char * ROT_K_OV = getenv("LLAMA_ATTN_ROT_K_OVERRIDE");
     if (ROT_K_OV && atoi(ROT_K_OV) != 0 && !attn_rot_disable) {
         attn_rot_k =
@@ -594,11 +545,30 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_v() % 64 == 0;
     }
 
-    LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
-    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    // Rotation config validation — shows exactly why each side is on or off
+    // so misconfiguration (wrong type, unaligned head_dim, env not set) is obvious.
+    LLAMA_LOG_INFO("%s: ---- attention rotation config ----\n", __func__);
+    LLAMA_LOG_INFO("%s:   LLAMA_ATTN_ROT_DISABLE     = %s  →  hard-disable=%s\n", __func__,
+        LLAMA_ATTN_ROT_DISABLE ? LLAMA_ATTN_ROT_DISABLE : "(not set)",
+        attn_rot_disable ? "YES" : "no");
+    LLAMA_LOG_INFO("%s:   LLAMA_ATTN_ROT_K_OVERRIDE  = %s\n", __func__,
+        ROT_K_OV ? ROT_K_OV : "(not set)");
+    LLAMA_LOG_INFO("%s:     n_embd_head_k_all=%d  type_k=%s  quantized=%s  head%%64=%s\n", __func__,
+        n_embd_head_k_all,
+        ggml_type_name(type_k),
+        ggml_is_quantized(type_k)          ? "yes" : "NO",
+        (hparams.n_embd_head_k() % 64==0) ? "yes" : "NO");
+    LLAMA_LOG_INFO("%s:     → K rotation: %s\n", __func__, attn_rot_k ? "ENABLED ✓" : "disabled");
+    LLAMA_LOG_INFO("%s:   LLAMA_ATTN_ROT_V_OVERRIDE  = %s\n", __func__,
+        ROT_V_OV ? ROT_V_OV : "(not set)");
+    LLAMA_LOG_INFO("%s:     n_embd_head_v_all=%d  type_v=%s  quantized=%s  head%%64=%s\n", __func__,
+        n_embd_head_v_all,
+        ggml_type_name(type_v),
+        ggml_is_quantized(type_v)          ? "yes" : "NO",
+        (hparams.n_embd_head_v() % 64==0) ? "yes" : "NO");
+    LLAMA_LOG_INFO("%s:     → V rotation: %s\n", __func__, attn_rot_v ? "ENABLED ✓" : "disabled");
+    LLAMA_LOG_INFO("%s: -----------------------------------\n", __func__);
 
-    // pre-compute the haramard matrices and keep them in host memory
-    // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
     if (attn_rot_k || attn_rot_v) {
         for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
