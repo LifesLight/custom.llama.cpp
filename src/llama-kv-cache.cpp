@@ -204,13 +204,22 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     // ---- Per-layer KV type env-var overrides ----------------------------------------
-    // FIRST_N_FULL / LAST_N_FULL / FULL_KV_TYPE  →  override first/last N full-attn layers
-    // FIRST_N_SWA  / LAST_N_SWA  / SWA_KV_TYPE   →  override first/last N SWA layers
+    // All indices below are 1-based nth-of-type (i.e. 1 = first FULL or first SWA layer).
     //
-    // FULL_KV_TYPE / SWA_KV_TYPE accept either a single type (both K and V) or
-    // "ktype,vtype" for asymmetric K/V (e.g. "q8_0,turbo4").
-    // Valid type names: q8_0  f16  bf16  turbo2  turbo3  turbo4
-    // Layers outside the first/last ranges keep the globally selected type_k/type_v.
+    // Boundary overrides (applied first, lowest priority):
+    //   FIRST_N_FULL / LAST_N_FULL / FULL_KV_TYPE
+    //   FIRST_N_SWA  / LAST_N_SWA  / SWA_KV_TYPE
+    //
+    // Center range overrides (higher priority, wins over boundary):
+    //   CENT_START_N_FULL / CENT_END_N_FULL / CENT_FULL_KV_TYPE
+    //   CENT_START_N_SWA  / CENT_END_N_SWA  / CENT_SWA_KV_TYPE
+    //   Both bounds are inclusive. e.g. CENT_START_N_FULL=3 CENT_END_N_FULL=7
+    //   applies to the 3rd through 7th full-attn layers.
+    //
+    // Layers not matched by any override keep the globally selected type_k/type_v.
+    //
+    // KV type values: q8_0  f16  bf16  turbo2  turbo3  turbo4
+    // Asymmetric K/V: "ktype,vtype"  e.g. SWA_KV_TYPE=turbo4,q8_0
     // ---------------------------------------------------------------------------------
     auto kv_parse_one_type = [](const char * s, ggml_type fallback) -> ggml_type {
         if (!s || !*s) return fallback;
@@ -249,6 +258,7 @@ llama_kv_cache::llama_kv_cache(
         const char * e = getenv(name); return e ? atoi(e) : def;
     };
 
+    // Boundary override config
     const int ovr_first_n_full = kv_getenv_int("FIRST_N_FULL", 0);
     const int ovr_last_n_full  = kv_getenv_int("LAST_N_FULL",  0);
     const int ovr_first_n_swa  = kv_getenv_int("FIRST_N_SWA",  0);
@@ -259,8 +269,23 @@ llama_kv_cache::llama_kv_cache(
     kv_parse_kv_pair("FULL_KV_TYPE", type_k, type_v, ovr_full_type_k, ovr_full_type_v);
     kv_parse_kv_pair("SWA_KV_TYPE",  type_k, type_v, ovr_swa_type_k,  ovr_swa_type_v);
 
-    // Pre-scan: collect ordered layer indices per attention type so "first/last N"
-    // counts within the full-attn or SWA population, not within raw layer indices.
+    // Center range override config (1-based nth-of-type, inclusive on both ends)
+    // 0 means "not set" for start; 0 means "not set" for end.
+    const int ovr_cent_start_full = kv_getenv_int("CENT_START_N_FULL", 0);
+    const int ovr_cent_end_full   = kv_getenv_int("CENT_END_N_FULL",   0);
+    const int ovr_cent_start_swa  = kv_getenv_int("CENT_START_N_SWA",  0);
+    const int ovr_cent_end_swa    = kv_getenv_int("CENT_END_N_SWA",    0);
+
+    ggml_type ovr_cent_full_type_k, ovr_cent_full_type_v;
+    ggml_type ovr_cent_swa_type_k,  ovr_cent_swa_type_v;
+    kv_parse_kv_pair("CENT_FULL_KV_TYPE", type_k, type_v, ovr_cent_full_type_k, ovr_cent_full_type_v);
+    kv_parse_kv_pair("CENT_SWA_KV_TYPE",  type_k, type_v, ovr_cent_swa_type_k,  ovr_cent_swa_type_v);
+
+    const bool any_cent_full_ovr = ovr_cent_start_full > 0 || ovr_cent_end_full > 0;
+    const bool any_cent_swa_ovr  = ovr_cent_start_swa  > 0 || ovr_cent_end_swa  > 0;
+
+    // Pre-scan: collect ordered layer indices per attention type so all "nth-of-type"
+    // indices are resolved against the actual population, not raw layer indices.
     // e.g. Gemma 4 31B: full-attn layers are at indices 5,11,17,… so FIRST_N_FULL=2
     // hits layer 5 and 11, not layer 0 and 1.
     std::vector<uint32_t> full_layer_ids, swa_layer_ids;
@@ -270,35 +295,81 @@ llama_kv_cache::llama_kv_cache(
         else                    full_layer_ids.push_back(il);
     }
 
-    std::vector<bool> ovr_apply_full(hparams.n_layer, false);
-    std::vector<bool> ovr_apply_swa (hparams.n_layer, false);
+    // Per-layer resolved types: first apply boundary overrides, then stamp center
+    // overrides on top (center wins). Stored as (type_k, type_v) per layer index.
+    std::vector<ggml_type> resolved_type_k(hparams.n_layer, type_k);
+    std::vector<ggml_type> resolved_type_v(hparams.n_layer, type_v);
+
+    // Boundary pass (lowest priority)
     for (int i = 0; i < (int)full_layer_ids.size(); ++i) {
+        const uint32_t il = full_layer_ids[i];
         if (i < ovr_first_n_full ||
             (ovr_last_n_full > 0 && i >= (int)full_layer_ids.size() - ovr_last_n_full)) {
-            ovr_apply_full[full_layer_ids[i]] = true;
+            resolved_type_k[il] = ovr_full_type_k;
+            resolved_type_v[il] = ovr_full_type_v;
         }
     }
     for (int i = 0; i < (int)swa_layer_ids.size(); ++i) {
+        const uint32_t il = swa_layer_ids[i];
         if (i < ovr_first_n_swa ||
             (ovr_last_n_swa > 0 && i >= (int)swa_layer_ids.size() - ovr_last_n_swa)) {
-            ovr_apply_swa[swa_layer_ids[i]] = true;
+            resolved_type_k[il] = ovr_swa_type_k;
+            resolved_type_v[il] = ovr_swa_type_v;
         }
     }
 
+    // Center pass (higher priority — stamps over boundary results)
+    // i is 0-based internally; env vars are 1-based, so compare i+1.
+    if (any_cent_full_ovr) {
+        for (int i = 0; i < (int)full_layer_ids.size(); ++i) {
+            const int nth = i + 1; // 1-based
+            const bool in_range =
+                (ovr_cent_start_full == 0 || nth >= ovr_cent_start_full) &&
+                (ovr_cent_end_full   == 0 || nth <= ovr_cent_end_full);
+            if (in_range) {
+                resolved_type_k[full_layer_ids[i]] = ovr_cent_full_type_k;
+                resolved_type_v[full_layer_ids[i]] = ovr_cent_full_type_v;
+            }
+        }
+    }
+    if (any_cent_swa_ovr) {
+        for (int i = 0; i < (int)swa_layer_ids.size(); ++i) {
+            const int nth = i + 1; // 1-based
+            const bool in_range =
+                (ovr_cent_start_swa == 0 || nth >= ovr_cent_start_swa) &&
+                (ovr_cent_end_swa   == 0 || nth <= ovr_cent_end_swa);
+            if (in_range) {
+                resolved_type_k[swa_layer_ids[i]] = ovr_cent_swa_type_k;
+                resolved_type_v[swa_layer_ids[i]] = ovr_cent_swa_type_v;
+            }
+        }
+    }
+
+    // Summary log
     const bool any_full_ovr = ovr_first_n_full > 0 || ovr_last_n_full > 0;
     const bool any_swa_ovr  = ovr_first_n_swa  > 0 || ovr_last_n_swa  > 0;
     if (any_full_ovr) {
-        LLAMA_LOG_INFO("%s: FULL-attn KV override: first=%d last=%d  K=%s V=%s\n", __func__,
+        LLAMA_LOG_INFO("%s: FULL-attn boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
             ovr_first_n_full, ovr_last_n_full,
             ggml_type_name(ovr_full_type_k), ggml_type_name(ovr_full_type_v));
     }
     if (any_swa_ovr) {
-        LLAMA_LOG_INFO("%s: SWA      KV override: first=%d last=%d  K=%s V=%s\n", __func__,
+        LLAMA_LOG_INFO("%s: SWA      boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
             ovr_first_n_swa, ovr_last_n_swa,
             ggml_type_name(ovr_swa_type_k), ggml_type_name(ovr_swa_type_v));
     }
+    if (any_cent_full_ovr) {
+        LLAMA_LOG_INFO("%s: FULL-attn center   override : nth %d..%d  K=%s V=%s\n", __func__,
+            ovr_cent_start_full, ovr_cent_end_full,
+            ggml_type_name(ovr_cent_full_type_k), ggml_type_name(ovr_cent_full_type_v));
+    }
+    if (any_cent_swa_ovr) {
+        LLAMA_LOG_INFO("%s: SWA      center   override : nth %d..%d  K=%s V=%s\n", __func__,
+            ovr_cent_start_swa, ovr_cent_end_swa,
+            ggml_type_name(ovr_cent_swa_type_k), ggml_type_name(ovr_cent_swa_type_v));
+    }
 
-    // seq = nth-of-type index (1-based), used in the pretty-print table
+    // Accumulate per-layer info for the pretty-print after the loop
     struct LayerKVInfo { uint32_t il; uint32_t seq; bool is_swa; ggml_type tk; ggml_type tv; };
     std::vector<LayerKVInfo> layer_kv_log;
     uint32_t full_seq_ctr = 0;
@@ -359,19 +430,10 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        // Per-layer KV type: start from global type, apply env-var range overrides.
-        ggml_type layer_type_k = type_k;
-        ggml_type layer_type_v = type_v;
+        // Pick resolved types for this layer (pre-computed above, center > boundary > global)
         const bool is_swa_layer = hparams.is_swa(il);
-        {
-            if (is_swa_layer && ovr_apply_swa[il]) {
-                layer_type_k = ovr_swa_type_k;
-                layer_type_v = ovr_swa_type_v;
-            } else if (!is_swa_layer && ovr_apply_full[il]) {
-                layer_type_k = ovr_full_type_k;
-                layer_type_v = ovr_full_type_v;
-            }
-        }
+        const ggml_type layer_type_k = resolved_type_k[il];
+        const ggml_type layer_type_v = resolved_type_v[il];
 
         // Record for pretty-print: seq is 1-based nth-of-type index
         {
@@ -546,7 +608,6 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // Rotation config validation — shows exactly why each side is on or off
-    // so misconfiguration (wrong type, unaligned head_dim, env not set) is obvious.
     LLAMA_LOG_INFO("%s: ---- attention rotation config ----\n", __func__);
     LLAMA_LOG_INFO("%s:   LLAMA_ATTN_ROT_DISABLE     = %s  →  hard-disable=%s\n", __func__,
         LLAMA_ATTN_ROT_DISABLE ? LLAMA_ATTN_ROT_DISABLE : "(not set)",
@@ -556,16 +617,16 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s:     n_embd_head_k_all=%d  type_k=%s  quantized=%s  head%%64=%s\n", __func__,
         n_embd_head_k_all,
         ggml_type_name(type_k),
-        ggml_is_quantized(type_k)          ? "yes" : "NO",
-        (hparams.n_embd_head_k() % 64==0) ? "yes" : "NO");
+        ggml_is_quantized(type_k)           ? "yes" : "NO",
+        (hparams.n_embd_head_k() % 64 == 0) ? "yes" : "NO");
     LLAMA_LOG_INFO("%s:     → K rotation: %s\n", __func__, attn_rot_k ? "ENABLED ✓" : "disabled");
     LLAMA_LOG_INFO("%s:   LLAMA_ATTN_ROT_V_OVERRIDE  = %s\n", __func__,
         ROT_V_OV ? ROT_V_OV : "(not set)");
     LLAMA_LOG_INFO("%s:     n_embd_head_v_all=%d  type_v=%s  quantized=%s  head%%64=%s\n", __func__,
         n_embd_head_v_all,
         ggml_type_name(type_v),
-        ggml_is_quantized(type_v)          ? "yes" : "NO",
-        (hparams.n_embd_head_v() % 64==0) ? "yes" : "NO");
+        ggml_is_quantized(type_v)           ? "yes" : "NO",
+        (hparams.n_embd_head_v() % 64 == 0) ? "yes" : "NO");
     LLAMA_LOG_INFO("%s:     → V rotation: %s\n", __func__, attn_rot_v ? "ENABLED ✓" : "disabled");
     LLAMA_LOG_INFO("%s: -----------------------------------\n", __func__);
 
