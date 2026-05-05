@@ -71,6 +71,7 @@ static ggml_tensor * ggml_mul_mat_aux(
     // (reshape_2d) drops that information and trips the meta backend.
     res = ggml_reshape_4d(ctx, cur, n, cur->ne[0]/n, cur->ne[1], cur->ne[2]*cur->ne[3]);
     res = ggml_mul_mat   (ctx, rot, res);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;
