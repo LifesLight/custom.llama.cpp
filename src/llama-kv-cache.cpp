@@ -76,7 +76,6 @@ static ggml_tensor * ggml_mul_mat_aux(
 //
 // llama_kv_cache
 //
-
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -292,30 +291,6 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // Summary log
-    const bool any_full_ovr = ovr_first_n_full > 0 || ovr_last_n_full > 0;
-    const bool any_swa_ovr  = ovr_first_n_swa  > 0 || ovr_last_n_swa  > 0;
-    if (any_full_ovr) {
-        LLAMA_LOG_INFO("%s: FULL-attn boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
-            ovr_first_n_full, ovr_last_n_full,
-            ggml_type_name(ovr_full_type_k), ggml_type_name(ovr_full_type_v));
-    }
-    if (any_swa_ovr) {
-        LLAMA_LOG_INFO("%s: SWA      boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
-            ovr_first_n_swa, ovr_last_n_swa,
-            ggml_type_name(ovr_swa_type_k), ggml_type_name(ovr_swa_type_v));
-    }
-    if (any_cent_full_ovr) {
-        LLAMA_LOG_INFO("%s: FULL-attn center   override : nth %d..%d  K=%s V=%s\n", __func__,
-            ovr_cent_start_full, ovr_cent_end_full,
-            ggml_type_name(ovr_cent_full_type_k), ggml_type_name(ovr_cent_full_type_v));
-    }
-    if (any_cent_swa_ovr) {
-        LLAMA_LOG_INFO("%s: SWA      center   override : nth %d..%d  K=%s V=%s\n", __func__,
-            ovr_cent_start_swa, ovr_cent_end_swa,
-            ggml_type_name(ovr_cent_swa_type_k), ggml_type_name(ovr_cent_swa_type_v));
-    }
-
     // Accumulate per-layer info for the pretty-print after the loop
     struct LayerKVInfo { uint32_t il; uint32_t seq; bool is_swa; ggml_type tk; ggml_type tv; };
     std::vector<LayerKVInfo> layer_kv_log;
@@ -399,12 +374,44 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_stream, v_stream, });
     }
 
-    {
+    if (!layer_kv_log.empty()) {
+        bool processed_any_full = false;
+        bool processed_any_swa  = false;
+        for (const auto & info : layer_kv_log) {
+            if (info.is_swa) processed_any_swa = true;
+            else             processed_any_full = true;
+        }
+
+        const bool any_full_ovr = ovr_first_n_full > 0 || ovr_last_n_full > 0;
+        const bool any_swa_ovr  = ovr_first_n_swa  > 0 || ovr_last_n_swa  > 0;
+
+        if (processed_any_full && any_full_ovr) {
+            LLAMA_LOG_INFO("%s: FULL-attn boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
+                ovr_first_n_full, ovr_last_n_full,
+                ggml_type_name(ovr_full_type_k), ggml_type_name(ovr_full_type_v));
+        }
+        if (processed_any_swa && any_swa_ovr) {
+            LLAMA_LOG_INFO("%s: SWA      boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
+                ovr_first_n_swa, ovr_last_n_swa,
+                ggml_type_name(ovr_swa_type_k), ggml_type_name(ovr_swa_type_v));
+        }
+        if (processed_any_full && any_cent_full_ovr) {
+            LLAMA_LOG_INFO("%s: FULL-attn center   override : nth %d..%d  K=%s V=%s\n", __func__,
+                ovr_cent_start_full, ovr_cent_end_full,
+                ggml_type_name(ovr_cent_full_type_k), ggml_type_name(ovr_cent_full_type_v));
+        }
+        if (processed_any_swa && any_cent_swa_ovr) {
+            LLAMA_LOG_INFO("%s: SWA      center   override : nth %d..%d  K=%s V=%s\n", __func__,
+                ovr_cent_start_swa, ovr_cent_end_swa,
+                ggml_type_name(ovr_cent_swa_type_k), ggml_type_name(ovr_cent_swa_type_v));
+        }
+
+        // # = nth layer of that attention type (1-based), l = absolute layer index.
         LLAMA_LOG_INFO("%s: KV cache layer types:\n", __func__);
         LLAMA_LOG_INFO("%s:   ┌──────┬────────┬────────┬────────────┬────────────┐\n", __func__);
         LLAMA_LOG_INFO("%s:   │  #   │  l=    │  attn  │   K-type   │   V-type   │\n", __func__);
         LLAMA_LOG_INFO("%s:   ├──────┼────────┼────────┼────────────┼────────────┤\n", __func__);
-        for (auto & info : layer_kv_log) {
+        for (const auto & info : layer_kv_log) {
             LLAMA_LOG_INFO("%s:   │ %3u  │  %4u  │  %4s  │ %10s │ %10s │\n", __func__,
                 info.seq,
                 info.il,
