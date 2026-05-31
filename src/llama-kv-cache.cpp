@@ -160,6 +160,169 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // ---- Per-layer KV type env-var overrides ----------------------------------------
+    // All indices below are 1-based nth-of-type (i.e. 1 = first FULL or first SWA layer).
+    //
+    // Boundary overrides (applied first, lowest priority):
+    //   FIRST_N_FULL / LAST_N_FULL / FULL_KV_TYPE
+    //   FIRST_N_SWA  / LAST_N_SWA  / SWA_KV_TYPE
+    //
+    // Center range overrides (higher priority, wins over boundary):
+    //   CENT_START_N_FULL / CENT_END_N_FULL / CENT_FULL_KV_TYPE
+    //   CENT_START_N_SWA  / CENT_END_N_SWA  / CENT_SWA_KV_TYPE
+    //   Both bounds are inclusive. e.g. CENT_START_N_FULL=3 CENT_END_N_FULL=7
+    //   applies to the 3rd through 7th full-attn layers.
+    //
+    // Layers not matched by any override keep the globally selected type_k/type_v.
+    //
+    // KV type values: q8_0  f16  bf16
+    // Asymmetric K/V: "ktype,vtype"  e.g. SWA_KV_TYPE=f16,q8_0
+    // ---------------------------------------------------------------------------------
+    auto kv_parse_one_type = [](const char * s, ggml_type fallback) -> ggml_type {
+        if (!s || !*s) return fallback;
+        struct { const char * name; ggml_type type; } table[] = {
+            {"q8_0",   GGML_TYPE_Q8_0},  {"Q8_0",   GGML_TYPE_Q8_0},
+            {"f16",    GGML_TYPE_F16},   {"F16",    GGML_TYPE_F16},
+            {"bf16",   GGML_TYPE_BF16},  {"BF16",   GGML_TYPE_BF16},
+        };
+        for (auto & e : table) {
+            if (strcasecmp(s, e.name) == 0) return e.type;
+        }
+        LLAMA_LOG_WARN("kv_type_override: unknown type '%s', ignoring\n", s);
+        return fallback;
+    };
+
+    auto kv_parse_kv_pair = [&](const char * env_name, ggml_type def_k, ggml_type def_v,
+                                 ggml_type & out_k, ggml_type & out_v) {
+        const char * s = getenv(env_name);
+        if (!s || !*s) { out_k = def_k; out_v = def_v; return; }
+        char buf[64];
+        strncpy(buf, s, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+        char * comma = strchr(buf, ',');
+        if (comma) {
+            *comma = '\0';
+            out_k = kv_parse_one_type(buf,       def_k);
+            out_v = kv_parse_one_type(comma + 1, def_v);
+        } else {
+            out_k = out_v = kv_parse_one_type(buf, def_k);
+        }
+    };
+
+    auto kv_getenv_int = [](const char * name, int def) -> int {
+        const char * e = getenv(name); return e ? atoi(e) : def;
+    };
+
+    // Boundary override config
+    const int ovr_first_n_full = kv_getenv_int("FIRST_N_FULL", 0);
+    const int ovr_last_n_full  = kv_getenv_int("LAST_N_FULL",  0);
+    const int ovr_first_n_swa  = kv_getenv_int("FIRST_N_SWA",  0);
+    const int ovr_last_n_swa   = kv_getenv_int("LAST_N_SWA",   0);
+
+    ggml_type ovr_full_type_k, ovr_full_type_v;
+    ggml_type ovr_swa_type_k,  ovr_swa_type_v;
+    kv_parse_kv_pair("FULL_KV_TYPE", type_k, type_v, ovr_full_type_k, ovr_full_type_v);
+    kv_parse_kv_pair("SWA_KV_TYPE",  type_k, type_v, ovr_swa_type_k,  ovr_swa_type_v);
+
+    // Center range override config (1-based nth-of-type, inclusive on both ends)
+    const int ovr_cent_start_full = kv_getenv_int("CENT_START_N_FULL", 0);
+    const int ovr_cent_end_full   = kv_getenv_int("CENT_END_N_FULL",   0);
+    const int ovr_cent_start_swa  = kv_getenv_int("CENT_START_N_SWA",  0);
+    const int ovr_cent_end_swa    = kv_getenv_int("CENT_END_N_SWA",    0);
+
+    ggml_type ovr_cent_full_type_k, ovr_cent_full_type_v;
+    ggml_type ovr_cent_swa_type_k,  ovr_cent_swa_type_v;
+    kv_parse_kv_pair("CENT_FULL_KV_TYPE", type_k, type_v, ovr_cent_full_type_k, ovr_cent_full_type_v);
+    kv_parse_kv_pair("CENT_SWA_KV_TYPE",  type_k, type_v, ovr_cent_swa_type_k,  ovr_cent_swa_type_v);
+
+    const bool any_cent_full_ovr = ovr_cent_start_full > 0 || ovr_cent_end_full > 0;
+    const bool any_cent_swa_ovr  = ovr_cent_start_swa  > 0 || ovr_cent_end_swa  > 0;
+
+    std::vector<uint32_t> full_layer_ids, swa_layer_ids;
+    for (uint32_t il = 0; il < hparams.n_layer; il++) {
+        if (!hparams.has_kv(il)) continue;
+        if (hparams.is_swa(il)) swa_layer_ids.push_back(il);
+        else                    full_layer_ids.push_back(il);
+    }
+
+    // Per-layer resolved types: first apply boundary overrides, then stamp center overrides
+    std::vector<ggml_type> resolved_type_k(hparams.n_layer, type_k);
+    std::vector<ggml_type> resolved_type_v(hparams.n_layer, type_v);
+
+    // Boundary pass (lowest priority)
+    for (int i = 0; i < (int)full_layer_ids.size(); ++i) {
+        const uint32_t il = full_layer_ids[i];
+        if (i < ovr_first_n_full ||
+            (ovr_last_n_full > 0 && i >= (int)full_layer_ids.size() - ovr_last_n_full)) {
+            resolved_type_k[il] = ovr_full_type_k;
+            resolved_type_v[il] = ovr_full_type_v;
+        }
+    }
+    for (int i = 0; i < (int)swa_layer_ids.size(); ++i) {
+        const uint32_t il = swa_layer_ids[i];
+        if (i < ovr_first_n_swa ||
+            (ovr_last_n_swa > 0 && i >= (int)swa_layer_ids.size() - ovr_last_n_swa)) {
+            resolved_type_k[il] = ovr_swa_type_k;
+            resolved_type_v[il] = ovr_swa_type_v;
+        }
+    }
+
+    // Center pass (higher priority — stamps over boundary results)
+    if (any_cent_full_ovr) {
+        for (int i = 0; i < (int)full_layer_ids.size(); ++i) {
+            const int nth = i + 1; // 1-based
+            const bool in_range =
+                (ovr_cent_start_full == 0 || nth >= ovr_cent_start_full) &&
+                (ovr_cent_end_full   == 0 || nth <= ovr_cent_end_full);
+            if (in_range) {
+                resolved_type_k[full_layer_ids[i]] = ovr_cent_full_type_k;
+                resolved_type_v[full_layer_ids[i]] = ovr_cent_full_type_v;
+            }
+        }
+    }
+    if (any_cent_swa_ovr) {
+        for (int i = 0; i < (int)swa_layer_ids.size(); ++i) {
+            const int nth = i + 1; // 1-based
+            const bool in_range =
+                (ovr_cent_start_swa == 0 || nth >= ovr_cent_start_swa) &&
+                (ovr_cent_end_swa   == 0 || nth <= ovr_cent_end_swa);
+            if (in_range) {
+                resolved_type_k[swa_layer_ids[i]] = ovr_cent_swa_type_k;
+                resolved_type_v[swa_layer_ids[i]] = ovr_cent_swa_type_v;
+            }
+        }
+    }
+
+    // Summary log
+    const bool any_full_ovr = ovr_first_n_full > 0 || ovr_last_n_full > 0;
+    const bool any_swa_ovr  = ovr_first_n_swa  > 0 || ovr_last_n_swa  > 0;
+    if (any_full_ovr) {
+        LLAMA_LOG_INFO("%s: FULL-attn boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
+            ovr_first_n_full, ovr_last_n_full,
+            ggml_type_name(ovr_full_type_k), ggml_type_name(ovr_full_type_v));
+    }
+    if (any_swa_ovr) {
+        LLAMA_LOG_INFO("%s: SWA      boundary override : first=%d last=%d  K=%s V=%s\n", __func__,
+            ovr_first_n_swa, ovr_last_n_swa,
+            ggml_type_name(ovr_swa_type_k), ggml_type_name(ovr_swa_type_v));
+    }
+    if (any_cent_full_ovr) {
+        LLAMA_LOG_INFO("%s: FULL-attn center   override : nth %d..%d  K=%s V=%s\n", __func__,
+            ovr_cent_start_full, ovr_cent_end_full,
+            ggml_type_name(ovr_cent_full_type_k), ggml_type_name(ovr_cent_full_type_v));
+    }
+    if (any_cent_swa_ovr) {
+        LLAMA_LOG_INFO("%s: SWA      center   override : nth %d..%d  K=%s V=%s\n", __func__,
+            ovr_cent_start_swa, ovr_cent_end_swa,
+            ggml_type_name(ovr_cent_swa_type_k), ggml_type_name(ovr_cent_swa_type_v));
+    }
+
+    // Accumulate per-layer info for the pretty-print after the loop
+    struct LayerKVInfo { uint32_t il; uint32_t seq; bool is_swa; ggml_type tk; ggml_type tv; };
+    std::vector<LayerKVInfo> layer_kv_log;
+    uint32_t full_seq_ctr = 0;
+    uint32_t swa_seq_ctr  = 0;
+    // ---- End per-layer KV type override setup ---------------------------------------
+
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -208,8 +371,17 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        const bool is_swa_layer = hparams.is_swa(il);
+        const ggml_type layer_type_k = resolved_type_k[il];
+        const ggml_type layer_type_v = resolved_type_v[il];
+
+        {
+            uint32_t seq = is_swa_layer ? ++swa_seq_ctr : ++full_seq_ctr;
+            layer_kv_log.push_back({il, seq, is_swa_layer, layer_type_k, layer_type_v});
+        }
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -225,6 +397,22 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+    }
+
+    {
+        LLAMA_LOG_INFO("%s: KV cache layer types:\n", __func__);
+        LLAMA_LOG_INFO("%s:   ┌──────┬────────┬────────┬────────────┬────────────┐\n", __func__);
+        LLAMA_LOG_INFO("%s:   │  #   │  l=    │  attn  │   K-type   │   V-type   │\n", __func__);
+        LLAMA_LOG_INFO("%s:   ├──────┼────────┼────────┼────────────┼────────────┤\n", __func__);
+        for (auto & info : layer_kv_log) {
+            LLAMA_LOG_INFO("%s:   │ %3u  │  %4u  │  %4s  │ %10s │ %10s │\n", __func__,
+                info.seq,
+                info.il,
+                info.is_swa ? "SWA" : "FULL",
+                ggml_type_name(info.tk),
+                ggml_type_name(info.tv));
+        }
+        LLAMA_LOG_INFO("%s:   └──────┴────────┴────────┴────────────┴────────────┘\n", __func__);
     }
 
     if (reuse) {
