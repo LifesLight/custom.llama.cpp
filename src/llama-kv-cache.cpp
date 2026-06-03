@@ -298,6 +298,9 @@ llama_kv_cache::llama_kv_cache(
     uint32_t swa_seq_ctr  = 0;
     // ---- End per-layer KV type override setup ---------------------------------------
 
+    bool any_quantized_k = false;
+    bool any_quantized_v = false;
+
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -349,6 +352,13 @@ llama_kv_cache::llama_kv_cache(
         const bool is_swa_layer = hparams.is_swa(il);
         const ggml_type layer_type_k = resolved_type_k[il];
         const ggml_type layer_type_v = resolved_type_v[il];
+
+        if (has_k && ggml_is_quantized(layer_type_k)) {
+            any_quantized_k = true;
+        }
+        if (has_v && ggml_is_quantized(layer_type_v)) {
+            any_quantized_v = true;
+        }
 
         {
             uint32_t seq = is_swa_layer ? ++swa_seq_ctr : ++full_seq_ctr;
@@ -486,7 +496,7 @@ llama_kv_cache::llama_kv_cache(
     attn_rot_k =
         !attn_rot_disable &&
         n_embd_head_k_all > 0 &&
-        ggml_is_quantized(type_k) &&
+        any_quantized_k &&
         hparams.n_embd_head_k() % 64 == 0;
 
     // always create Hadamard rotation tensors for DeepSeek V3.2 DSA lightning indexer
@@ -497,7 +507,7 @@ llama_kv_cache::llama_kv_cache(
     attn_rot_v =
         !attn_rot_disable &&
         n_embd_head_v_all > 0 &&
-        ggml_is_quantized(type_v) &&
+        any_quantized_v &&
         hparams.n_embd_head_v() % 64 == 0;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
