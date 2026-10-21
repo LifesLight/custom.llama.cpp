@@ -459,6 +459,90 @@ typedef struct {
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
 
+// Trellis quants (from ik_llama.cpp). Each group of weights is generated from a 16 bit seed
+// by an integer LCG, see ggml_kt_gen(). d is stored scaled by 2^16, multiply by GGML_KT_D_SCALE to get the real scale.
+#define GGML_KT_D_SCALE (1.0f/65536.0f)
+
+// 8 sub-blocks of 32: 4 bit scales, one 16 bit seed per group of 8 (abs values), sign bits in qh
+typedef struct {
+    ggml_half d;
+    uint8_t   scales[QK_K/64];
+    uint8_t   ql[QK_K/4];
+    uint8_t   qh[QK_K/8];
+} block_iq3_kt;
+static_assert(sizeof(block_iq3_kt) == sizeof(ggml_half) + QK_K/64 + QK_K/4 + QK_K/8, "wrong iq3_kt block size/padding");
+
+// IQ_K quants (from ik_llama.cpp): non-linear grids, each sub-block can select a shifted copy of its grid.
+// IQ2_K, IQ3_K, IQ4_K have the same layout as in ik_llama.cpp.
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint8_t   scales[QK_K/32];
+    uint8_t   qs[QK_K/4];
+} block_iq2_k;
+static_assert(sizeof(block_iq2_k) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/32 + QK_K/4, "wrong iq2_k block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint16_t  scales_h;
+    uint8_t   scales_l[QK_K/32];
+    uint8_t   qs[QK_K/4];
+    uint8_t   qh[QK_K/8];
+} block_iq3_k;
+static_assert(sizeof(block_iq3_k) == sizeof(ggml_half) + 2*sizeof(uint16_t) + QK_K/32 + QK_K/4 + QK_K/8, "wrong iq3_k block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint8_t   scales_h[QK_K/64];
+    uint8_t   scales_l[QK_K/32];
+    uint8_t   qs[QK_K/2];
+} block_iq4_k;
+static_assert(sizeof(block_iq4_k) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/2 + 3*QK_K/64, "wrong iq4_k block size/padding");
+
+// The KS/KSS/KL variants store one scale per row in ik_llama.cpp. ggml has no per-row data, so here the
+// scale is a fp16 d at the start of every block of 256 (+0.0625 bpw), the rest of the block is unchanged.
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint8_t   scales[QK_K/64];
+    uint8_t   qs[QK_K/4];
+} block_iq2_ks;
+static_assert(sizeof(block_iq2_ks) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/4, "wrong iq2_ks block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  scales_h;
+    uint8_t   scales_l[QK_K/64];
+    uint8_t   qs[QK_K/4];
+    uint8_t   qh[QK_K/16];
+} block_iq2_kl;
+static_assert(sizeof(block_iq2_kl) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/4 + QK_K/16, "wrong iq2_kl block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint16_t  extra;
+    uint8_t   scales[QK_K/64];
+    uint8_t   qs[QK_K/4];
+    uint8_t   qh[QK_K/8];
+} block_iq3_ks;
+static_assert(sizeof(block_iq3_ks) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/4 + QK_K/8, "wrong iq3_ks block size/padding");
+
+typedef struct {
+    ggml_half d;
+    uint8_t   scales[QK_K/32];
+    uint8_t   qs[QK_K/2];
+} block_iq4_ks;
+static_assert(sizeof(block_iq4_ks) == sizeof(ggml_half) + QK_K/32 + QK_K/2, "wrong iq4_ks block size/padding");
+
+// ik_llama.cpp declares qs as uint32_t[QK_K/8], uint16_t here keeps the block at 130 bytes
+typedef struct {
+    ggml_half d;
+    uint16_t  qs[QK_K/4];
+} block_iq4_kss;
+static_assert(sizeof(block_iq4_kss) == sizeof(ggml_half) + QK_K/2, "wrong iq4_kss block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
@@ -1127,6 +1211,34 @@ GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
 #define kvalues_mxfp4 kvalues_fp4
+
+// IQ_K grids (from ik_llama.cpp). Each table is the grid followed by its shifted copy.
+// iq2nl_values is padded to 16 entries so it can be used with 4 bit lookups.
+// The CUDA kernels read these tables as uint32, so they get an explicit alignment there.
+#if defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
+#define GGML_TABLE_BEGIN_A16(type, name, size) static const __device__ __align__(16) type name[size] = {
+#else
+#define GGML_TABLE_BEGIN_A16(type, name, size) GGML_TABLE_BEGIN(type, name, size)
+#endif
+GGML_TABLE_BEGIN_A16(int8_t, iq2nl_values, 16)
+    -31, -13, 1, 17,   -26, -8, 6, 22,   0, 0, 0, 0,   0, 0, 0, 0,
+GGML_TABLE_END()
+
+// value pairs of IQ2_KL, low byte first
+GGML_TABLE_BEGIN_A16(uint16_t, iq2kl_values, 32)
+    0xe9c1, 0x0dc1, 0xc1d8, 0xf6d8, 0x0dd8, 0x2fd8, 0xd8e9, 0xe9e9, 0x01e9, 0x0de9, 0x1ce9, 0xc1f6, 0x01f6, 0x0df6, 0x2ff6, 0xe901,
+    0xf601, 0x0101, 0x0d01, 0x1c01, 0xd80d, 0xe90d, 0xf60d, 0x010d, 0x0d0d, 0xc11c, 0xe91c, 0x011c, 0x1c1c, 0x2f1c, 0xe92f, 0x0d2f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN_A16(int8_t, iq3nl_values, 16)
+    -63, -40, -23, -10, 1, 13, 28,  47,
+    -59, -36, -19,  -6, 5, 17, 32,  51,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN_A16(int8_t, iq4k_values, 32)
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117
+GGML_TABLE_END()
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f

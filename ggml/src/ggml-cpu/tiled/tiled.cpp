@@ -280,6 +280,8 @@ static void tiled_unpack_src0(const block_iq4_xs * rows, int64_t row_stride, int
     }
 }
 
+#include "tiled-iqk.inc"
+
 // iq2_xxs: 2-bit grids through the iq2xxs_grid LUT, 4-bit scale per 32, no min
 // codes stored as (value + 128), matching BIAS = 128
 static void tiled_unpack_src0(const block_iq2_xxs * rows, int64_t row_stride, int n_rows, tiled_tile_src0 * tile, int num_k) {
@@ -627,6 +629,7 @@ static bool ggml_tiled_supported(const struct ggml_tensor * src0,
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
+        GGML_IQK_TYPE_CASES
             return true;
         default:
             return false;
@@ -1194,6 +1197,7 @@ static bool ggml_tiled_matmul_type_dispatch(const struct ggml_compute_params * p
             return tiled_matmul_dispatch<block_iq1_s, 32, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
         case GGML_TYPE_IQ1_M:
             return tiled_matmul_dispatch<block_iq1_m, 16, false, 128, true>(params, dst, expert_rows, cur_a, cne1, scratch);
+        GGML_TILED_IQK_DISPATCH_CASES
         default:
             return false;
     }

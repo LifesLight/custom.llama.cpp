@@ -5483,6 +5483,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
+        GGML_IQK_TYPE_CASES
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
             {
@@ -6243,6 +6244,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
+        GGML_IQK_TYPE_CASES
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_Q8_K:

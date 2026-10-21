@@ -888,6 +888,7 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_iq4_xs,
         .from_float_ref           = (ggml_from_float_t)quantize_row_iq4_xs_ref,
     },
+    GGML_IQK_TYPE_TRAITS
     [GGML_TYPE_Q8_K] = {
         .type_name                = "q8_K",
         .blck_size                = QK_K,
@@ -8127,6 +8128,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        GGML_IQK_QUANTIZE_CASES
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

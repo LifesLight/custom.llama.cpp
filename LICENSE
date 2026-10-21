@@ -1,6 +1,10 @@
 MIT License
 
 Copyright (c) 2023-2026 The ggml authors
+Copyright (c) 2024-2025 The ik_llama.cpp authors (https://github.com/ikawrakow/ik_llama.cpp/blob/main/AUTHORS)
+  (IQ3_KT and IQ_K quantization types: ggml/src/ggml-kt.cpp, ggml/src/ggml-iqk.cpp, ggml/src/ggml-iqk.h,
+   ggml/src/ggml-cpu/kt.cpp, ggml/src/ggml-cpu/iqk.cpp, ggml/src/ggml-cpu/quants-iqk.h, ggml/src/ggml-cpu/tiled/tiled-iqk.inc,
+   ggml/src/ggml-cuda/kt.cuh, ggml/src/ggml-cuda/iqk.cuh and related code)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

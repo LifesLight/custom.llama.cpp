@@ -430,7 +430,19 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // quants from ik_llama.cpp: IQ3_KT (trellis) and the IQ_K family
+#define GGML_IQK_TYPE_CASES case GGML_TYPE_IQ3_KT: case GGML_TYPE_IQ2_K: case GGML_TYPE_IQ3_K: case GGML_TYPE_IQ4_K: case GGML_TYPE_IQ2_KS: case GGML_TYPE_IQ3_KS: case GGML_TYPE_IQ4_KS: case GGML_TYPE_IQ4_KSS: case GGML_TYPE_IQ2_KL:
+        GGML_TYPE_IQ3_KT  = 200,
+        // 201 was IQ4_KT
+        GGML_TYPE_IQ2_K   = 202,
+        GGML_TYPE_IQ3_K   = 203,
+        GGML_TYPE_IQ4_K   = 204,
+        GGML_TYPE_IQ2_KS  = 205,
+        GGML_TYPE_IQ3_KS  = 206,
+        GGML_TYPE_IQ4_KS  = 207,
+        GGML_TYPE_IQ4_KSS = 208,
+        GGML_TYPE_IQ2_KL  = 209,
+        GGML_TYPE_COUNT   = 210,
     };
 
     // [TAG_GGML_PREC]

@@ -553,6 +553,9 @@ template void tiled_run_microtile<16, false, 32, true>(const tiled_tile_src0 & s
 // q3_K: act-bias (Wmax 4)
 template void tiled_run_microtile<16, false, 4, true>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                                 int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
+// iq2_k, iq3_k, iq4_k: sign trick, scale per 16
+template void tiled_run_microtile<16, false, 128, false>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
+                                                  int i0, int j0, int num_k, int slab, float * buf, int buf_stride);
 // q2_K: BIAS = 0
 template void tiled_run_microtile<16, true, 0, false>(const tiled_tile_src0 & src0, const tiled_tile_src1 & src1,
                                                int i0, int j0, int num_k, int slab, float * buf, int buf_stride);

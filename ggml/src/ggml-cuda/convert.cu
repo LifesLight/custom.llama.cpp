@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "iqk.cuh"
 
 #include <cstdint>
 
@@ -535,6 +536,7 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_iq4_nl_cuda;
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_cuda;
+        GGML_CUDA_IQK_DEQUANT_CASES
         case GGML_TYPE_IQ3_S:
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
@@ -595,6 +597,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_iq4_nl_cuda;
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_cuda;
+        GGML_CUDA_IQK_DEQUANT_CASES
         case GGML_TYPE_IQ3_S:
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
@@ -652,6 +655,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return dequantize_row_iq4_nl_cuda;
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_cuda;
+        GGML_CUDA_IQK_DEQUANT_CASES
         case GGML_TYPE_IQ3_S:
             return dequantize_row_iq3_s_cuda;
         case GGML_TYPE_MXFP4:
