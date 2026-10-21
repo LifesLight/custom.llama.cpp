@@ -1378,6 +1378,28 @@ private:
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
+            // causal model with a memory: encoded media chunks can share a batch with the text tokens (see can_mix_mtmd_chunk())
+            {
+                const char * env = getenv("LLAMA_SERVER_MTMD_MIXED");
+                const bool env_on = env == nullptr || atoi(env) != 0;
+                // the drafter has to accept the same mixed batch as the target: MTP splits it, n-gram methods do not read it
+                const bool spec_ok = std::all_of(params_base.speculative.types.begin(), params_base.speculative.types.end(), [](common_speculative_type t) {
+                    return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                           (t >= COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE && t <= COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+                });
+                const bool arch_ok = llama_model_supports_mixed_batch(model_tgt);
+                const bool causal  = !mtmd_decode_use_non_causal(mctx, nullptr);
+                mtmd_mixed_causal = env_on && arch_ok && causal && spec_ok && !use_mixed_batch();
+                if (mtmd_mixed_causal) {
+                    SRV_INF("%s\n", "media chunks are prefilled in the same batch as the text tokens (LLAMA_SERVER_MTMD_MIXED=0 to disable)");
+                } else if (env_on && !use_mixed_batch()) {
+                    SRV_INF("media chunks are prefilled on their own: %s\n",
+                            !arch_ok ? "the model does not support mixed token/embedding batches" :
+                            !causal  ? "the model uses non-causal attention on media" :
+                                       "the speculative decoding type does not support mixed batches");
+                }
+            }
+
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
             init_opt.video_params.ffmpeg_bin_dir = params_base.video_ffmpeg_bin_dir.empty()
@@ -4279,6 +4301,11 @@ private:
 
                     bool has_mtmd = false;
 
+                    // add the media chunks to the batch below, next to the text tokens, instead of decoding them on their own here
+                    // (plain completions only: embedding/rerank/decision tasks, shared prefixes and aLoRA keep the old path)
+                    const bool mix_mtmd = mtmd_mixed_causal && input_tokens.has_mtmd && !wait_shared && alora_scale <= 0 &&
+                                          slot.task->type != SERVER_TASK_TYPE_DECISION && !slot.need_embd();
+
                     // check if we should process the mtmd chunk
                     while (true) {
                         auto cur_token_idx = slot.prompt.n_tokens();
@@ -4287,6 +4314,10 @@ private:
                             input_tokens[cur_token_idx] != LLAMA_TOKEN_NULL // encountered a text token
                         ) {
                             break;
+                        }
+
+                        if (mix_mtmd && can_mix_mtmd_chunk(slot, input_tokens.find_chunk(cur_token_idx).get(), n_batch - batch.size())) {
+                            break; // added to the batch below
                         }
 
                         // process the mtmd chunk
@@ -4332,7 +4363,20 @@ private:
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
-                            break; // end of text chunk
+                            // end of text chunk; a media chunk that fits continues the batch, otherwise it is decoded on its own next time
+                            if (!mix_mtmd || !can_mix_mtmd_chunk(slot, input_tokens.find_chunk(slot.prompt.n_tokens()).get(), n_batch - batch.size())) {
+                                break;
+                            }
+                            if (!add_mtmd_chunk_causal(slot, slot.prompt.n_tokens())) {
+                                SLT_ERR(slot, "%s", "failed to process mtmd chunk\n");
+                                // the batch must not keep the entries of a released slot
+                                batch.truncate(n_tokens_prev);
+                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                                slot.release();
+                                return; // the slot is done, skip it entirely
+                            }
+                            has_mtmd = true; // same checkpoint rule as for a chunk decoded on its own
+                            continue;
                         }
 
                         // stop at the end of the shared prefix, the children are started from this state
@@ -4468,6 +4512,42 @@ private:
         return !llama_get_memory(ctx_tgt) || !llama_get_causal_attn(ctx_tgt);
     }
 
+    // set at load time, see the mmproj loading
+    bool mtmd_mixed_causal = false;
+
+    // a media chunk joins the batch of the text tokens if the model is causal on it and the whole chunk fits,
+    // otherwise process_mtmd_chunk() decodes it on its own as before
+    bool can_mix_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * chunk, int32_t n_free) const {
+        return mtmd_mixed_causal &&
+               !mtmd_decode_use_non_causal(slot.mctx, chunk) &&
+               (int32_t) mtmd_input_chunk_get_n_tokens(chunk) <= n_free;
+    }
+
+    // encode the media chunk at idx (with the following ones, if not done yet) and add its embeddings to the batch
+    // returns false on error, the caller releases the slot
+    bool add_mtmd_chunk_causal(server_slot & slot, size_t idx) {
+        const auto & chunk = slot.task->tokens.find_chunk(idx);
+
+        float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+        if (!embd) {
+            int32_t res = 0;
+            queue_tasks.yield_to_queue([&]() {
+                res = encode_mtmd_chunk(slot, slot.mbatch, idx);
+            });
+            embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+        }
+
+        if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch)) {
+            return false;
+        }
+
+        SLT_DBG(slot, "media chunk at %zu (%zu tokens) added to the batch, batch size = %d\n",
+                idx, mtmd_input_chunk_get_n_tokens(chunk.get()), batch.size());
+
+        slot.prompt.tokens.push_back_placeholder(chunk.get());
+        return true;
+    }
+
     // add the rest of the prompt to the batch, the mtmd chunks are added as embeddings next to the text tokens
     // the caller makes sure that it fits in the batch
     // returns false on error, the slot is then released
@@ -4542,7 +4622,8 @@ private:
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
         if (spec && batch.has_embd()) {
-            if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
+            // MTP has no separate draft model (model_dft == nullptr), it runs on the target model
+            if (model_dft && llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
             }
