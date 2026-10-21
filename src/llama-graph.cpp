@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-moe-stream.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1571,6 +1572,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    moe_stream       (params.moe_stream),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
@@ -1713,7 +1715,16 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+        ggml_mul_mat_id(ctx0, moe_cache ? moe_cache->get_experts(w) : moe_stream->get_bank(w), cur, slots);
+
+    // the experts of the MoE stream that are not computed from its cache are always offloaded, whatever the batch size
+    if (slots == nullptr && moe_stream != nullptr) {
+        if (ggml_backend_t backend = moe_stream->offload_backend(w)) {
+            if (ggml_backend_supports_op(backend, res)) {
+                ggml_backend_sched_set_tensor_backend(sched, res, backend);
+            }
+        }
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2587,7 +2598,24 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_up_exps,
                  int   il) const {
     if (moe_cache == nullptr) {
-        return nullptr;
+        if (moe_stream == nullptr) {
+            return nullptr;
+        }
+        // the expert cache of the MoE stream: an op computed on the CPU makes the selected experts cached and
+        // gives their slots, the experts are then read from the cache
+        for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+            if (w != nullptr && moe_stream->get_bank(w) == nullptr) {
+                return nullptr;
+            }
+        }
+        ggml_tensor * slots = moe_stream->build_slots(ctx0, selected_experts, il);
+        if (slots == nullptr) {
+            return nullptr;
+        }
+        ggml_backend_sched_set_tensor_backend(sched, slots, backend_cpu);
+        cb(slots, "ffn_moe_slots", il);
+        ggml_build_forward_expand(gf, slots);
+        return slots;
     }
 
     ggml_tensor * slot_map = moe_cache->get_slot_map(il, selected_experts->ne[1], selected_experts->ne[0]);

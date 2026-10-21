@@ -2788,6 +2788,64 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-stream"}, "N",
+        "stream the MoE experts kept in the CPU (memory mapped) to the GPU during prompt processing with O_DIRECT reads\n"
+        "on N IO threads, instead of page faulting them in. for models whose experts do not fit in RAM (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM"));
+    add_opt(common_arg(
+        {"--moe-stream-resident"}, "GiB|auto",
+        "with --moe-stream: size of the expert cache in RAM in GiB, the same number of experts in every layer.\n"
+        "the other experts are read from disk once per ubatch. auto: the available RAM minus --moe-stream-reserve.\n"
+        "needs 'ulimit -l unlimited' (default: auto)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_stream_resident = SIZE_MAX;
+                return;
+            }
+            const double gib = std::stod(value);
+            if (gib < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_resident = (size_t) (gib*1024*1024*1024);
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_RESIDENT"));
+    add_opt(common_arg(
+        {"--moe-stream-reserve"}, "GiB",
+        "with --moe-stream-resident auto: GiB of RAM left available for everything else (default: 8)",
+        [](common_params & params, const std::string & value) {
+            const double gib = std::stod(value);
+            if (gib < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_reserve = (size_t) (gib*1024*1024*1024);
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_RESERVE"));
+    add_opt(common_arg(
+        {"--moe-stream-policy"}, "{lru,slru}",
+        "with --moe-stream: which experts are evicted from the expert cache in generation (default: lru)\n"
+        "- lru: the least recently used\n"
+        "- slru: segmented LRU, experts used again are protected in one half",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "lru")  { params.moe_stream_policy = LLAMA_MOE_STREAM_POLICY_LRU;  }
+            else if (value == "slru") { params.moe_stream_policy = LLAMA_MOE_STREAM_POLICY_SLRU; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_POLICY"));
+    add_opt(common_arg(
+        {"--moe-stream-state"}, "FNAME",
+        "with --moe-stream: file the cached experts are saved to and restored from at startup,\n"
+        "'none' to disable (default: next to the model file containing the experts, with .moe-stream appended)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_state = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_STATE"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

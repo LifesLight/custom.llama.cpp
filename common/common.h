@@ -597,6 +597,12 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
+    int32_t moe_stream_threads  = 0;        // IO threads streaming the CPU MoE experts to the GPU with O_DIRECT, 0 = disabled
+    size_t  moe_stream_resident = SIZE_MAX; // bytes of the streamed experts kept locked in RAM, SIZE_MAX = from the available RAM
+    size_t  moe_stream_reserve  = 8ull*1024*1024*1024; // RAM left available when sizing the resident experts automatically
+    enum llama_moe_stream_policy moe_stream_policy = LLAMA_MOE_STREAM_POLICY_LRU;
+    std::string moe_stream_state; // file to save the cached experts to, empty = next to the model, "none" = disabled
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

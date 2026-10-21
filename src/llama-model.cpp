@@ -1262,6 +1262,7 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+    std::vector<std::string> mapping_paths; // [mappings.size()]
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1894,7 +1895,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!params.no_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2038,8 +2039,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
-        for (auto & mapping : ml.mappings) {
-            pimpl->mappings.emplace_back(std::move(mapping));
+        for (size_t idx = 0; idx < ml.mappings.size(); idx++) {
+            pimpl->mappings.emplace_back(std::move(ml.mappings[idx]));
+            pimpl->mapping_paths.emplace_back(idx < ml.fnames.size() ? ml.fnames[idx] : std::string());
         }
     }
 
@@ -2429,6 +2431,26 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+bool llama_model::get_mapped_location(const ggml_tensor * t, std::string & path, size_t & offs) const {
+    const uint8_t * data = (const uint8_t *) t->data;
+    for (size_t idx = 0; idx < pimpl->mappings.size(); idx++) {
+        const auto & mapping = pimpl->mappings[idx];
+        if (!mapping) {
+            continue;
+        }
+        const uint8_t * addr = (const uint8_t *) mapping->addr();
+        if (data >= addr && data + ggml_nbytes(t) <= addr + mapping->size()) {
+            if (idx >= pimpl->mapping_paths.size() || pimpl->mapping_paths[idx].empty()) {
+                return false;
+            }
+            path = pimpl->mapping_paths[idx];
+            offs = data - addr;
+            return true;
+        }
+    }
+    return false;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -3368,6 +3390,7 @@ llama_model_params llama_model_default_params() {
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
+        /*.no_prefetch                 =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
     };

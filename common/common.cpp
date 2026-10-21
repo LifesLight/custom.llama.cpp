@@ -1689,6 +1689,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    // the streamed experts are read on demand, prefetching the whole files would only thrash the page cache
+    mparams.no_prefetch     = params.moe_stream_threads > 0;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1749,6 +1751,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_stream_threads  = params.moe_stream_threads;
+    cparams.moe_stream_resident = params.moe_stream_resident;
+    cparams.moe_stream_reserve  = params.moe_stream_reserve;
+    cparams.moe_stream_policy   = params.moe_stream_policy;
+    cparams.moe_stream_state    = params.moe_stream_state.empty() ? nullptr : params.moe_stream_state.c_str();
 
     return cparams;
 }

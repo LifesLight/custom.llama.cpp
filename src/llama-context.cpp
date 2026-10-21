@@ -32,11 +32,15 @@ static void llama_verify_hadamard_graph(
         ggml_cgraph * gf,
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
-        const llama_moe_cache * moe_cache) {
+        const llama_moe_cache * moe_cache,
+        const llama_moe_stream * moe_stream) {
     // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
         if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
+            forward.emplace(cached, t);
+        }
+        if (const ggml_tensor * cached = moe_stream ? moe_stream->get_bank(w) : nullptr) {
             forward.emplace(cached, t);
         }
     }
@@ -369,6 +373,11 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_stream_threads  = params.moe_stream_threads;
+    cparams.moe_stream_resident = params.moe_stream_resident;
+    cparams.moe_stream_reserve  = params.moe_stream_reserve;
+    cparams.moe_stream_policy   = params.moe_stream_policy;
+    cparams.moe_stream_state    = params.moe_stream_state ? params.moe_stream_state : "";
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -560,6 +569,25 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+        }
+
+        if (cparams.moe_stream_threads > 0) {
+            if (moe_cache) {
+                LLAMA_LOG_WARN("%s: MoE streaming is not supported together with the MoE cache, disabled\n", __func__);
+            } else if (!cparams.op_offload) {
+                LLAMA_LOG_WARN("%s: MoE streaming requires op offload, disabled\n", __func__);
+            } else {
+                llama_moe_stream_params sparams;
+                sparams.n_threads = cparams.moe_stream_threads;
+                sparams.resident  = cparams.moe_stream_resident;
+                sparams.reserve   = cparams.moe_stream_reserve;
+                sparams.policy    = cparams.moe_stream_policy;
+                sparams.state     = cparams.moe_stream_state;
+                moe_stream = std::make_unique<llama_moe_stream>(model, backend_ptrs, sparams);
+                if (!moe_stream->active()) {
+                    moe_stream.reset();
+                }
+            }
         }
 
         sched_reserve();
@@ -1583,7 +1611,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // a full ubatch is likely followed by another one, the stream prefetches its first layer
+    if (moe_stream) {
+        moe_stream->begin_graph(sched.get(), res->get_gf(), ubatch.n_tokens, ubatch.n_tokens >= cparams.n_ubatch);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (moe_stream) {
+        moe_stream->end_graph();
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2675,7 +2713,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get(), moe_stream.get());
         hadamard_verified = true;
     }
 
@@ -2716,6 +2754,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_stream  =*/ moe_stream.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -2785,12 +2824,16 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     auto & st = lctx->copy_experts;
 
+    // the experts streamed from disk are always copied by the stream, all of them if the ids are not known
+    llama_moe_stream * stream = lctx->moe_stream && lctx->moe_stream->is_streamed(src) ? lctx->moe_stream.get() : nullptr;
+
     // the ids must be computed before the split starts, so only the first node of the split is considered
-    if (ggml_graph_n_nodes(graph) == 0) {
-        return false;
-    }
-    const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+    const ggml_tensor * node = ggml_graph_n_nodes(graph) > 0 ? ggml_graph_node(graph, 0) : nullptr;
+    if (!node || node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        if (stream) {
+            stream->copy(backend, src, dst, nullptr);
+            return true;
+        }
         return false;
     }
 
@@ -2817,6 +2860,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+    }
+
+    if (stream) {
+        stream->copy(backend, src, dst, &st.used);
+        return true;
     }
 
     // group consecutive experts and copy them together
@@ -4018,6 +4066,11 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_stream_threads          =*/ 0,
+        /*.moe_stream_resident         =*/ SIZE_MAX,
+        /*.moe_stream_reserve          =*/ 8ull*1024*1024*1024,
+        /*.moe_stream_policy           =*/ LLAMA_MOE_STREAM_POLICY_LRU,
+        /*.moe_stream_state            =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
