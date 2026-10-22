@@ -117,6 +117,10 @@ struct llama_moe_stream::impl {
 
         bool dirty = false; // the cached experts changed since the staging buffers were filled
 
+        // when each expert was last evicted (n_evict at the time), 0 = never
+        std::vector<uint64_t> evicted_at;
+        uint64_t n_evict = 0;
+
         bool streamed() const { return n_slots < n_expert; }
     };
 
@@ -193,6 +197,16 @@ struct llama_moe_stream::impl {
     // half-life of the usage scores in tokens (LLAMA_MOE_STREAM_HALFLIFE)
     double halflife = 512.0;
 
+    // compute the cached experts while the missing ones are read (LLAMA_MOE_STREAM_OVERLAP)
+    bool overlap_mode = false;
+
+    // the reads of the batch computed on the CPU between the start and the wait ops
+    int                  pend_li = -1;
+    wait_group           pend_wg;
+    std::vector<int32_t> pend_all;   // [k*n] the slot of each selected expert
+    std::vector<uint8_t> pend_read;  // [k*n] the expert is being read
+    size_t               pend_read_start = 0;
+
     size_t page_size = 4096;
 
     // expert cache
@@ -248,6 +262,7 @@ struct llama_moe_stream::impl {
     std::vector<int32_t> overflow;
     std::vector<int32_t> cnt;       // [max n_expert] tokens per expert in the current batch
     std::vector<int32_t> ov_index;  // [max n_expert] index in the window, -1 if not in it
+    std::vector<uint8_t> being_read; // [max n_expert] read for the current batch
     std::vector<int32_t> rank;
 
     std::vector<uint8_t> zeros = std::vector<uint8_t>(512, 0); // padding of experts that are not read
@@ -273,6 +288,9 @@ struct llama_moe_stream::impl {
     int64_t cpu_window  = 0;
     size_t  cpu_bytes   = 0;
     double  cpu_t_read  = 0.0;
+    // how predictable the misses were: among the 2 / 8 most used experts that were not cached, or most recently evicted
+    int64_t cpu_pred_used[2]    = { 0, 0 };
+    int64_t cpu_pred_evicted[2] = { 0, 0 };
 
     bool    graph_cached = false; // the current graph was computed from the cache
     int64_t state_tokens = 0;     // tokens computed on the CPU since the state was saved
@@ -318,6 +336,9 @@ struct llama_moe_stream::impl {
         if (const char * env = getenv("LLAMA_MOE_STREAM_HALFLIFE")) {
             halflife = std::max(1.0, atof(env));
         }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_OVERLAP")) {
+            overlap_mode = atoi(env) != 0;
+        }
         slots.resize(n_slots);
         for (auto & sl : slots) {
             sl.off  .assign(max_n_expert, SIZE_MAX);
@@ -326,6 +347,7 @@ struct llama_moe_stream::impl {
         }
         cnt     .assign(max_n_expert, 0);
         ov_index.assign(max_n_expert, -1);
+        being_read.assign(max_n_expert, 0);
 
         const int n_threads = std::max(1, params.n_threads);
 
@@ -619,6 +641,7 @@ struct llama_moe_stream::impl {
             l.score    .assign(l.n_expert, 0.0);
             l.mark     .assign(l.n_expert, 0);
             l.counts   .assign(l.n_expert, 0);
+            l.evicted_at.assign(l.n_expert, 0);
 
             for (int idx : l.tensors) {
                 auto & ti = tensors[idx];
@@ -1107,6 +1130,8 @@ struct llama_moe_stream::impl {
     void ensure(int li, const ggml_tensor * ids, ggml_tensor * out) {
         auto & l = layers[li];
 
+        GGML_ASSERT(pend_li < 0 && "the previous layer did not wait for its reads");
+
         const int64_t k = ids->ne[0];
         const int64_t n = ids->ne[1];
 
@@ -1140,8 +1165,6 @@ struct llama_moe_stream::impl {
         const double w = weight();
         missing.clear();
         for (int32_t e : needed) {
-            l.stamp[e]  = clock;
-            l.score[e] += cnt[e]*w;
             cpu_access++;
             if (l.slot_of[e] < 0) {
                 missing.push_back(e);
@@ -1151,15 +1174,35 @@ struct llama_moe_stream::impl {
             promote(l, e);
         }
 
+        // how the misses could have been predicted, with the scores before this batch
+        for (int32_t e : missing) {
+            int64_t higher = 0;
+            for (int64_t x = 0; x < l.n_expert; ++x) {
+                higher += l.slot_of[x] < 0 && l.score[x] > l.score[e];
+            }
+            cpu_pred_used[0] += higher < 2;
+            cpu_pred_used[1] += higher < 8;
+            if (l.evicted_at[e] > 0) {
+                const uint64_t ago = l.n_evict - l.evicted_at[e];
+                cpu_pred_evicted[0] += ago < 2;
+                cpu_pred_evicted[1] += ago < 8;
+            }
+        }
+
+        for (int32_t e : needed) {
+            l.stamp[e]  = clock;
+            l.score[e] += cnt[e]*w;
+        }
+
         overflow.clear();
+        const size_t read_start = bytes_read;
+        wait_group & wg = pend_wg;
         if (!missing.empty()) {
             const double t0 = t_now();
-            const size_t read_start = bytes_read;
 
             // the most used first, so that with lfu they are the ones admitted
             std::stable_sort(missing.begin(), missing.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
 
-            wait_group wg;
             bool changed = false;
             for (int32_t e : missing) {
                 const int64_t v = victim(l);
@@ -1177,6 +1220,7 @@ struct llama_moe_stream::impl {
                 l.slot_of[e]   = s;
                 l.expert_of[s] = e;
                 l.mark[v]      = l.mark_gen; // the slot is taken, not a victim again
+                l.evicted_at[v] = ++l.n_evict;
                 changed        = true;
 
                 read_experts(l, e, s, 1, wg);
@@ -1203,29 +1247,96 @@ struct llama_moe_stream::impl {
                 cpu_window += overflow.size();
             }
 
-            if (!wait(wg)) {
-                GGML_ABORT("moe_stream: failed to read the experts of layer %d", l.il);
-            }
-
             if (changed) {
                 l.dirty     = true;
                 state_dirty = true;
             }
-            cpu_bytes  += bytes_read - read_start;
-            cpu_t_read += t_now() - t0;
-        }
 
-        int32_t * dst = (int32_t *) out->data;
-        for (int64_t i1 = 0; i1 < n; ++i1) {
-            for (int64_t i0 = 0; i0 < k; ++i0) {
-                const int32_t e = id_at(i0, i1);
-                dst[i1*k + i0] = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) l.n_slots + ov_index[e];
+            if (!overlap_mode) {
+                if (!wait(wg)) {
+                    GGML_ABORT("moe_stream: failed to read the experts of layer %d", l.il);
+                }
+                cpu_bytes  += bytes_read - read_start;
+                cpu_t_read += t_now() - t0;
             }
         }
 
+        // the experts read for this batch: the missing ones, now in a cache slot or in the window
+        for (int32_t e : missing) {
+            being_read[e] = 1;
+        }
+
+        int32_t * dst = (int32_t *) out->data;
+        pend_all .resize(k*n);
+        pend_read.resize(k*n);
+        for (int64_t i1 = 0; i1 < n; ++i1) {
+            for (int64_t i0 = 0; i0 < k; ++i0) {
+                const int32_t e    = id_at(i0, i1);
+                const int32_t slot = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) l.n_slots + ov_index[e];
+                const bool    rd   = being_read[e] != 0;
+                pend_all [i1*k + i0] = slot;
+                pend_read[i1*k + i0] = rd;
+                dst[i1*k + i0] = overlap_mode && rd ? -1 : slot;
+            }
+        }
+
+        for (int32_t e : missing) {
+            being_read[e] = 0;
+        }
         for (int32_t e : overflow) {
             ov_index[e] = -1;
         }
+
+        if (overlap_mode) {
+            pend_li         = li;
+            pend_read_start = read_start;
+        }
+    }
+
+    // the cached experts are computed: wait for the missing ones
+    void wait_reads(int li, ggml_tensor * out) {
+        GGML_ASSERT(pend_li == li);
+        pend_li = -1;
+
+        const double t0 = t_now();
+        if (!wait(pend_wg)) {
+            GGML_ABORT("moe_stream: failed to read the experts of layer %d", layers[li].il);
+        }
+        cpu_t_read += t_now() - t0;
+        cpu_bytes  += bytes_read - pend_read_start;
+
+        const size_t kn = pend_all.size();
+        int32_t * dst = (int32_t *) out->data;
+        for (size_t i = 0; i < kn; ++i) {
+            dst[i]      = pend_read[i] ? pend_all[i] : -1;
+            dst[kn + i] = pend_all[i];
+        }
+    }
+
+    static void wait_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(nth);
+        if (ith != 0) {
+            return;
+        }
+        auto * c = (op_ctx *) userdata;
+        c->self->wait_reads(c->li, dst);
+    }
+
+    ggml_tensor * build_wait(ggml_context * ctx, ggml_tensor * slots_t, const std::vector<ggml_tensor *> & deps, int il) const {
+        if (!overlap_mode || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+            return nullptr;
+        }
+        const int li = layer_of_il[il];
+
+        // the first parts are sources, so that the wait is computed after them
+        std::vector<ggml_tensor *> args = { slots_t };
+        for (ggml_tensor * d : deps) {
+            if (args.size() < GGML_MAX_SRC) {
+                args.push_back(d);
+            }
+        }
+        return ggml_custom_4d(ctx, GGML_TYPE_I32, slots_t->ne[0], slots_t->ne[1], 2, 1, args.data(), (int) args.size(),
+                wait_op, 1, const_cast<op_ctx *>(&op_ctxs[li]));
     }
 
     static void ensure_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
@@ -1864,10 +1975,15 @@ struct llama_moe_stream::impl {
             cpu_batches  += 1;
             state_tokens += n_tokens;
             if (cpu_tokens >= CPU_STATS_TOKENS && cpu_access > 0) {
+                const double n_miss = (double) std::max<int64_t>(cpu_access - cpu_hits, 1);
                 LLAMA_LOG_INFO("moe_stream: cpu: %" PRId64 " tokens in %" PRId64 " batches, %.1f%% of the selected experts cached, %.1f missing per batch"
-                        " (%.1f in the overflow window), read %.2f GiB in %.1f s (%.2f GiB/s)\n",
+                        " (%.1f in the overflow window), read %.2f GiB, %s %.1f s\n",
                         cpu_tokens, cpu_batches, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/cpu_batches, (double) cpu_window/cpu_batches,
-                        cpu_bytes/GiB, cpu_t_read, cpu_bytes/GiB/std::max(cpu_t_read, 1e-6));
+                        cpu_bytes/GiB, overlap_mode ? "waited" : "in", cpu_t_read);
+                LLAMA_LOG_INFO("moe_stream: cpu: of the missing experts, %.0f%% / %.0f%% were among the 2 / 8 most used not cached, %.0f%% / %.0f%% among the 2 / 8 last evicted\n",
+                        100.0*cpu_pred_used[0]/n_miss, 100.0*cpu_pred_used[1]/n_miss, 100.0*cpu_pred_evicted[0]/n_miss, 100.0*cpu_pred_evicted[1]/n_miss);
+                cpu_pred_used[0] = cpu_pred_used[1] = 0;
+                cpu_pred_evicted[0] = cpu_pred_evicted[1] = 0;
                 cpu_tokens  = 0;
                 cpu_batches = 0;
                 cpu_access  = 0;
@@ -1905,6 +2021,22 @@ llama_moe_stream::~llama_moe_stream() = default;
 
 bool llama_moe_stream::active() const {
     return pimpl->is_active;
+}
+
+bool llama_moe_stream::overlap() const {
+    return pimpl->is_active && pimpl->overlap_mode;
+}
+
+ggml_tensor * llama_moe_stream::build_wait(ggml_context * ctx, ggml_tensor * slots, const std::vector<ggml_tensor *> & deps, int il) const {
+#ifdef __linux__
+    return pimpl->is_active ? pimpl->build_wait(ctx, slots, deps, il) : nullptr;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(slots);
+    GGML_UNUSED(deps);
+    GGML_UNUSED(il);
+    return nullptr;
+#endif
 }
 
 bool llama_moe_stream::is_streamed(const ggml_tensor * src) const {

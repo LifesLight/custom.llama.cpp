@@ -52,6 +52,12 @@ public:
     // makes them resident when it is computed. nullptr if the layer cannot be computed from the cache.
     ggml_tensor * build_slots(ggml_context * ctx, ggml_tensor * selected_experts, int il) const;
 
+    // LLAMA_MOE_STREAM_OVERLAP: the slots of build_slots are -1 for the experts being read, the cached experts are
+    // computed while they are read. build_wait waits for them once deps are computed and gives [k, n, 2] slots:
+    // [:, :, 0] -1 except for the experts that were read, [:, :, 1] all the slots. nullptr if not overlapping
+    bool overlap() const;
+    ggml_tensor * build_wait(ggml_context * ctx, ggml_tensor * slots, const std::vector<ggml_tensor *> & deps, int il) const;
+
     // called before each graph compute, after the graph is allocated: the tensors are prefetched in the order
     // of the expert matmuls that the scheduler assigned to the GPU
     // expect_more is a hint that another ubatch will follow, so its first tensors can be prefetched

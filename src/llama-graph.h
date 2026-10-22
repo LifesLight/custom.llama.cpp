@@ -25,6 +25,15 @@ struct llama_hadamard;
 class llama_moe_cache;
 class llama_moe_stream;
 
+// the expert matmuls of a layer computed on the CPU from the MoE stream cache in two parts: the cached experts
+// while the missing ones are read (ids_a), then the missing ones (ids_b); down has all of them (ids_all)
+struct llm_moe_split {
+    ggml_tensor * ids_b   = nullptr;
+    ggml_tensor * ids_all = nullptr;
+    ggml_tensor * down    = nullptr;
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> first; // weight -> result of the first part
+};
+
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
@@ -1122,7 +1131,16 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s   = nullptr,
-              ggml_tensor * slots = nullptr) const;
+              ggml_tensor * slots = nullptr,
+      const llm_moe_split * split = nullptr) const;
+
+    // the mul_mat_id of the experts as of w, on the backend it belongs to, with the precision of w
+    ggml_tensor * build_mm_id_experts(
+              ggml_tensor * w,
+              ggml_tensor * as,
+              ggml_tensor * cur,
+              ggml_tensor * ids,
+                     bool   cached) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
