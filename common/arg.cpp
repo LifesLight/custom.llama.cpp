@@ -2827,13 +2827,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_RESERVE"));
     add_opt(common_arg(
-        {"--moe-stream-policy"}, "{lru,slru}",
-        "with --moe-stream: which experts are evicted from the expert cache in generation (default: lru)\n"
+        {"--moe-stream-policy"}, "{lru,slru,lfu}",
+        "with --moe-stream: which experts are evicted from the expert cache by the batches computed on the CPU (default: lru)\n"
         "- lru: the least recently used\n"
-        "- slru: segmented LRU, experts used again are protected in one half",
+        "- slru: segmented LRU, experts used again are protected in one half\n"
+        "- lfu: the least used, with counts that decay (half-life LLAMA_MOE_STREAM_HALFLIFE tokens, default 512);\n"
+        "  an expert used less than the one it would replace is read for the batch without being cached",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "lru")  { params.moe_stream_policy = LLAMA_MOE_STREAM_POLICY_LRU;  }
             else if (value == "slru") { params.moe_stream_policy = LLAMA_MOE_STREAM_POLICY_SLRU; }
+            else if (value == "lfu")  { params.moe_stream_policy = LLAMA_MOE_STREAM_POLICY_LFU;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_POLICY"));

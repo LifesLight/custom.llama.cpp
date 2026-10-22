@@ -379,11 +379,13 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        std::vector<int32_t> counts; // tokens per expert
 
         void reset() {
             ids = nullptr;
             ids_data.clear();
             used.clear();
+            counts.clear();
         }
     };
 

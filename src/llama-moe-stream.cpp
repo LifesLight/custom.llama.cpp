@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -40,11 +41,14 @@ constexpr size_t BOUNCE_CHUNK = 1ull*1024*1024;
 
 constexpr double GiB = 1024.0*1024.0*1024.0;
 
-// generation statistics are logged every that many tokens
-constexpr int DECODE_STATS_TOKENS = 128;
+// statistics of the batches computed on the CPU are logged every that many tokens
+constexpr int CPU_STATS_TOKENS = 128;
 
-// the cached experts are saved every that many generated tokens
+// the cached experts are saved every that many tokens computed on the CPU
 constexpr int STATE_SAVE_TOKENS = 256;
+
+// the usage scores are rescaled when their weight reaches 2^SCORE_RESCALE
+constexpr double SCORE_RESCALE = 512.0;
 
 size_t align_down(size_t x, size_t a) { return x / a * a; }
 size_t align_up  (size_t x, size_t a) { return (x + a - 1) / a * a; }
@@ -55,6 +59,7 @@ const char * policy_name(llama_moe_stream_policy p) {
     switch (p) {
         case LLAMA_MOE_STREAM_POLICY_LRU:  return "lru";
         case LLAMA_MOE_STREAM_POLICY_SLRU: return "slru";
+        case LLAMA_MOE_STREAM_POLICY_LFU:  return "lfu";
     }
     return "?";
 }
@@ -69,43 +74,29 @@ struct llama_moe_stream::impl {
         size_t size        = 0;
     };
 
-    // a run of consecutive streamed experts of a tensor, read into a staging buffer as one aligned range of the file
-    struct run {
-        size_t rd_beg;
-        size_t rd_end;
-        size_t slot_offs; // offset of rd_beg in the staging buffer
-    };
-
     struct tensor {
         const ggml_tensor * t;
 
         int     layer;       // index in layers
+        int     index;       // index in the tensors of the layer, also its staging buffer for the CPU overflow
         int     file;        // index in files
         size_t  file_offs;   // offset of the data in the file
         size_t  nbytes;
         size_t  expert_size;
         int64_t n_expert;
 
-        // selective reads: offset in the staging buffer of the experts read for the current batch, SIZE_MAX if not read
-        std::vector<size_t> sel_exp;
-        int                 sel_slot = -1;    // the staging buffer, -1 if not read yet
-        bool                sel_full = false; // the whole layout was read instead (exp_slot)
-
-        // the cache: [ne0, ne1, n_slots], an expert per slot
+        // the cache: [ne0, ne1, n_slots + n_window], an expert per slot
+        // the window after the cache slots is an alias of the staging buffer of the tensor, for the experts of
+        // a batch computed on the CPU that do not fit in the cache
         ggml_tensor * bank      = nullptr;
         uint8_t *     bank_data = nullptr;
-
-        // layout of the experts that are not cached in a staging buffer, rebuilt when the cached experts change
-        std::vector<run>    runs;
-        std::vector<size_t> exp_slot;   // [n_expert] offset of the expert in the staging buffer, SIZE_MAX if cached
-        size_t              slot_bytes = 0;
-        uint32_t            layout     = 0; // version of the layout
     };
 
     struct layer {
         int il;
         int64_t n_expert = 0;
-        int64_t n_slots  = 0; // cache slots
+        int64_t n_slots  = 0;     // cache slots
+        bool    window   = false; // the cache has an overflow window
         std::vector<int> tensors;
 
         std::vector<int32_t> slot_of;   // [n_expert] cache slot of the expert, -1 if not cached
@@ -115,11 +106,16 @@ struct llama_moe_stream::impl {
         std::vector<uint64_t> stamp;    // [n_expert] last use
         std::vector<uint8_t>  prot;     // [n_expert] in the protected segment (slru)
         int64_t n_prot = 0;
+        std::vector<double>   score;    // [n_expert] usage, decayed
 
         std::vector<uint32_t> mark;     // [n_expert] selected by the current batch
         uint32_t              mark_gen = 0;
 
-        bool dirty = false; // the cached experts changed since the staging layouts were built
+        // the experts selected in the current graph, for the batches computed on the GPU
+        std::vector<int32_t> counts;
+        uint32_t             counts_gen = 0;
+
+        bool dirty = false; // the cached experts changed since the staging buffers were filled
 
         bool streamed() const { return n_slots < n_expert; }
     };
@@ -130,21 +126,28 @@ struct llama_moe_stream::impl {
         bool error   = false; // guarded by mtx
     };
 
+    enum expert_state : uint8_t {
+        EXP_NONE      = 0, // not in the staging buffer
+        EXP_PLACED    = 1, // read or being read
+        EXP_CANCELLED = 2, // has a place, but its reads were cancelled
+    };
+
     struct slot {
         uint8_t * data = nullptr;
 
-        int      tensor   = -1;    // the tensor held (or being read) by the staging buffer
-        uint32_t layout   = 0;     // the layout of the tensor when it was read
-        bool     consumed = false; // the tensor was uploaded since it was read
-        wait_group wg;
+        int    tensor   = -1;    // the tensor held by the staging buffer
+        bool   consumed = false; // the tensor was uploaded since it was assigned
+        size_t fill     = 0;     // bytes of the buffer that are used
+
+        std::vector<size_t>     off;   // [max n_expert] offset of the expert in the buffer
+        std::vector<uint8_t>    state; // [max n_expert] expert_state
+        std::vector<wait_group> wg;    // [max n_expert] the reads of the expert
 
         // the uploads from this buffer must finish before it can be overwritten
         ggml_backend_event_t event      = nullptr;
         ggml_backend_t       ev_backend = nullptr;
         bool                 ev_valid   = false; // the event was recorded after the last upload
         bool                 uploading  = false;
-
-        int sel_owner = -1; // selective reads: the tensor read into the buffer
     };
 
     struct job {
@@ -154,6 +157,8 @@ struct llama_moe_stream::impl {
         uint8_t *    dst;
         wait_group * wg;
         bool         aligned; // offs, len and dst are aligned: read directly, otherwise through a bounce buffer
+        int          slot   = -1; // the staging buffer and the expert, for the reads that can be cancelled
+        int          expert = -1;
     };
 
     // user data of the cache ops
@@ -172,29 +177,42 @@ struct llama_moe_stream::impl {
     std::vector<int>    layer_of_il; // [il] index in layers, -1 if not streamed
     std::vector<op_ctx> op_ctxs;     // [layers.size()]
     std::unordered_map<const ggml_tensor *, int> tensor_idx;
-    std::unordered_map<const ggml_tensor *, int> bank_idx;
     std::unordered_map<std::string, int>         name_idx;
+    int64_t max_n_expert = 0;
 
     ggml_backend_dev_t target_dev     = nullptr;
     ggml_backend_t     target_backend = nullptr;
     int64_t            n_expert_used  = 0;
 
-    // batches of up to that many tokens read only the experts selected by the router (LLAMA_MOE_STREAM_SELECTIVE)
-    int64_t selective_max = 128;
+    // batches of up to that many tokens are computed on the CPU (LLAMA_MOE_STREAM_CPU_MAX)
+    int64_t cpu_max = 32;
+
+    // half-life of the usage scores in tokens (LLAMA_MOE_STREAM_HALFLIFE)
+    double halflife = 512.0;
+
+    size_t page_size = 4096;
 
     // expert cache
-    void *                arena      = nullptr; // anonymous mapping, unless pinned
-    size_t                arena_size = 0;
-    ggml_backend_buffer_t arena_buf  = nullptr; // pinned host buffer, if requested
-    ggml_backend_buffer_t bank_buf   = nullptr;
-    ggml_context *        bank_ctx   = nullptr;
-    bool                  pinned     = false;
+    void *         arena      = nullptr; // the cache slots, and the windows mapped over the staging buffers
+    size_t         arena_size = 0;
+    ggml_backend_buffer_t bank_buf = nullptr;
+    ggml_context * bank_ctx   = nullptr;
+    std::vector<std::pair<void *, size_t>> bank_ranges; // the parts of the arena that are cache slots
+    bool           pinned     = false;
 
     // staging buffers
-    ggml_backend_buffer_t host_buf  = nullptr;
-    void *                host_mem  = nullptr; // fallback if the device has no pinned host buffer type
-    size_t                slot_size = 0;       // the largest streamed part of a tensor
+    int                   memfd       = -1;      // the staging buffers, so that they can be mapped as windows
+    void *                staging     = nullptr; // their mapping
+    size_t                staging_size_ = 0;
+    ggml_backend_buffer_t host_buf    = nullptr; // fallback without memfd: pinned host buffer
+    void *                host_mem    = nullptr; // fallback: normal memory
+    size_t                slot_size   = 0;       // the largest part of a tensor that is not cached, with alignment
     std::vector<slot>     slots;
+
+    // pinned memory registration
+    bool (*register_fn)(void *, size_t) = nullptr;
+    void (*unregister_fn)(void *)       = nullptr;
+    std::vector<void *> registered;
 
     std::string state_path;
 
@@ -210,16 +228,22 @@ struct llama_moe_stream::impl {
     // graph state
     std::vector<int> order;     // the tensors streamed by the current graph, in the order of their matmuls
     std::vector<int> order_pos; // [tensors.size()] position of a tensor in order, -1 if not streamed
-    bool    expect_more   = false;
-    bool    last_streamed = false;
-    bool    selective     = false; // the current graph reads only the experts selected by the router
-    int     sel_layer     = -1;
-    std::vector<bool> sel_used;    // the experts selected in sel_layer
-    int64_t n_tokens      = 0;
-    uint64_t clock        = 0;
+    bool     expect_more   = false;
+    bool     last_streamed = false;
+    int64_t  n_tokens      = 0;
+    uint32_t graph_gen     = 0;
+    uint64_t clock         = 0;
+
+    // usage scores: an expert selected by a token gets 2^(tclock/halflife - sbase)
+    double tclock = 0.0;
+    double sbase  = 0.0;
 
     std::vector<int32_t> needed;
     std::vector<int32_t> missing;
+    std::vector<int32_t> overflow;
+    std::vector<int32_t> cnt;       // [max n_expert] tokens per expert in the current batch
+    std::vector<int32_t> ov_index;  // [max n_expert] index in the window, -1 if not in it
+    std::vector<int32_t> rank;
 
     std::vector<uint8_t> zeros = std::vector<uint8_t>(512, 0); // padding of experts that are not read
 
@@ -231,17 +255,21 @@ struct llama_moe_stream::impl {
     double t_first   = -1.0;
     double t_stalled = 0.0;
     int    n_misses  = 0;
-    int    n_wasted  = 0; // prefetched tensors evicted before they were used
+    int    n_wasted  = 0; // tensors in staging buffers reused before they were uploaded
+    int64_t pf_need  = 0; // selected experts that were not cached
+    int64_t pf_hit   = 0; // of which the reads had started before the router selected them
 
-    // generation stats, since the last report
-    int64_t dec_tokens = 0;
-    int64_t dec_access = 0;
-    int64_t dec_hits   = 0;
-    size_t  dec_bytes  = 0;
-    double  dec_t_read = 0.0;
+    // stats of the batches computed on the CPU, since the last report
+    int64_t cpu_tokens  = 0;
+    int64_t cpu_batches = 0;
+    int64_t cpu_access  = 0;
+    int64_t cpu_hits    = 0;
+    int64_t cpu_window  = 0;
+    size_t  cpu_bytes   = 0;
+    double  cpu_t_read  = 0.0;
 
     bool    graph_cached = false; // the current graph was computed from the cache
-    int64_t state_tokens = 0;     // generated tokens since the state was saved
+    int64_t state_tokens = 0;     // tokens computed on the CPU since the state was saved
     bool    state_dirty  = false;
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const llama_moe_stream_params & params) {
@@ -253,6 +281,7 @@ struct llama_moe_stream::impl {
 #else
         policy        = params.policy;
         n_expert_used = model.hparams.n_expert_used_max();
+        page_size     = sysconf(_SC_PAGESIZE);
 
         // the experts are offloaded to the first GPU (see ggml_backend_sched_backend_id_from_cur)
         for (auto * backend : backends) {
@@ -277,10 +306,20 @@ struct llama_moe_stream::impl {
         if (const char * env = getenv("LLAMA_MOE_STREAM_SLOTS")) {
             n_slots = std::max(2, atoi(env));
         }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_SELECTIVE")) {
-            selective_max = std::max(0, atoi(env));
+        if (const char * env = getenv("LLAMA_MOE_STREAM_CPU_MAX")) {
+            cpu_max = std::max(0, atoi(env));
+        }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_HALFLIFE")) {
+            halflife = std::max(1.0, atof(env));
         }
         slots.resize(n_slots);
+        for (auto & sl : slots) {
+            sl.off  .assign(max_n_expert, SIZE_MAX);
+            sl.state.assign(max_n_expert, EXP_NONE);
+            sl.wg = std::vector<wait_group>(max_n_expert);
+        }
+        cnt     .assign(max_n_expert, 0);
+        ov_index.assign(max_n_expert, -1);
 
         const int n_threads = std::max(1, params.n_threads);
 
@@ -299,7 +338,16 @@ struct llama_moe_stream::impl {
             posix_fadvise(files[ti.file].fd_buffered, ti.file_offs, ti.nbytes, POSIX_FADV_DONTNEED);
         }
 
-        if (!alloc_cache() || !fill_cache() || !alloc_slots()) {
+        auto * reg = ggml_backend_dev_backend_reg(target_dev);
+        if (reg) {
+            // the registration of host memory is disabled by default in the CUDA backend, which only uses it for
+            // this: enable it unless the user disabled it
+            setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
+            register_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+            unregister_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+        }
+
+        if (!alloc_staging() || !alloc_cache() || !fill_cache()) {
             return;
         }
 
@@ -330,22 +378,28 @@ struct llama_moe_stream::impl {
                 ggml_backend_event_free(s.event);
             }
         }
-        if (host_buf) {
-            ggml_backend_buffer_free(host_buf);
+        for (void * p : registered) {
+            unregister_fn(p);
         }
-        free(host_mem);
         if (bank_ctx) {
             ggml_free(bank_ctx);
         }
-        if (bank_buf && bank_buf != arena_buf) {
+        if (bank_buf) {
             ggml_backend_buffer_free(bank_buf);
-        }
-        if (arena_buf) {
-            ggml_backend_buffer_free(arena_buf);
         }
         if (arena) {
             munmap(arena, arena_size);
         }
+        if (staging) {
+            munmap(staging, staging_size_);
+        }
+        if (memfd >= 0) {
+            close(memfd);
+        }
+        if (host_buf) {
+            ggml_backend_buffer_free(host_buf);
+        }
+        free(host_mem);
         for (auto & f : files) {
             if (f.fd_direct >= 0) {
                 close(f.fd_direct);
@@ -424,6 +478,7 @@ struct llama_moe_stream::impl {
             tensor ti;
             ti.t           = t;
             ti.layer       = -1;
+            ti.index       = -1;
             ti.file        = fi;
             ti.file_offs   = offs;
             ti.nbytes      = ggml_nbytes(t);
@@ -458,6 +513,7 @@ struct llama_moe_stream::impl {
             const int li = (int) layers.size();
             for (auto & ti : ts) {
                 ti.layer = li;
+                ti.index = (int) l.tensors.size();
                 l.tensors.push_back((int) tensors.size());
                 tensor_idx[ti.t]     = (int) tensors.size();
                 name_idx[ti.t->name] = (int) tensors.size();
@@ -467,6 +523,7 @@ struct llama_moe_stream::impl {
                 layer_of_il.resize(il + 1, -1);
             }
             layer_of_il[il] = li;
+            max_n_expert = std::max(max_n_expert, l.n_expert);
             layers.push_back(std::move(l));
         }
 
@@ -499,15 +556,14 @@ struct llama_moe_stream::impl {
         return kb*1024;
     }
 
-    // the worst case size of the streamed part of a tensor in a staging buffer, whichever experts are cached:
-    // every run of streamed experts can need up to 2 alignment blocks more
-    static size_t max_slot_bytes(const tensor & ti, int64_t n_cached) {
+    // the size of a staging buffer for the experts of a tensor that are not cached: each is read as its own
+    // aligned range of the file, which can need up to 2 alignment blocks more
+    size_t max_slot_bytes(const tensor & ti, int64_t n_cached) const {
         const int64_t n_streamed = ti.n_expert - n_cached;
         if (n_streamed <= 0) {
             return 0;
         }
-        const int64_t n_runs = std::min(n_streamed, n_cached + 1);
-        return n_streamed*ti.expert_size + n_runs*2*STREAM_ALIGN;
+        return align_up(n_streamed*(ti.expert_size + 2*STREAM_ALIGN), page_size);
     }
 
     size_t staging_size(double frac) const {
@@ -518,7 +574,7 @@ struct llama_moe_stream::impl {
                 res = std::max(res, max_slot_bytes(tensors[idx], n_cached));
             }
         }
-        return slots.size()*align_up(res, STREAM_ALIGN);
+        return slots.size()*res;
     }
 
     // every layer caches the same fraction of its experts
@@ -554,12 +610,14 @@ struct llama_moe_stream::impl {
             l.expert_of.assign(l.n_slots,  -1);
             l.stamp    .assign(l.n_expert, 0);
             l.prot     .assign(l.n_expert, 0);
+            l.score    .assign(l.n_expert, 0.0);
             l.mark     .assign(l.n_expert, 0);
+            l.counts   .assign(l.n_expert, 0);
 
             for (int idx : l.tensors) {
                 auto & ti = tensors[idx];
                 total_res += (size_t) l.n_slots * ti.expert_size;
-                slot_size = std::max(slot_size, align_up(max_slot_bytes(ti, l.n_slots), STREAM_ALIGN));
+                slot_size = std::max(slot_size, max_slot_bytes(ti, l.n_slots));
             }
         }
 
@@ -568,88 +626,193 @@ struct llama_moe_stream::impl {
     }
 
     //
-    // expert cache
+    // memory
     //
 
-    bool alloc_cache() {
-        size_t total = 0;
-        size_t n_banks = 0;
-        for (const auto & l : layers) {
-            for (int idx : l.tensors) {
-                if (l.n_slots > 0) {
-                    total += align_up(l.n_slots*tensors[idx].expert_size, STREAM_ALIGN);
-                    n_banks++;
+    bool register_pinned(void * p, size_t n) {
+        if (!register_fn || !unregister_fn || n == 0) {
+            return false;
+        }
+        if (!register_fn(p, n)) {
+            return false;
+        }
+        registered.push_back(p);
+        return true;
+    }
+
+    // the staging buffers: in a memfd, so that each can also be mapped as the overflow window of the cache of the
+    // tensors computed on the CPU, and registered as pinned memory for the uploads
+    bool alloc_staging() {
+        if (slot_size == 0) {
+            LLAMA_LOG_INFO("moe_stream: %s: all the experts are cached, nothing to stream\n", __func__);
+            return true;
+        }
+
+        const size_t n_slots = slots.size();
+        staging_size_ = n_slots*slot_size;
+
+        uint8_t * base = nullptr;
+        bool      pin  = false;
+
+        memfd = memfd_create("moe-stream-staging", MFD_CLOEXEC);
+        if (memfd >= 0 && ftruncate(memfd, staging_size_) == 0) {
+            void * p = mmap(nullptr, staging_size_, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+            if (p != MAP_FAILED) {
+                staging = p;
+                base    = (uint8_t *) p;
+                if (mlock(staging, staging_size_) != 0) {
+                    LLAMA_LOG_WARN("moe_stream: %s: failed to lock the staging buffers: %s\n", __func__, strerror(errno));
                 }
+                pin = register_pinned(staging, staging_size_);
             }
         }
-        if (total == 0) {
+        if (!base) {
+            LLAMA_LOG_WARN("moe_stream: %s: memfd failed (%s), batches computed on the CPU are limited to the cache size\n", __func__, strerror(errno));
+            if (memfd >= 0) {
+                close(memfd);
+                memfd = -1;
+            }
+            if (auto * buft = ggml_backend_dev_host_buffer_type(target_dev)) {
+                host_buf = ggml_backend_buft_alloc_buffer(buft, staging_size_ + STREAM_ALIGN);
+            }
+            if (host_buf) {
+                base = (uint8_t *) align_up((size_t) ggml_backend_buffer_get_base(host_buf), STREAM_ALIGN);
+                pin  = true;
+            } else if (posix_memalign(&host_mem, STREAM_ALIGN, staging_size_) == 0) {
+                base = (uint8_t *) host_mem;
+            }
+        }
+        if (!base) {
+            LLAMA_LOG_ERROR("moe_stream: %s: failed to allocate %.2f GiB for the staging buffers, MoE streaming disabled\n", __func__, staging_size_/GiB);
+            return false;
+        }
+
+        for (size_t s = 0; s < n_slots; ++s) {
+            slots[s].data  = base + s*slot_size;
+            slots[s].event = ggml_backend_event_new(target_dev);
+        }
+
+        if (!pin) {
+            LLAMA_LOG_WARN("moe_stream: %s: the staging buffers are not pinned, uploads from them will be slower\n", __func__);
+        }
+        LLAMA_LOG_INFO("moe_stream: %s: %zu x %.2f GiB %s staging buffers (%.2f GiB), %zu IO threads\n", __func__,
+                n_slots, slot_size/GiB, pin ? "pinned" : "normal", staging_size_/GiB, workers.size());
+
+        return true;
+    }
+
+    // the cache: for each tensor its slots, ending at a page boundary, followed by its overflow window if any
+    bool alloc_cache() {
+        struct region {
+            int    t;
+            size_t bank;   // bytes of the cache slots
+            size_t padded; // rounded up to pages
+            bool   window;
+        };
+        std::vector<region> regions;
+        size_t total = 0;
+        size_t total_banks = 0;
+        int    n_windows = 0;
+
+        for (auto & l : layers) {
+            // a window per tensor of the layer, each over its own staging buffer
+            l.window = memfd >= 0 && l.streamed() && l.tensors.size() <= slots.size();
+            for (int idx : l.tensors) {
+                const auto & ti = tensors[idx];
+                region r;
+                r.t      = idx;
+                r.bank   = l.n_slots*ti.expert_size;
+                r.padded = align_up(r.bank, page_size);
+                r.window = l.window;
+                if (r.bank == 0 && !r.window) {
+                    continue;
+                }
+                total       += r.padded + (r.window ? slot_size : 0);
+                total_banks += r.bank;
+                n_windows   += r.window;
+                regions.push_back(r);
+            }
+        }
+        if (regions.empty()) {
             return true;
         }
 
         const double t_start = t_now();
 
-        uint8_t * base = nullptr;
+        arena_size = total;
+        arena = mmap(nullptr, arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (arena == MAP_FAILED) {
+            arena = nullptr;
+            LLAMA_LOG_ERROR("moe_stream: %s: failed to allocate %.2f GiB for the expert cache: %s\n", __func__, total_banks/GiB, strerror(errno));
+            return false;
+        }
 
-        // pinned memory makes the uploads of the cached experts DMA, but pinning that much can take long
         const char * env_pin = getenv("LLAMA_MOE_STREAM_PIN");
-        if (env_pin && atoi(env_pin) != 0) {
-            if (auto * buft = ggml_backend_dev_host_buffer_type(target_dev)) {
-                arena_buf = ggml_backend_buft_alloc_buffer(buft, total + STREAM_ALIGN);
+        const bool want_pin = env_pin && atoi(env_pin) != 0;
+
+        bool lock_failed = false;
+        size_t n_pinned = 0;
+
+        uint8_t * cur = (uint8_t *) arena;
+        std::vector<uint8_t *> starts(regions.size());
+        for (size_t i = 0; i < regions.size(); ++i) {
+            const auto & r  = regions[i];
+            const auto & ti = tensors[r.t];
+
+            if (r.padded > 0) {
+                // locking also allocates all the pages now
+                if (!lock_failed && mlock(cur, r.padded) != 0) {
+                    lock_failed = true;
+                    LLAMA_LOG_WARN("moe_stream: %s: failed to lock the expert cache (%s), it may be swapped out\n", __func__, strerror(errno));
+                    LLAMA_LOG_WARN("moe_stream: %s: raise the limit with 'ulimit -l unlimited' (or LimitMEMLOCK=infinity for a systemd service)\n", __func__);
+                }
+                if (want_pin && register_pinned(cur, r.padded)) {
+                    n_pinned += r.padded;
+                }
+                bank_ranges.emplace_back(cur, r.padded);
             }
-            if (arena_buf) {
-                base     = (uint8_t *) align_up((size_t) ggml_backend_buffer_get_base(arena_buf), STREAM_ALIGN);
-                bank_buf = arena_buf;
-                pinned   = true;
-            } else {
-                LLAMA_LOG_WARN("moe_stream: %s: failed to allocate %.2f GiB of pinned memory, using normal memory\n", __func__, total/GiB);
+            starts[i] = cur + r.padded - r.bank;
+            cur += r.padded;
+
+            if (r.window) {
+                void * p = mmap(cur, slot_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memfd, (off_t) (ti.index*slot_size));
+                if (p == MAP_FAILED) {
+                    LLAMA_LOG_ERROR("moe_stream: %s: failed to map an overflow window: %s\n", __func__, strerror(errno));
+                    return false;
+                }
+                cur += slot_size;
             }
         }
 
-        if (!base) {
-            arena_size = total;
-            arena = mmap(nullptr, arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-            if (arena == MAP_FAILED) {
-                arena = nullptr;
-                LLAMA_LOG_ERROR("moe_stream: %s: failed to allocate %.2f GiB for the expert cache: %s\n", __func__, total/GiB, strerror(errno));
-                return false;
-            }
-            // locking also allocates all the pages now
-            if (mlock(arena, arena_size) != 0) {
-                LLAMA_LOG_WARN("moe_stream: %s: failed to lock the expert cache (%s), it may be swapped out\n", __func__, strerror(errno));
-                LLAMA_LOG_WARN("moe_stream: %s: raise the limit with 'ulimit -l unlimited' (or LimitMEMLOCK=infinity for a systemd service)\n", __func__);
-            }
-            base = (uint8_t *) arena;
-            bank_buf = ggml_backend_cpu_buffer_from_ptr(arena, arena_size);
-        }
-
+        bank_buf = ggml_backend_cpu_buffer_from_ptr(arena, arena_size);
         ggml_backend_buffer_set_usage(bank_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
         ggml_init_params ip = {
-            /*.mem_size   =*/ ggml_tensor_overhead()*(n_banks + 1),
+            /*.mem_size   =*/ ggml_tensor_overhead()*(regions.size() + 1),
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
         bank_ctx = ggml_init(ip);
 
-        uint8_t * p = base;
-        for (const auto & l : layers) {
-            if (l.n_slots == 0) {
-                continue;
-            }
-            for (int idx : l.tensors) {
-                auto & ti = tensors[idx];
-                ti.bank = ggml_new_tensor_3d(bank_ctx, ti.t->type, ti.t->ne[0], ti.t->ne[1], l.n_slots);
-                GGML_ASSERT((size_t) ti.bank->nb[2] == ti.expert_size);
-                ggml_format_name(ti.bank, "%s.cache", ti.t->name);
-                ggml_backend_tensor_alloc(bank_buf, ti.bank, p);
-                ti.bank_data = p;
-                bank_idx[ti.bank] = idx;
-                p += align_up(l.n_slots*ti.expert_size, STREAM_ALIGN);
-            }
+        for (size_t i = 0; i < regions.size(); ++i) {
+            const auto & r  = regions[i];
+            auto       & ti = tensors[r.t];
+            const auto & l  = layers[ti.layer];
+
+            const int64_t n_window = r.window ? (int64_t) (slot_size / ti.expert_size) : 0;
+            GGML_ASSERT(!r.window || n_window >= l.n_expert - l.n_slots);
+
+            ti.bank = ggml_new_tensor_3d(bank_ctx, ti.t->type, ti.t->ne[0], ti.t->ne[1], l.n_slots + n_window);
+            GGML_ASSERT((size_t) ti.bank->nb[2] == ti.expert_size);
+            ggml_format_name(ti.bank, "%s.cache", ti.t->name);
+            ggml_backend_tensor_alloc(bank_buf, ti.bank, starts[i]);
+            ti.bank_data = starts[i];
         }
 
-        LLAMA_LOG_INFO("moe_stream: %s: allocated %.2f GiB of %s memory for the expert cache in %.1f s\n", __func__,
-                total/GiB, pinned ? "pinned" : "locked", t_now() - t_start);
+        pinned = want_pin && n_pinned > 0;
+
+        LLAMA_LOG_INFO("moe_stream: %s: allocated %.2f GiB of %s memory for the expert cache in %.1f s, %d overflow windows\n", __func__,
+                total_banks/GiB, pinned ? "pinned" : "locked", t_now() - t_start, n_windows);
 
         return true;
     }
@@ -693,8 +856,6 @@ struct llama_moe_stream::impl {
                 read_experts(l, l.expert_of[s], s, n, wg);
                 s += n;
             }
-
-            build_layout(l);
         }
         if (!wait(wg)) {
             LLAMA_LOG_ERROR("moe_stream: %s: failed to read the experts into the cache\n", __func__);
@@ -709,27 +870,31 @@ struct llama_moe_stream::impl {
         return true;
     }
 
+    // the largest batch of a layer computed on the CPU
+    int64_t cpu_limit(const layer & l) const {
+        if (!l.streamed() || l.window) {
+            return cpu_max;
+        }
+        // without a window, all the experts of a batch must fit in the cache
+        return std::min<int64_t>(cpu_max, n_expert_used > 0 ? l.n_slots / n_expert_used : 0);
+    }
+
     // log how batches are computed
     void check_offload() {
-        int64_t cpu_max = INT64_MAX;
+        int64_t lim = INT64_MAX;
         for (const auto & l : layers) {
-            if (l.streamed()) {
-                cpu_max = std::min<int64_t>(cpu_max, n_expert_used > 0 ? l.n_slots / n_expert_used : 0);
-            }
+            lim = std::min(lim, cpu_limit(l));
         }
-        if (cpu_max == INT64_MAX) {
-            return; // everything cached
+        LLAMA_LOG_INFO("moe_stream: %s: batches of up to %" PRId64 " tokens are computed on the CPU from the cache (LLAMA_MOE_STREAM_CPU_MAX=%" PRId64 "),"
+                " larger ones on %s, prefetching the experts in the order of their usage\n", __func__,
+                lim, cpu_max, ggml_backend_name(target_backend));
+        if (lim < cpu_max) {
+            LLAMA_LOG_WARN("moe_stream: %s: without overflow windows, batches on the CPU are limited to %" PRId64 " tokens\n", __func__, lim);
         }
-        if (cpu_max == 0) {
-            LLAMA_LOG_WARN("moe_stream: %s: less than %" PRId64 " cached experts per layer, generation is offloaded too\n", __func__, n_expert_used);
-        }
-        LLAMA_LOG_INFO("moe_stream: %s: batches of up to %" PRId64 " tokens are computed on the CPU from the cache, up to %" PRId64
-                " on %s reading the selected experts, larger ones on %s streaming all the experts\n", __func__,
-                cpu_max, selective_max, ggml_backend_name(target_backend), ggml_backend_name(target_backend));
     }
 
     //
-    // saved state: the cached experts of each layer, most recently used first
+    // saved state: the cached experts of each layer, most recently used first, and the usage scores
     //
 
     int load_state() {
@@ -742,7 +907,7 @@ struct llama_moe_stream::impl {
         }
 
         std::string line;
-        if (!std::getline(in, line) || line != "moe-stream-state 1") {
+        if (!std::getline(in, line) || (line != "moe-stream-state 1" && line != "moe-stream-state 2")) {
             LLAMA_LOG_WARN("moe_stream: %s: %s is not a state file, ignored\n", __func__, state_path.c_str());
             return 0;
         }
@@ -750,6 +915,27 @@ struct llama_moe_stream::impl {
         int n_loaded = 0;
         while (std::getline(in, line)) {
             std::istringstream ss(line);
+            if (line.rfind("s ", 0) == 0) {
+                // scores
+                std::string tag;
+                int il = -1;
+                int64_t n_expert = 0;
+                if (!(ss >> tag >> il >> n_expert) || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+                    continue;
+                }
+                auto & l = layers[layer_of_il[il]];
+                if (n_expert != l.n_expert) {
+                    continue;
+                }
+                for (int64_t e = 0; e < l.n_expert; ++e) {
+                    double v = 0.0;
+                    if (!(ss >> v)) {
+                        break;
+                    }
+                    l.score[e] = std::isfinite(v) && v > 0.0 ? v : 0.0;
+                }
+                continue;
+            }
             int il = -1;
             int64_t n_expert = 0;
             int64_t count = 0;
@@ -793,7 +979,9 @@ struct llama_moe_stream::impl {
                 }
                 return;
             }
-            out << "moe-stream-state 1\n";
+            out << "moe-stream-state 2\n";
+            out.precision(6);
+            const double w = weight();
             std::vector<int32_t> es;
             for (const auto & l : layers) {
                 es.clear();
@@ -804,6 +992,13 @@ struct llama_moe_stream::impl {
                 out << l.il << " " << l.n_expert << " " << es.size();
                 for (int32_t e : es) {
                     out << " " << e;
+                }
+                out << "\n";
+
+                // relative to the current weight, so that they are restored at the scale of a fresh clock
+                out << "s " << l.il << " " << l.n_expert;
+                for (int64_t e = 0; e < l.n_expert; ++e) {
+                    out << " " << l.score[e]/w;
                 }
                 out << "\n";
             }
@@ -817,25 +1012,92 @@ struct llama_moe_stream::impl {
     }
 
     //
+    // usage scores: each selection adds 2^(tclock/halflife), relative to sbase, the scores are rescaled before
+    // the weights get large, so they never overflow
+    //
+
+    double weight() const {
+        return std::exp2(tclock/halflife - sbase);
+    }
+
+    void advance(int64_t n) {
+        tclock += (double) n;
+        if (tclock/halflife - sbase > SCORE_RESCALE) {
+            const double f = std::exp2(-SCORE_RESCALE);
+            for (auto & l : layers) {
+                for (auto & v : l.score) {
+                    v *= f;
+                }
+            }
+            sbase += SCORE_RESCALE;
+        }
+    }
+
+    // the order in which the experts of a layer that are not cached are read: most used first
+    void ranked(const layer & l, std::vector<int32_t> & out) const {
+        out.clear();
+        for (int64_t e = 0; e < l.n_expert; ++e) {
+            if (l.slot_of[e] < 0) {
+                out.push_back((int32_t) e);
+            }
+        }
+        std::stable_sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
+    }
+
+    //
     // replacement policy, for the batches computed on the CPU
     //
 
-    // the least recently used cached expert that is not selected by the batch, in the given segment (-1 = any)
-    int64_t victim(const layer & l, int seg) const {
+    // the cached expert to evict that is not selected by the batch, -1 if there is none
+    int64_t victim(const layer & l) const {
         int64_t best = -1;
+        int64_t best_prob = -1; // slru: the least recently used of the probation half first
         for (int64_t s = 0; s < l.n_slots; ++s) {
             const int64_t e = l.expert_of[s];
-            if (l.mark[e] == l.mark_gen || (seg >= 0 && l.prot[e] != seg)) {
+            if (l.mark[e] == l.mark_gen) {
                 continue;
             }
-            if (best < 0 || l.stamp[e] < l.stamp[best]) {
+            if (best < 0) {
+                best = e;
+            } else if (policy == LLAMA_MOE_STREAM_POLICY_LFU) {
+                if (l.score[e] < l.score[best] || (l.score[e] == l.score[best] && l.stamp[e] < l.stamp[best])) {
+                    best = e;
+                }
+            } else if (l.stamp[e] < l.stamp[best]) {
                 best = e;
             }
+            if (policy == LLAMA_MOE_STREAM_POLICY_SLRU && !l.prot[e] && (best_prob < 0 || l.stamp[e] < l.stamp[best_prob])) {
+                best_prob = e;
+            }
         }
-        return best;
+        return best_prob >= 0 ? best_prob : best;
     }
 
-    // make the experts selected by a batch cached and write their slots
+    // a second use promotes to the protected half (slru), its least recently used expert goes back to probation
+    void promote(layer & l, int64_t e) {
+        if (policy != LLAMA_MOE_STREAM_POLICY_SLRU || l.prot[e]) {
+            return;
+        }
+        l.prot[e] = 1;
+        l.n_prot++;
+        if (l.n_prot > l.n_slots/2) {
+            int64_t d = -1;
+            for (int64_t s = 0; s < l.n_slots; ++s) {
+                const int64_t x = l.expert_of[s];
+                if (l.prot[x] && x != e && (d < 0 || l.stamp[x] < l.stamp[d])) {
+                    d = x;
+                }
+            }
+            if (d >= 0) {
+                l.prot[d] = 0;
+                l.n_prot--;
+            }
+        }
+    }
+
+    // make the experts selected by a batch computed on the CPU available and write their slots:
+    // the missing experts replace cached ones, or go to the overflow window when the cache is full of experts
+    // selected by the batch (or, with lfu, when they are used less than the expert they would replace)
     void ensure(int li, const ggml_tensor * ids, ggml_tensor * out) {
         auto & l = layers[li];
 
@@ -862,53 +1124,43 @@ struct llama_moe_stream::impl {
                 GGML_ASSERT(e >= 0 && e < l.n_expert);
                 if (l.mark[e] != l.mark_gen) {
                     l.mark[e] = l.mark_gen;
+                    cnt[e] = 0;
                     needed.push_back(e);
                 }
+                cnt[e]++;
             }
         }
-        GGML_ASSERT((int64_t) needed.size() <= l.n_slots && "more experts selected than cache slots");
 
+        const double w = weight();
         missing.clear();
         for (int32_t e : needed) {
-            l.stamp[e] = clock;
-            dec_access++;
+            l.stamp[e]  = clock;
+            l.score[e] += cnt[e]*w;
+            cpu_access++;
             if (l.slot_of[e] < 0) {
                 missing.push_back(e);
                 continue;
             }
-            dec_hits++;
-            if (policy == LLAMA_MOE_STREAM_POLICY_SLRU && !l.prot[e]) {
-                // a second use promotes to the protected half, its least recently used expert goes back to probation
-                l.prot[e] = 1;
-                l.n_prot++;
-                if (l.n_prot > l.n_slots/2) {
-                    int64_t d = -1;
-                    for (int64_t s = 0; s < l.n_slots; ++s) {
-                        const int64_t x = l.expert_of[s];
-                        if (l.prot[x] && x != e && (d < 0 || l.stamp[x] < l.stamp[d])) {
-                            d = x;
-                        }
-                    }
-                    if (d >= 0) {
-                        l.prot[d] = 0;
-                        l.n_prot--;
-                    }
-                }
-            }
+            cpu_hits++;
+            promote(l, e);
         }
 
+        overflow.clear();
         if (!missing.empty()) {
-            // evict all the victims at once, then read all the missing experts in parallel
             const double t0 = t_now();
             const size_t read_start = bytes_read;
 
+            // the most used first, so that with lfu they are the ones admitted
+            std::stable_sort(missing.begin(), missing.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
+
             wait_group wg;
+            bool changed = false;
             for (int32_t e : missing) {
-                int64_t v = policy == LLAMA_MOE_STREAM_POLICY_SLRU ? victim(l, 0) : -1;
-                if (v < 0) {
-                    v = victim(l, -1);
+                const int64_t v = victim(l);
+                if (v < 0 || (l.window && policy == LLAMA_MOE_STREAM_POLICY_LFU && l.score[e] <= l.score[v])) {
+                    overflow.push_back(e);
+                    continue;
                 }
-                GGML_ASSERT(v >= 0);
 
                 const int32_t s = l.slot_of[v];
                 if (l.prot[v]) {
@@ -918,24 +1170,55 @@ struct llama_moe_stream::impl {
                 l.slot_of[v]   = -1;
                 l.slot_of[e]   = s;
                 l.expert_of[s] = e;
+                l.mark[v]      = l.mark_gen; // the slot is taken, not a victim again
+                changed        = true;
 
                 read_experts(l, e, s, 1, wg);
             }
+
+            if (!overflow.empty()) {
+                GGML_ASSERT(l.window && "more experts selected than cache slots");
+
+                // the windows are the staging buffers of the tensors: wait for what uses them and drop their content
+                for (int idx : l.tensors) {
+                    const int s = tensors[idx].index;
+                    release(s);
+                    reset(s, -1);
+                }
+                for (size_t j = 0; j < overflow.size(); ++j) {
+                    const int32_t e = overflow[j];
+                    ov_index[e] = (int32_t) j;
+                    for (int idx : l.tensors) {
+                        const auto & ti = tensors[idx];
+                        uint8_t * dst = ti.bank_data + (l.n_slots + j)*ti.expert_size;
+                        submit_bounce(ti.file, ti.file_offs + e*ti.expert_size, ti.expert_size, dst, wg);
+                    }
+                }
+                cpu_window += overflow.size();
+            }
+
             if (!wait(wg)) {
                 GGML_ABORT("moe_stream: failed to read the experts of layer %d", l.il);
             }
 
-            l.dirty     = true;
-            state_dirty = true;
-            dec_bytes  += bytes_read - read_start;
-            dec_t_read += t_now() - t0;
+            if (changed) {
+                l.dirty     = true;
+                state_dirty = true;
+            }
+            cpu_bytes  += bytes_read - read_start;
+            cpu_t_read += t_now() - t0;
         }
 
         int32_t * dst = (int32_t *) out->data;
         for (int64_t i1 = 0; i1 < n; ++i1) {
             for (int64_t i0 = 0; i0 < k; ++i0) {
-                dst[i1*k + i0] = l.slot_of[id_at(i0, i1)];
+                const int32_t e = id_at(i0, i1);
+                dst[i1*k + i0] = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) l.n_slots + ov_index[e];
             }
+        }
+
+        for (int32_t e : overflow) {
+            ov_index[e] = -1;
         }
     }
 
@@ -957,8 +1240,13 @@ struct llama_moe_stream::impl {
 
         const int64_t k = selected->ne[0];
         const int64_t n = selected->ne[1];
-        if (l.n_slots == 0 || (l.streamed() && l.n_slots < k*n)) {
-            return nullptr; // the batch could select more experts than there are slots
+        if (n > cpu_limit(l) || n == 0) {
+            return nullptr;
+        }
+        for (int idx : l.tensors) {
+            if (!tensors[idx].bank) {
+                return nullptr;
+            }
         }
 
         ggml_tensor * args[1] = { selected };
@@ -969,25 +1257,19 @@ struct llama_moe_stream::impl {
     // IO threads
     //
 
-    void submit(const job & j) {
-        jobs.push_back(j);
-        j.wg->pending++;
-    }
-
-    // read an aligned range of a file into an aligned buffer
-    void submit_aligned(int fi, size_t beg, size_t end, uint8_t * dst, wait_group & wg) {
-        std::lock_guard<std::mutex> lk(mtx);
-        for (size_t o = beg; o < end; o += STREAM_CHUNK) {
-            submit({ fi, o, std::min(STREAM_CHUNK, end - o), dst + (o - beg), &wg, true });
-        }
-        cv_jobs.notify_all();
-    }
-
     // read any range of a file into any buffer, through the bounce buffers of the IO threads
     void submit_bounce(int fi, size_t offs, size_t len, uint8_t * dst, wait_group & wg) {
         std::lock_guard<std::mutex> lk(mtx);
         for (size_t o = 0; o < len; o += BOUNCE_CHUNK) {
-            submit({ fi, offs + o, std::min(BOUNCE_CHUNK, len - o), dst + o, &wg, false });
+            job j;
+            j.file    = fi;
+            j.offs    = offs + o;
+            j.len     = std::min(BOUNCE_CHUNK, len - o);
+            j.dst     = dst + o;
+            j.wg      = &wg;
+            j.aligned = false;
+            jobs.push_back(j);
+            wg.pending++;
         }
         cv_jobs.notify_all();
     }
@@ -1095,87 +1377,27 @@ struct llama_moe_stream::impl {
     }
 
     //
-    // staging buffers
+    // staging buffers, for the batches computed on the GPU: the experts of a tensor that are not cached are read
+    // into its buffer most used first, before the router selected them; once it did, the reads of the experts
+    // that are not selected are cancelled and the selected ones that are missing are read first
     //
 
-    bool alloc_slots() {
-        if (slot_size == 0) {
-            LLAMA_LOG_INFO("moe_stream: %s: all the experts are cached, nothing to stream\n", __func__);
-            return true;
-        }
-
-        const size_t n_slots = slots.size();
-        const size_t size    = n_slots*slot_size + STREAM_ALIGN;
-
-        uint8_t * base = nullptr;
-
-        auto * buft = ggml_backend_dev_host_buffer_type(target_dev);
-        if (buft) {
-            host_buf = ggml_backend_buft_alloc_buffer(buft, size);
-            if (host_buf) {
-                base = (uint8_t *) ggml_backend_buffer_get_base(host_buf);
+    // cancel the queued reads of a staging buffer, of all its experts or only of those that keep[] rejects
+    // call with mtx locked
+    template <typename F>
+    void cancel_locked(int s, F && drop) {
+        auto & sl = slots[s];
+        std::deque<job> kept;
+        for (auto & j : jobs) {
+            if (j.slot == s && drop(j.expert)) {
+                j.wg->pending--;
+                sl.state[j.expert] = EXP_CANCELLED;
+                continue;
             }
+            kept.push_back(j);
         }
-        if (!base) {
-            LLAMA_LOG_WARN("moe_stream: %s: no pinned host buffer for %s, uploads from the staging buffers will be slower\n", __func__, ggml_backend_dev_name(target_dev));
-            if (posix_memalign(&host_mem, STREAM_ALIGN, size) != 0) {
-                host_mem = nullptr;
-            }
-            base = (uint8_t *) host_mem;
-        }
-        if (!base) {
-            LLAMA_LOG_ERROR("moe_stream: %s: failed to allocate %.2f GiB for the staging buffers, MoE streaming disabled\n", __func__, size/GiB);
-            return false;
-        }
-
-        base = (uint8_t *) align_up((size_t) base, STREAM_ALIGN);
-        for (size_t s = 0; s < n_slots; ++s) {
-            slots[s].data  = base + s*slot_size;
-            slots[s].event = ggml_backend_event_new(target_dev);
-        }
-
-        LLAMA_LOG_INFO("moe_stream: %s: %zu x %.2f GiB %s staging buffers (%.2f GiB), %zu IO threads\n", __func__,
-                n_slots, slot_size/GiB, host_buf ? ggml_backend_buffer_name(host_buf) : "CPU", n_slots*slot_size/GiB, workers.size());
-
-        return true;
-    }
-
-    // the runs of streamed experts of the tensors of a layer and their place in a staging buffer
-    void build_layout(layer & l) {
-        for (int idx : l.tensors) {
-            auto & ti = tensors[idx];
-            const size_t es = ti.expert_size;
-
-            ti.runs.clear();
-            ti.exp_slot.assign(ti.n_expert, SIZE_MAX);
-            ti.slot_bytes = 0;
-            ti.layout++;
-
-            for (int64_t first = 0; first < ti.n_expert; ) {
-                if (l.slot_of[first] >= 0) {
-                    first++;
-                    continue;
-                }
-                int64_t last = first;
-                while (last + 1 < ti.n_expert && l.slot_of[last + 1] < 0) {
-                    last++;
-                }
-
-                run r;
-                r.rd_beg    = align_down(ti.file_offs + first*es,      STREAM_ALIGN);
-                r.rd_end    = align_up  (ti.file_offs + (last + 1)*es, STREAM_ALIGN);
-                r.slot_offs = ti.slot_bytes;
-                for (int64_t e = first; e <= last; ++e) {
-                    ti.exp_slot[e] = r.slot_offs + (ti.file_offs + e*es - r.rd_beg);
-                }
-                ti.slot_bytes += r.rd_end - r.rd_beg;
-                ti.runs.push_back(r);
-
-                first = last + 1;
-            }
-
-            GGML_ASSERT(ti.slot_bytes <= slot_size);
-        }
+        jobs.swap(kept);
+        cv_done.notify_all();
     }
 
     // wait until a staging buffer can be overwritten
@@ -1189,37 +1411,122 @@ struct llama_moe_stream::impl {
             }
             sl.uploading = false;
         }
-        wait(sl.wg);
+        std::unique_lock<std::mutex> lk(mtx);
+        cancel_locked(s, [](int) { return true; });
+        cv_done.wait(lk, [&] {
+            for (const auto & wg : sl.wg) {
+                if (wg.pending > 0) {
+                    return false;
+                }
+            }
+            return true;
+        });
     }
 
-    void load(int s, int t) {
-        release(s);
-
+    // give a staging buffer to tensor t (-1 = none), after release()
+    void reset(int s, int t) {
         auto & sl = slots[s];
-        if (sl.tensor >= 0 && !sl.consumed) {
+        if (sl.tensor >= 0 && !sl.consumed && t >= 0) {
             n_wasted++;
         }
-
-        const auto & ti = tensors[t];
-
         sl.tensor   = t;
-        sl.layout   = ti.layout;
         sl.consumed = false;
-        for (const auto & r : ti.runs) {
-            submit_aligned(ti.file, r.rd_beg, r.rd_end, sl.data + r.slot_offs, sl.wg);
+        sl.fill     = 0;
+        std::fill(sl.off.begin(),   sl.off.end(),   SIZE_MAX);
+        std::fill(sl.state.begin(), sl.state.end(), (uint8_t) EXP_NONE);
+        for (auto & wg : sl.wg) {
+            wg.error = false;
         }
+    }
+
+    // read expert e into its place in the staging buffer, first in the queue if front
+    // call with mtx locked
+    void place_locked(int s, int64_t e, bool front, std::vector<job> & head) {
+        auto & sl = slots[s];
+        const auto & ti = tensors[sl.tensor];
+        const size_t es = ti.expert_size;
+
+        const size_t beg = align_down(ti.file_offs + e*es,       STREAM_ALIGN);
+        const size_t end = align_up  (ti.file_offs + (e + 1)*es, STREAM_ALIGN);
+
+        uint8_t * dst;
+        if (sl.state[e] == EXP_NONE) {
+            GGML_ASSERT(sl.fill + (end - beg) <= slot_size);
+            sl.off[e] = sl.fill + (ti.file_offs + e*es - beg);
+            dst = sl.data + sl.fill;
+            sl.fill += end - beg;
+        } else {
+            // cancelled: read again at the same place, its reads in flight write the same data
+            dst = sl.data + sl.off[e] - (ti.file_offs + e*es - beg);
+        }
+        sl.state[e] = EXP_PLACED;
+
+        for (size_t o = beg; o < end; o += STREAM_CHUNK) {
+            job j;
+            j.file    = ti.file;
+            j.offs    = o;
+            j.len     = std::min(STREAM_CHUNK, end - o);
+            j.dst     = dst + (o - beg);
+            j.wg      = &sl.wg[e];
+            j.aligned = true;
+            j.slot    = s;
+            j.expert  = (int) e;
+            if (front) {
+                head.push_back(j);
+            } else {
+                jobs.push_back(j);
+            }
+            sl.wg[e].pending++;
+        }
+    }
+
+    // read the experts that are not cached, most used first
+    void speculate(int s) {
+        auto & sl = slots[s];
+        const auto & l = layers[tensors[sl.tensor].layer];
+
+        ranked(l, rank);
+
+        std::vector<job> head;
+        std::lock_guard<std::mutex> lk(mtx);
+        for (int32_t e : rank) {
+            if (sl.state[e] != EXP_PLACED) {
+                place_locked(s, e, false, head);
+            }
+        }
+        cv_jobs.notify_all();
+    }
+
+    // the router selected the experts: cancel the reads of the others, read the missing ones first
+    void fill(int s, const std::vector<int32_t> & counts) {
+        auto & sl = slots[s];
+        const auto & l = layers[tensors[sl.tensor].layer];
+
+        std::vector<job> head;
+        std::lock_guard<std::mutex> lk(mtx);
+        cancel_locked(s, [&](int e) { return counts[e] == 0; });
+        for (int64_t e = 0; e < l.n_expert; ++e) {
+            if (counts[e] == 0 || l.slot_of[e] >= 0) {
+                continue;
+            }
+            if (sl.state[e] != EXP_PLACED) {
+                place_locked(s, e, true, head);
+            }
+        }
+        jobs.insert(jobs.begin(), head.begin(), head.end());
+        cv_jobs.notify_all();
     }
 
     int find_slot(int t) const {
         for (size_t s = 0; s < slots.size(); ++s) {
-            if (slots[s].tensor == t && slots[s].layout == tensors[t].layout) {
+            if (slots[s].tensor == t) {
                 return (int) s;
             }
         }
         return -1;
     }
 
-    // the staging buffer to read a new tensor into: not one of the wanted tensors, preferably empty or already uploaded
+    // the staging buffer to give to a new tensor: not one of the wanted tensors, preferably empty or already uploaded
     int pick_slot(const std::vector<int> & wanted) const {
         int best = -1;
         int best_score = -1;
@@ -1237,7 +1544,19 @@ struct llama_moe_stream::impl {
         return best;
     }
 
-    // make sure tensor t is in a staging buffer, and read the next tensors of the graph into the other ones
+    // give a staging buffer to tensor t and start its reads
+    void assign(int s, int t) {
+        release(s);
+        reset(s, t);
+        const auto & l = layers[tensors[t].layer];
+        if (l.counts_gen == graph_gen) {
+            fill(s, l.counts); // the router of this layer already selected the experts
+        } else {
+            speculate(s);
+        }
+    }
+
+    // make sure tensor t has a staging buffer, and start the reads of the next tensors of the graph in the others
     // the buffers of the tensors already uploaded are reused once their uploads are done, which in the steady
     // state is the previous tensor, whose upload is queued before the upload of t anyway
     int prepare(int t) {
@@ -1260,7 +1579,7 @@ struct llama_moe_stream::impl {
             if (s < 0) {
                 s = 0;
             }
-            load(s, t);
+            assign(s, t);
         }
 
         for (size_t i = 1; i < wanted.size(); ++i) {
@@ -1271,127 +1590,36 @@ struct llama_moe_stream::impl {
             if (o < 0) {
                 break;
             }
-            load(o, wanted[i]);
+            assign(o, wanted[i]);
         }
 
         return s;
     }
 
-    //
-    // selective reads: for small batches, only the selected experts that are not cached are read, once the router
-    // has selected them. the reads of all the tensors of a layer are issued together.
-    //
-
-    void issue_selective(int t, const std::vector<bool> * used, int s) {
-        release(s);
-
-        auto & sl = slots[s];
-        if (sl.tensor >= 0 && !sl.consumed) {
-            n_wasted++; // a prefetch of a large batch
+    bool expert_ready(int s, int64_t e) {
+        const auto & sl = slots[s];
+        if (sl.state[e] != EXP_PLACED) {
+            return false;
         }
-        if (sl.sel_owner >= 0) {
-            tensors[sl.sel_owner].sel_slot = -1;
-        }
-        sl.tensor    = -1;
-        sl.consumed  = false;
-        sl.sel_owner = t;
-
-        auto & ti = tensors[t];
-        const auto & l = layers[ti.layer];
-        const size_t es = ti.expert_size;
-
-        ti.sel_slot = s;
-        if (used) {
-            sel_used = *used;
-        }
-
-        // the runs of selected experts that are not cached
-        std::vector<run> rs;
-        size_t bytes = 0;
-        ti.sel_exp.assign(ti.n_expert, SIZE_MAX);
-        for (int64_t first = 0; first < ti.n_expert && used; ) {
-            if (!(*used)[first] || l.slot_of[first] >= 0) {
-                first++;
-                continue;
-            }
-            int64_t last = first;
-            while (last + 1 < ti.n_expert && (*used)[last + 1] && l.slot_of[last + 1] < 0) {
-                last++;
-            }
-            run r;
-            r.rd_beg    = align_down(ti.file_offs + first*es,      STREAM_ALIGN);
-            r.rd_end    = align_up  (ti.file_offs + (last + 1)*es, STREAM_ALIGN);
-            r.slot_offs = bytes;
-            for (int64_t e = first; e <= last; ++e) {
-                ti.sel_exp[e] = r.slot_offs + (ti.file_offs + e*es - r.rd_beg);
-            }
-            bytes += r.rd_end - r.rd_beg;
-            rs.push_back(r);
-            first = last + 1;
-        }
-
-        // without the selection, or too fragmented to fit: read all the experts that are not cached
-        ti.sel_full = !used || bytes > slot_size;
-        for (const auto & r : ti.sel_full ? ti.runs : rs) {
-            submit_aligned(ti.file, r.rd_beg, r.rd_end, sl.data + r.slot_offs, sl.wg);
-        }
+        std::lock_guard<std::mutex> lk(mtx);
+        return sl.wg[e].pending == 0 && !sl.wg[e].error;
     }
 
-    // a staging buffer for selective reads: free, or holding a tensor that was uploaded
-    int pick_selective() const {
-        int best = -1;
-        int best_score = -1;
-        for (size_t s = 0; s < slots.size(); ++s) {
-            const auto & sl = slots[s];
-            const bool other = sl.sel_owner < 0 || tensors[sl.sel_owner].layer != sel_layer;
-            const int score = other ? 2 : sl.consumed ? 1 : -1;
-            if (score > best_score) {
-                best       = (int) s;
-                best_score = score;
-            }
-        }
-        return best_score >= 0 ? best : -1;
-    }
-
-    int prepare_selective(int t, const std::vector<bool> * used) {
-        const auto & ti = tensors[t];
-
-        if (ti.layer != sel_layer || (used && *used != sel_used)) {
-            // a new layer: read the selected experts of all its tensors, t first
-            sel_layer = ti.layer;
-            for (int idx : layers[sel_layer].tensors) {
-                tensors[idx].sel_slot = -1;
-            }
-            std::vector<int> ts = { t };
-            for (int idx : layers[sel_layer].tensors) {
-                if (idx != t) {
-                    ts.push_back(idx);
-                }
-            }
-            for (int u : ts) {
-                const int s = pick_selective();
-                if (s < 0) {
-                    break;
-                }
-                issue_selective(u, used, s);
-            }
-        }
-
-        if (ti.sel_slot < 0) {
-            // not enough staging buffers for the whole layer
-            n_misses++;
-            int s = pick_selective();
-            issue_selective(t, used, s < 0 ? 0 : s);
-        }
-
-        return ti.sel_slot;
-    }
-
-    void copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<bool> * used) {
+    void copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<int32_t> * counts) {
         const int    t  = tensor_idx.at(src);
         const auto & ti = tensors[t];
-        const auto & l  = layers[ti.layer];
+        auto       & l  = layers[ti.layer];
         const size_t es = ti.expert_size;
+
+        // the router selected the experts of this layer: record their usage, once per graph
+        if (counts && l.counts_gen != graph_gen) {
+            l.counts_gen = graph_gen;
+            l.counts     = *counts;
+            const double w = weight();
+            for (int64_t e = 0; e < l.n_expert; ++e) {
+                l.score[e] += l.counts[e]*w;
+            }
+        }
 
         int s = -1;
         if (l.streamed()) {
@@ -1400,10 +1628,38 @@ struct llama_moe_stream::impl {
                 bytes_read_start = bytes_read;
             }
 
-            s = selective ? prepare_selective(t, used) : prepare(t);
+            if (counts) {
+                // count how many of the selected experts that are not cached were already being read
+                const int s0 = find_slot(t);
+                for (int64_t e = 0; e < l.n_expert; ++e) {
+                    if ((*counts)[e] > 0 && l.slot_of[e] < 0) {
+                        pf_need++;
+                        pf_hit += s0 >= 0 && slots[s0].state[e] == EXP_PLACED;
+                    }
+                }
+            }
+
+            s = prepare(t);
+
+            if (counts) {
+                // this tensor and the other tensors of the layer that already have a buffer
+                for (size_t o = 0; o < slots.size(); ++o) {
+                    if (slots[o].tensor >= 0 && tensors[slots[o].tensor].layer == ti.layer) {
+                        fill((int) o, *counts);
+                    }
+                }
+            } else {
+                speculate(s); // all of them
+            }
 
             const double t0 = t_now();
-            const bool ok = wait(slots[s].wg);
+            bool ok = true;
+            for (int64_t e = 0; e < l.n_expert; ++e) {
+                if (l.slot_of[e] >= 0 || (counts && (*counts)[e] == 0)) {
+                    continue;
+                }
+                ok = wait(slots[s].wg[e]) && ok;
+            }
             t_stalled += t_now() - t0;
 
             if (!ok) {
@@ -1411,29 +1667,17 @@ struct llama_moe_stream::impl {
             }
         }
 
-        // where the experts that are not cached are in the staging buffer
-        const bool sel = s >= 0 && selective && !ti.sel_full;
-        const std::vector<size_t> & ex = sel ? ti.sel_exp : ti.exp_slot;
-        if (s >= 0) {
-            if (selective) {
-                GGML_ASSERT(ti.sel_slot == s && slots[s].sel_owner == t);
-            } else {
-                GGML_ASSERT(slots[s].tensor == t && slots[s].layout == ti.layout);
-            }
-        }
-
-        // copy [off, off + size) of the tensor, from the cache or from the staging buffer
-        auto put = [&](size_t off, size_t size) {
+        // copy [off, off + size) of the tensor, from the cache or from the staging buffer, whole experts
+        // except for the padding after the last one, which is zeros if the expert is not available
+        auto put = [&](size_t off, size_t size, bool padding) {
             while (size > 0) {
                 const int64_t e   = off / es;
                 const bool    res = l.slot_of[e] >= 0;
 
-                // extend over the next experts with the same source that are contiguous in it
+                // extend over the next cached experts that are in consecutive slots
                 int64_t e2  = e;
                 size_t  end = (e + 1)*es;
-                while (end < off + size && e2 + 1 < ti.n_expert && (l.slot_of[e2 + 1] >= 0) == res &&
-                        (res ? l.slot_of[e2 + 1] == l.slot_of[e2] + 1 :
-                               ex[e2] != SIZE_MAX && ex[e2 + 1] == ex[e2] + es)) {
+                while (res && end < off + size && e2 + 1 < ti.n_expert && l.slot_of[e2 + 1] == l.slot_of[e2] + 1) {
                     e2++;
                     end += es;
                 }
@@ -1443,16 +1687,14 @@ struct llama_moe_stream::impl {
                     const uint8_t * p = ti.bank_data + l.slot_of[e]*es + (off - e*es);
                     ggml_backend_tensor_set_async(backend, dst, p, off, n);
                     bytes_up_res += n;
-                } else if (ex[e] == SIZE_MAX) {
-                    // the padding after the last selected expert, its content does not matter as long as it is finite
-                    GGML_ASSERT(sel && n <= zeros.size() && "an expert was not read");
-                    ggml_backend_tensor_set_async(backend, dst, zeros.data(), off, n);
-                } else {
-                    GGML_ASSERT(s >= 0);
-                    const size_t so = ex[e] + (off - e*es);
+                } else if (s >= 0 && expert_ready(s, e)) {
+                    const size_t so = slots[s].off[e] + (off - e*es);
                     GGML_ASSERT(so + n <= slot_size);
                     ggml_backend_tensor_set_async(backend, dst, slots[s].data + so, off, n);
                     bytes_up_slot += n;
+                } else {
+                    GGML_ASSERT(padding && n <= zeros.size() && "an expert was not read");
+                    ggml_backend_tensor_set_async(backend, dst, zeros.data(), off, n);
                 }
 
                 off  += n;
@@ -1460,26 +1702,25 @@ struct llama_moe_stream::impl {
             }
         };
 
-        if (!used) {
-            put(0, ti.nbytes);
-        } else {
-            const int64_t n_expert = ti.n_expert;
-            for (int64_t first = 0; first < n_expert; ) {
-                if (!(*used)[first]) {
-                    first++;
-                    continue;
-                }
-                int64_t last = first;
-                while (last + 1 < n_expert && (*used)[last + 1]) {
-                    last++;
-                }
-
-                // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-                const size_t padding = last < n_expert - 1 ? std::min<size_t>(es, 512) : 0;
-                put(first*es, (last + 1 - first)*es + padding);
-
-                first = last + 1;
+        const int64_t n_expert = ti.n_expert;
+        for (int64_t first = 0; first < n_expert; ) {
+            if (counts && (*counts)[first] == 0) {
+                first++;
+                continue;
             }
+            int64_t last = first;
+            while (last + 1 < n_expert && (!counts || (*counts)[last + 1] > 0)) {
+                last++;
+            }
+
+            put(first*es, (last + 1 - first)*es, false);
+
+            // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
+            if (last < n_expert - 1) {
+                put((last + 1)*es, std::min<size_t>(es, 512), true);
+            }
+
+            first = last + 1;
         }
 
         if (s >= 0) {
@@ -1502,10 +1743,13 @@ struct llama_moe_stream::impl {
         order.clear();
         order_pos.assign(tensors.size(), -1);
 
+        graph_gen++;
+        advance(n_tok);
+
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_tensor * node = ggml_graph_node(gf, i);
-            if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0]) {
-                continue;
+            if (node->op != GGML_OP_MUL_MAT_ID || !node->src[0] || ggml_nelements(node) == 0) {
+                continue; // no tokens (e.g. the last layer of a ubatch without outputs): its experts are not copied
             }
             // the scheduler replaces the weights of the offloaded nodes with their copies on the device,
             // named "<backend>#<weight>#<copy>", the weights of the nodes computed on the CPU stay the same
@@ -1530,7 +1774,7 @@ struct llama_moe_stream::impl {
         }
 
         if (!order.empty()) {
-            // the slots of the cached experts may have changed since the last prompt
+            // the cached experts may have changed since the staging buffers were filled
             for (size_t li = 0; li < layers.size(); ++li) {
                 auto & l = layers[li];
                 if (!l.dirty) {
@@ -1540,33 +1784,17 @@ struct llama_moe_stream::impl {
                     const int st = slots[s].tensor;
                     if (st >= 0 && tensors[st].layer == (int) li) {
                         release((int) s);
-                        slots[s].tensor = -1;
+                        reset((int) s, -1);
                     }
                 }
-                build_layout(l);
                 l.dirty = false;
             }
-        } else {
-            if (last_streamed) {
-                // the uploads from the cache must be done before the cache changes
-                ggml_backend_sched_synchronize(sched);
-                cancel_prefetch();
-            }
+        } else if (last_streamed) {
+            // the uploads from the cache and the staging buffers must be done before the cache changes,
+            // and generation needs the IO threads
+            ggml_backend_sched_synchronize(sched);
+            cancel_prefetch();
         }
-
-        const bool sel = !order.empty() && n_tok <= selective_max;
-        if (sel && !selective) {
-            cancel_prefetch(); // reads of a large batch that is not coming
-        }
-        selective = sel;
-        sel_layer = -1;
-        for (auto & ti : tensors) {
-            ti.sel_slot = -1;
-        }
-        for (auto & sl : slots) {
-            sl.sel_owner = -1;
-        }
-
         last_streamed = !order.empty();
 
         n_tokens      = n_tok;
@@ -1576,42 +1804,37 @@ struct llama_moe_stream::impl {
         t_stalled     = 0.0;
         n_misses      = 0;
         n_wasted      = 0;
+        pf_need       = 0;
+        pf_hit        = 0;
         bytes_up_slot = 0;
         bytes_up_res  = 0;
     }
 
-    // drop the reads queued for the staging buffers, generation needs the IO threads for the cache
+    // drop the queued reads into the staging buffers
     void cancel_prefetch() {
         std::lock_guard<std::mutex> lk(mtx);
-        for (auto it = jobs.begin(); it != jobs.end(); ) {
-            bool staging = false;
-            for (auto & sl : slots) {
-                if (it->wg == &sl.wg) {
-                    staging = true;
-                    sl.wg.pending--;
-                    sl.tensor = -1; // incomplete
-                    break;
-                }
-            }
-            it = staging ? jobs.erase(it) : it + 1;
+        for (size_t s = 0; s < slots.size(); ++s) {
+            cancel_locked((int) s, [](int) { return true; });
         }
-        cv_done.notify_all();
     }
 
     void end_graph() {
         if (graph_cached && !last_streamed) {
-            // generation (in prompt processing, only the last layers of ubatches with few outputs use the cache)
-            dec_tokens   += n_tokens;
+            cpu_tokens   += n_tokens;
+            cpu_batches  += 1;
             state_tokens += n_tokens;
-            if (dec_tokens >= DECODE_STATS_TOKENS && dec_access > 0) {
-                LLAMA_LOG_INFO("moe_stream: generation: %" PRId64 " tokens, %.1f%% of the selected experts cached, %.1f missing per token, read %.2f GiB in %.1f s (%.2f GiB/s)\n",
-                        dec_tokens, 100.0*dec_hits/dec_access, (double) (dec_access - dec_hits)/dec_tokens,
-                        dec_bytes/GiB, dec_t_read, dec_bytes/GiB/std::max(dec_t_read, 1e-6));
-                dec_tokens = 0;
-                dec_access = 0;
-                dec_hits   = 0;
-                dec_bytes  = 0;
-                dec_t_read = 0.0;
+            if (cpu_tokens >= CPU_STATS_TOKENS && cpu_access > 0) {
+                LLAMA_LOG_INFO("moe_stream: cpu: %" PRId64 " tokens in %" PRId64 " batches, %.1f%% of the selected experts cached, %.1f missing per batch"
+                        " (%.1f in the overflow window), read %.2f GiB in %.1f s (%.2f GiB/s)\n",
+                        cpu_tokens, cpu_batches, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/cpu_batches, (double) cpu_window/cpu_batches,
+                        cpu_bytes/GiB, cpu_t_read, cpu_bytes/GiB/std::max(cpu_t_read, 1e-6));
+                cpu_tokens  = 0;
+                cpu_batches = 0;
+                cpu_access  = 0;
+                cpu_hits    = 0;
+                cpu_window  = 0;
+                cpu_bytes   = 0;
+                cpu_t_read  = 0.0;
             }
             if (state_dirty && state_tokens >= STATE_SAVE_TOKENS) {
                 save_state();
@@ -1625,8 +1848,10 @@ struct llama_moe_stream::impl {
         const double t    = std::max(t_now() - t_first, 1e-6);
         const size_t read = bytes_read - bytes_read_start;
 
-        LLAMA_LOG_INFO("moe_stream: %" PRId64 " tokens%s: %.1f s, read %.2f GiB (%.2f GiB/s), uploaded %.2f GiB staged + %.2f GiB cached, stalled %.1f s, %d misses, %d wasted\n",
-                n_tokens, selective ? " (selected experts)" : "", t, read/GiB, read/GiB/t, bytes_up_slot/GiB, bytes_up_res/GiB, t_stalled, n_misses, n_wasted);
+        LLAMA_LOG_INFO("moe_stream: %" PRId64 " tokens: %.1f s, read %.2f GiB (%.2f GiB/s), uploaded %.2f GiB staged + %.2f GiB cached, stalled %.1f s,"
+                " %.0f%% of the selected experts prefetched, %d misses, %d wasted\n",
+                n_tokens, t, read/GiB, read/GiB/t, bytes_up_slot/GiB, bytes_up_res/GiB, t_stalled,
+                100.0*pf_hit/std::max<int64_t>(pf_need, 1), n_misses, n_wasted);
 
         t_first = -1.0;
     }
@@ -1689,14 +1914,14 @@ void llama_moe_stream::end_graph() {
 #endif
 }
 
-void llama_moe_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<bool> * used) {
+void llama_moe_stream::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<int32_t> * counts) {
 #ifdef __linux__
-    pimpl->copy(backend, src, dst, used);
+    pimpl->copy(backend, src, dst, counts);
 #else
     GGML_UNUSED(backend);
     GGML_UNUSED(src);
     GGML_UNUSED(dst);
-    GGML_UNUSED(used);
+    GGML_UNUSED(counts);
     GGML_ABORT("not supported");
 #endif
 }

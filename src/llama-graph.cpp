@@ -1717,9 +1717,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_mul_mat_id(ctx0, w, cur, ids) :
         ggml_mul_mat_id(ctx0, moe_cache ? moe_cache->get_experts(w) : moe_stream->get_bank(w), cur, slots);
 
-    // the experts of the MoE stream that are not computed from its cache are always offloaded, whatever the batch size
-    if (slots == nullptr && moe_stream != nullptr) {
-        if (ggml_backend_t backend = moe_stream->offload_backend(w)) {
+    // the experts of the MoE stream are computed on the CPU from its cache, or offloaded, whatever the batch size
+    if (moe_stream != nullptr && moe_cache == nullptr) {
+        if (slots != nullptr) {
+            ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
+        } else if (ggml_backend_t backend = moe_stream->offload_backend(w)) {
             if (ggml_backend_supports_op(backend, res)) {
                 ggml_backend_sched_set_tensor_backend(sched, res, backend);
             }

@@ -22,12 +22,13 @@ struct llama_moe_stream_params {
 // bypassing the page cache of the memory mapped model files entirely
 //
 // - every layer has the same fraction of its experts as cache slots (gate, up and down of an expert together)
-// - small batches (generation) are computed on the CPU from the cache: an op between the router and the expert
-//   matmuls reads the missing experts in parallel into the slots of the least recently used ones (lru or slru
-//   policy) and remaps the selected experts to their slots
-// - large batches are offloaded to the GPU: the cached experts are uploaded from the cache, the others are read
-//   with O_DIRECT by a pool of IO threads into a ring of pinned staging buffers, one tensor per buffer, so that the
-//   next tensors are read while one is uploaded. the cache does not change during prompt processing
+// - batches of up to LLAMA_MOE_STREAM_CPU_MAX tokens are computed on the CPU from the cache: an op between the
+//   router and the expert matmuls reads the missing experts in parallel into the slots of evicted ones (lru, slru
+//   or lfu policy), or into an overflow window over the staging buffers, and remaps the selected experts
+// - larger batches are offloaded to the GPU: the cached experts are uploaded from the cache, the others are read
+//   with O_DIRECT by a pool of IO threads into a ring of pinned staging buffers, one tensor per buffer, most used
+//   first while the previous tensors are computed; once the router selected the experts, only the missing selected
+//   ones are read. the cache does not change during prompt processing
 class llama_moe_stream {
 public:
     // backends are the backends of the context, the first GPU is the one the experts are offloaded to
@@ -58,8 +59,8 @@ public:
     void end_graph();
 
     // ggml_backend_sched copy callback for the experts of src
-    // used: the experts selected by the router (nullptr = copy all), dst: the copy of src on the device
-    void copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<bool> * used);
+    // counts: the tokens per expert selected by the router (nullptr = copy all), dst: the copy of src on the device
+    void copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, const std::vector<int32_t> * counts);
 
 private:
     struct impl;

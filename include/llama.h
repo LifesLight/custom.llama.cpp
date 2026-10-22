@@ -220,6 +220,7 @@ extern "C" {
     enum llama_moe_stream_policy {
         LLAMA_MOE_STREAM_POLICY_LRU  = 1, // the least recently used
         LLAMA_MOE_STREAM_POLICY_SLRU = 2, // segmented LRU: experts used again are protected in one half
+        LLAMA_MOE_STREAM_POLICY_LFU  = 3, // the least used, with decaying counts; rarely used experts do not evict
     };
 
     enum llama_lazy_mode {
