@@ -41,8 +41,8 @@ constexpr size_t BOUNCE_CHUNK = 1ull*1024*1024;
 
 constexpr double GiB = 1024.0*1024.0*1024.0;
 
-// statistics of the batches computed on the CPU are logged every that many tokens
-constexpr int CPU_STATS_TOKENS = 128;
+// statistics of the batches computed on the CPU are logged and written to the stats file every that many tokens
+constexpr int CPU_STATS_TOKENS = 1024;
 
 // the cached experts are saved every that many tokens computed on the CPU
 constexpr int STATE_SAVE_TOKENS = 256;
@@ -120,6 +120,15 @@ struct llama_moe_stream::impl {
         // when each expert was last evicted (n_evict at the time), 0 = never
         std::vector<uint64_t> evicted_at;
         uint64_t n_evict = 0;
+
+        // statistics of the batches computed on the CPU, since the start
+        std::vector<uint64_t> last_use;  // [n_expert] use_tick of the last batch that selected the expert, 0 = never
+        uint64_t              use_tick = 0;
+        std::vector<uint64_t> sd_hist;   // [n_expert + 1] LRU stack distance of the selected experts, [n_expert] = first use
+        std::vector<uint64_t> picks;     // [n_expert] tokens that selected the expert
+        uint64_t st_access = 0;
+        uint64_t st_hits   = 0;
+        uint64_t st_window = 0;
 
         bool streamed() const { return n_slots < n_expert; }
     };
@@ -292,6 +301,24 @@ struct llama_moe_stream::impl {
     int64_t cpu_pred_used[2]    = { 0, 0 };
     int64_t cpu_pred_evicted[2] = { 0, 0 };
 
+    // stats file (LLAMA_MOE_STREAM_STATS, default next to the model, "none" = disabled)
+    std::string stats_path;
+    double      alloc_min = 0.5; // minimum slots of a layer in the projected split, relative to the uniform split (LLAMA_MOE_STREAM_ALLOC_MIN)
+    double      t_start_all = 0.0;
+
+    struct totals {
+        int64_t cpu_tokens = 0, cpu_batches = 0, cpu_access = 0, cpu_hits = 0, cpu_window = 0;
+        size_t  cpu_bytes  = 0;
+        double  cpu_t_read = 0.0;
+        int64_t cpu_pred_used[2] = { 0, 0 }, cpu_pred_evicted[2] = { 0, 0 };
+        int64_t gpu_graphs = 0, gpu_tokens = 0, gpu_misses = 0, gpu_wasted = 0;
+        int64_t gpu_pf_need = 0, gpu_pf_done = 0, gpu_pf_queue = 0;
+        size_t  gpu_read = 0, gpu_up_slot = 0, gpu_up_res = 0;
+        double  gpu_time = 0.0, gpu_stalled = 0.0;
+    };
+    totals tot;  // since the start
+    totals last; // of the last interval
+
     bool    graph_cached = false; // the current graph was computed from the cache
     int64_t state_tokens = 0;     // tokens computed on the CPU since the state was saved
     bool    state_dirty  = false;
@@ -339,6 +366,10 @@ struct llama_moe_stream::impl {
         if (const char * env = getenv("LLAMA_MOE_STREAM_OVERLAP")) {
             overlap_mode = atoi(env) != 0;
         }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_ALLOC_MIN")) {
+            alloc_min = std::clamp(atof(env), 0.0, 1.0);
+        }
+        t_start_all = t_now();
         slots.resize(n_slots);
         for (auto & sl : slots) {
             sl.off  .assign(max_n_expert, SIZE_MAX);
@@ -355,6 +386,13 @@ struct llama_moe_stream::impl {
 
         if (params.state != "none") {
             state_path = params.state.empty() ? files[0].path + ".moe-stream" : params.state;
+        }
+        {
+            const char * env = getenv("LLAMA_MOE_STREAM_STATS");
+            const std::string v = env ? env : "";
+            if (v != "none") {
+                stats_path = v.empty() ? files[0].path + ".moe-stream-stats.json" : v;
+            }
         }
 
         for (int i = 0; i < n_threads; ++i) {
@@ -389,6 +427,9 @@ struct llama_moe_stream::impl {
 #ifdef __linux__
         if (is_active && state_dirty) {
             save_state();
+        }
+        if (is_active && tot.cpu_tokens + tot.gpu_tokens > 0) {
+            write_stats();
         }
 #endif
         {
@@ -669,6 +710,9 @@ struct llama_moe_stream::impl {
             l.mark     .assign(l.n_expert, 0);
             l.counts   .assign(l.n_expert, 0);
             l.evicted_at.assign(l.n_expert, 0);
+            l.last_use  .assign(l.n_expert, 0);
+            l.sd_hist   .assign(l.n_expert + 1, 0);
+            l.picks     .assign(l.n_expert, 0);
 
             for (int idx : l.tensors) {
                 auto & ti = tensors[idx];
@@ -1221,6 +1265,26 @@ struct llama_moe_stream::impl {
             l.score[e] += cnt[e]*w;
         }
 
+        // LRU stack distances: how many other experts were selected since the last batch that selected e
+        // (all the selections of a batch are at the same distance)
+        for (int32_t e : needed) {
+            int64_t d = l.n_expert;
+            if (l.last_use[e] > 0) {
+                d = 0;
+                for (int64_t x = 0; x < l.n_expert; ++x) {
+                    d += l.last_use[x] > l.last_use[e];
+                }
+            }
+            l.sd_hist[d]++;
+            l.picks[e] += cnt[e];
+        }
+        l.use_tick++;
+        for (int32_t e : needed) {
+            l.last_use[e] = l.use_tick;
+        }
+        l.st_access += needed.size();
+        l.st_hits   += needed.size() - missing.size();
+
         overflow.clear();
         const size_t read_start = bytes_read;
         wait_group & wg = pend_wg;
@@ -1272,6 +1336,7 @@ struct llama_moe_stream::impl {
                     }
                 }
                 cpu_window += overflow.size();
+                l.st_window += overflow.size();
             }
 
             if (changed) {
@@ -1996,19 +2061,204 @@ struct llama_moe_stream::impl {
         }
     }
 
+    static void add_cpu(totals & a, const totals & b) {
+        a.cpu_tokens  += b.cpu_tokens;
+        a.cpu_batches += b.cpu_batches;
+        a.cpu_access  += b.cpu_access;
+        a.cpu_hits    += b.cpu_hits;
+        a.cpu_window  += b.cpu_window;
+        a.cpu_bytes   += b.cpu_bytes;
+        a.cpu_t_read  += b.cpu_t_read;
+        for (int i = 0; i < 2; ++i) {
+            a.cpu_pred_used[i]    += b.cpu_pred_used[i];
+            a.cpu_pred_evicted[i] += b.cpu_pred_evicted[i];
+        }
+    }
+
+    // the bytes of an expert of a layer, all its tensors
+    size_t expert_bytes(const layer & l) const {
+        size_t b = 0;
+        for (int idx : l.tensors) {
+            b += tensors[idx].expert_size;
+        }
+        return b;
+    }
+
+    // LRU hit rate of the batches computed on the CPU from the stack distances, with the current uniform split of
+    // the cache, and with the split of the same bytes that maximizes the hits, each layer keeping at least alloc_min
+    // of its current slots (greedy by hits per byte of the next slot)
+    void project(double & cur, double & best, std::vector<int64_t> * split) const {
+        uint64_t access = 0, hits_cur = 0;
+        size_t   budget = 0;
+        std::vector<int64_t> c(layers.size());
+        for (size_t li = 0; li < layers.size(); ++li) {
+            const auto & l = layers[li];
+            for (int64_t d = 0; d < l.n_slots; ++d) {
+                hits_cur += l.sd_hist[d];
+            }
+            for (uint64_t v : l.sd_hist) {
+                access += v;
+            }
+            budget += l.n_slots*expert_bytes(l);
+            c[li] = std::min<int64_t>(l.n_expert, (int64_t) std::ceil(alloc_min*l.n_slots));
+            budget -= c[li]*expert_bytes(l) <= budget ? c[li]*expert_bytes(l) : budget;
+        }
+
+        uint64_t hits_best = 0;
+        for (size_t li = 0; li < layers.size(); ++li) {
+            for (int64_t d = 0; d < c[li]; ++d) {
+                hits_best += layers[li].sd_hist[d];
+            }
+        }
+        for (;;) {
+            int64_t bl = -1;
+            double  bv = -1.0;
+            for (size_t li = 0; li < layers.size(); ++li) {
+                const auto & l = layers[li];
+                const size_t eb = expert_bytes(l);
+                if (c[li] >= l.n_expert || eb > budget) {
+                    continue;
+                }
+                // the hits of the next few slots, so that a gap in the histogram does not stop a layer
+                double gain = 0.0;
+                for (int64_t d = c[li]; d < std::min<int64_t>(l.n_expert, c[li] + 4); ++d) {
+                    gain += l.sd_hist[d];
+                }
+                gain /= 4.0*eb;
+                if (gain > bv) {
+                    bv = gain;
+                    bl = (int64_t) li;
+                }
+            }
+            if (bl < 0) {
+                break;
+            }
+            hits_best += layers[bl].sd_hist[c[bl]];
+            c[bl]++;
+            budget -= expert_bytes(layers[bl]);
+        }
+
+        cur  = access > 0 ? (double) hits_cur /access : 0.0;
+        best = access > 0 ? (double) hits_best/access : 0.0;
+        if (split) {
+            *split = c;
+        }
+    }
+
+    void write_stats() {
+        if (stats_path.empty()) {
+            return;
+        }
+
+        double cur = 0.0, best = 0.0;
+        std::vector<int64_t> split;
+        project(cur, best, &split);
+
+        auto cpu_json = [](std::ostream & o, const totals & t) {
+            const double n_miss = (double) std::max<int64_t>(t.cpu_access - t.cpu_hits, 1);
+            o << "{\"tokens\": " << t.cpu_tokens << ", \"batches\": " << t.cpu_batches
+              << ", \"selected\": " << t.cpu_access << ", \"cached\": " << t.cpu_hits << ", \"overflow_window\": " << t.cpu_window
+              << ", \"read_gib\": " << t.cpu_bytes/GiB << ", \"read_or_wait_s\": " << t.cpu_t_read
+              << ", \"misses_in_top2_used\": " << t.cpu_pred_used[0]/n_miss << ", \"misses_in_top8_used\": " << t.cpu_pred_used[1]/n_miss
+              << ", \"misses_in_last2_evicted\": " << t.cpu_pred_evicted[0]/n_miss << ", \"misses_in_last8_evicted\": " << t.cpu_pred_evicted[1]/n_miss << "}";
+        };
+
+        // the interval in progress is part of the totals
+        totals cur_iv;
+        cur_iv.cpu_tokens  = cpu_tokens;
+        cur_iv.cpu_batches = cpu_batches;
+        cur_iv.cpu_access  = cpu_access;
+        cur_iv.cpu_hits    = cpu_hits;
+        cur_iv.cpu_window  = cpu_window;
+        cur_iv.cpu_bytes   = cpu_bytes;
+        cur_iv.cpu_t_read  = cpu_t_read;
+        for (int i = 0; i < 2; ++i) {
+            cur_iv.cpu_pred_used[i]    = cpu_pred_used[i];
+            cur_iv.cpu_pred_evicted[i] = cpu_pred_evicted[i];
+        }
+        totals all = tot;
+        if (cpu_tokens > 0) {
+            add_cpu(all, cur_iv);
+        }
+
+        const std::string tmp = stats_path + ".tmp";
+        {
+            std::ofstream o(tmp);
+            if (!o) {
+                static bool warned = false;
+                if (!warned) {
+                    LLAMA_LOG_WARN("moe_stream: %s: cannot write %s\n", __func__, tmp.c_str());
+                    warned = true;
+                }
+                return;
+            }
+            o.precision(6);
+            o << "{\n";
+            o << "  \"version\": 1,\n";
+            o << "  \"uptime_s\": " << t_now() - t_start_all << ",\n";
+            o << "  \"policy\": \"" << policy_name(policy) << "\", \"halflife\": " << halflife << ", \"overlap\": " << (overlap_mode ? "true" : "false")
+              << ", \"cpu_max\": " << cpu_max << ", \"staging_buffers\": " << slots.size() << ", \"io_threads\": " << workers.size() << ",\n";
+            o << "  \"cpu_total\": ";
+            cpu_json(o, all);
+            o << ",\n  \"cpu_last_interval\": ";
+            cpu_json(o, last.cpu_tokens > 0 ? last : cur_iv);
+            o << ",\n";
+            o << "  \"gpu_total\": {\"ubatches\": " << all.gpu_graphs << ", \"tokens\": " << tot.gpu_tokens << ", \"time_s\": " << tot.gpu_time
+              << ", \"stalled_s\": " << tot.gpu_stalled << ", \"read_gib\": " << tot.gpu_read/GiB
+              << ", \"uploaded_staged_gib\": " << tot.gpu_up_slot/GiB << ", \"uploaded_cached_gib\": " << tot.gpu_up_res/GiB
+              << ", \"selected_not_cached\": " << tot.gpu_pf_need << ", \"read_ahead_done\": " << tot.gpu_pf_done << ", \"read_ahead_in_progress\": " << tot.gpu_pf_queue
+              << ", \"misses\": " << tot.gpu_misses << ", \"wasted\": " << tot.gpu_wasted << "},\n";
+            o << "  \"projection\": {\"lru_hit_rate_uniform\": " << cur << ", \"lru_hit_rate_best\": " << best << ", \"min_slots_fraction\": " << alloc_min << "},\n";
+            o << "  \"layers\": [\n";
+            for (size_t li = 0; li < layers.size(); ++li) {
+                const auto & l = layers[li];
+                o << "    {\"il\": " << l.il << ", \"n_expert\": " << l.n_expert << ", \"slots\": " << l.n_slots
+                  << ", \"best_slots\": " << split[li] << ", \"expert_bytes\": " << expert_bytes(l)
+                  << ", \"selected\": " << l.st_access << ", \"cached\": " << l.st_hits << ", \"overflow_window\": " << l.st_window;
+                o << ",\n     \"stack_distance\": [";
+                for (size_t d = 0; d < l.sd_hist.size(); ++d) {
+                    o << (d ? "," : "") << l.sd_hist[d];
+                }
+                o << "],\n     \"picks\": [";
+                for (size_t x = 0; x < l.picks.size(); ++x) {
+                    o << (x ? "," : "") << l.picks[x];
+                }
+                o << "]}" << (li + 1 < layers.size() ? "," : "") << "\n";
+            }
+            o << "  ]\n}\n";
+        }
+        if (rename(tmp.c_str(), stats_path.c_str()) != 0) {
+            LLAMA_LOG_WARN("moe_stream: %s: failed to write %s: %s\n", __func__, stats_path.c_str(), strerror(errno));
+        }
+    }
+
     void end_graph() {
         if (graph_cached && !last_streamed) {
             cpu_tokens   += n_tokens;
             cpu_batches  += 1;
             state_tokens += n_tokens;
             if (cpu_tokens >= CPU_STATS_TOKENS && cpu_access > 0) {
-                const double n_miss = (double) std::max<int64_t>(cpu_access - cpu_hits, 1);
-                LLAMA_LOG_INFO("moe_stream: cpu: %" PRId64 " tokens in %" PRId64 " batches, %.1f%% of the selected experts cached, %.1f missing per batch"
-                        " (%.1f in the overflow window), read %.2f GiB, %s %.1f s\n",
-                        cpu_tokens, cpu_batches, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/cpu_batches, (double) cpu_window/cpu_batches,
-                        cpu_bytes/GiB, overlap_mode ? "waited" : "in", cpu_t_read);
-                LLAMA_LOG_INFO("moe_stream: cpu: of the missing experts, %.0f%% / %.0f%% were among the 2 / 8 most used not cached, %.0f%% / %.0f%% among the 2 / 8 last evicted\n",
-                        100.0*cpu_pred_used[0]/n_miss, 100.0*cpu_pred_used[1]/n_miss, 100.0*cpu_pred_evicted[0]/n_miss, 100.0*cpu_pred_evicted[1]/n_miss);
+                last.cpu_tokens  = cpu_tokens;
+                last.cpu_batches = cpu_batches;
+                last.cpu_access  = cpu_access;
+                last.cpu_hits    = cpu_hits;
+                last.cpu_window  = cpu_window;
+                last.cpu_bytes   = cpu_bytes;
+                last.cpu_t_read  = cpu_t_read;
+                for (int i = 0; i < 2; ++i) {
+                    last.cpu_pred_used[i]    = cpu_pred_used[i];
+                    last.cpu_pred_evicted[i] = cpu_pred_evicted[i];
+                }
+                add_cpu(tot, last);
+
+                double cur = 0.0, best = 0.0;
+                project(cur, best, nullptr);
+                LLAMA_LOG_INFO("moe_stream: cpu: %" PRId64 " tokens, %.1f%% of the selected experts cached, %.1f missing per token, read %.2f GiB, %s %.1f s;"
+                        " LRU hit rate projected with the uniform split %.1f%%, with the best split %.1f%%%s%s\n",
+                        cpu_tokens, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/std::max<int64_t>(cpu_tokens, 1),
+                        cpu_bytes/GiB, overlap_mode ? "waited" : "in", cpu_t_read, 100.0*cur, 100.0*best,
+                        stats_path.empty() ? "" : ", stats in ", stats_path.c_str());
+
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
                 cpu_pred_evicted[0] = cpu_pred_evicted[1] = 0;
                 cpu_tokens  = 0;
@@ -2018,6 +2268,8 @@ struct llama_moe_stream::impl {
                 cpu_window  = 0;
                 cpu_bytes   = 0;
                 cpu_t_read  = 0.0;
+
+                write_stats();
             }
             if (state_dirty && state_tokens >= STATE_SAVE_TOKENS) {
                 save_state();
@@ -2030,6 +2282,19 @@ struct llama_moe_stream::impl {
 
         const double t    = std::max(t_now() - t_first, 1e-6);
         const size_t read = bytes_read - bytes_read_start;
+
+        tot.gpu_graphs++;
+        tot.gpu_tokens   += n_tokens;
+        tot.gpu_time     += t;
+        tot.gpu_stalled  += t_stalled;
+        tot.gpu_read     += read;
+        tot.gpu_up_slot  += bytes_up_slot;
+        tot.gpu_up_res   += bytes_up_res;
+        tot.gpu_pf_need  += pf_need;
+        tot.gpu_pf_done  += pf_done;
+        tot.gpu_pf_queue += pf_queue;
+        tot.gpu_misses   += n_misses;
+        tot.gpu_wasted   += n_wasted;
 
         LLAMA_LOG_INFO("moe_stream: %" PRId64 " tokens: %.1f s, read %.2f GiB (%.2f GiB/s), uploaded %.2f GiB staged + %.2f GiB cached, stalled %.1f s,"
                 " selected experts read ahead %.0f%% (+%.0f%% in progress), %d misses, %d wasted\n",
