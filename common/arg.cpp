@@ -1716,6 +1716,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-user-split"},
+        {"--no-checkpoint-user-split"},
+        "split the prompt at the start of the last user message (and at the first one) to create a context checkpoint\n"
+        "there, which lets an edit of that message reuse the cache before it. the checkpoints near the end of the prompt\n"
+        "and every --checkpoint-min-step tokens are kept. disabling it saves a batch per prompt, which is worth it\n"
+        "when each batch reads the experts from disk (--moe-stream) (default: enabled)",
+        [](common_params & params, bool value) {
+            params.checkpoint_user_split = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_USER_SPLIT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),

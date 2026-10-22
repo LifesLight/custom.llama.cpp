@@ -4371,7 +4371,10 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            const bool user_split = params_base.checkpoint_user_split && (pos == last_user_pos || checkpoints.empty());
+                            const bool spaced     = pos > (checkpoints.empty() ? 0 : checkpoints.back().n_tokens) + params_base.checkpoint_min_step;
+
+                            if (user_split || spaced) {
                                 break;
                             }
                         }

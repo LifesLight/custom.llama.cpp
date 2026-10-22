@@ -161,6 +161,9 @@ struct llama_moe_stream::impl {
         int          expert = -1;
     };
 
+    // speculative reads, by rank of the expert in the usage order of its layer, then by submission
+    using spec_key = std::pair<int32_t, uint64_t>;
+
     // user data of the cache ops
     struct op_ctx {
         impl * self;
@@ -220,7 +223,9 @@ struct llama_moe_stream::impl {
     std::mutex               mtx;
     std::condition_variable  cv_jobs;
     std::condition_variable  cv_done;
-    std::deque<job>          jobs;
+    std::deque<job>          jobs;    // reads that are needed now, first
+    std::map<spec_key, job>  spec;    // speculative reads, when there is nothing else to read
+    uint64_t                 spec_seq = 0;
     std::vector<std::thread> workers;
     bool                     stop = false;
     std::atomic<bool>        warned_dio_fallback { false };
@@ -257,7 +262,8 @@ struct llama_moe_stream::impl {
     int    n_misses  = 0;
     int    n_wasted  = 0; // tensors in staging buffers reused before they were uploaded
     int64_t pf_need  = 0; // selected experts that were not cached
-    int64_t pf_hit   = 0; // of which the reads had started before the router selected them
+    int64_t pf_done  = 0; // of which the reads were done when the router selected them
+    int64_t pf_queue = 0; // of which the reads were queued or in progress
 
     // stats of the batches computed on the CPU, since the last report
     int64_t cpu_tokens  = 0;
@@ -1354,12 +1360,16 @@ struct llama_moe_stream::impl {
             job j;
             {
                 std::unique_lock<std::mutex> lk(mtx);
-                cv_jobs.wait(lk, [this] { return stop || !jobs.empty(); });
-                if (jobs.empty()) {
+                cv_jobs.wait(lk, [this] { return stop || !jobs.empty() || !spec.empty(); });
+                if (!jobs.empty()) {
+                    j = jobs.front();
+                    jobs.pop_front();
+                } else if (!spec.empty()) {
+                    j = spec.begin()->second;
+                    spec.erase(spec.begin());
+                } else {
                     break; // stop
                 }
-                j = jobs.front();
-                jobs.pop_front();
             }
 
             const bool ok = bounce && read_job(j, (uint8_t *) bounce);
@@ -1397,6 +1407,16 @@ struct llama_moe_stream::impl {
             kept.push_back(j);
         }
         jobs.swap(kept);
+        for (auto it = spec.begin(); it != spec.end(); ) {
+            job & j = it->second;
+            if (j.slot == s && drop(j.expert)) {
+                j.wg->pending--;
+                sl.state[j.expert] = EXP_CANCELLED;
+                it = spec.erase(it);
+                continue;
+            }
+            ++it;
+        }
         cv_done.notify_all();
     }
 
@@ -1439,9 +1459,9 @@ struct llama_moe_stream::impl {
         }
     }
 
-    // read expert e into its place in the staging buffer, first in the queue if front
+    // read expert e into its place in the staging buffer: needed now (into head, rank < 0), or speculatively
     // call with mtx locked
-    void place_locked(int s, int64_t e, bool front, std::vector<job> & head) {
+    void place_locked(int s, int64_t e, int32_t rank_e, std::vector<job> & head) {
         auto & sl = slots[s];
         const auto & ti = tensors[sl.tensor];
         const size_t es = ti.expert_size;
@@ -1471,17 +1491,18 @@ struct llama_moe_stream::impl {
             j.aligned = true;
             j.slot    = s;
             j.expert  = (int) e;
-            if (front) {
+            if (rank_e < 0) {
                 head.push_back(j);
             } else {
-                jobs.push_back(j);
+                spec.emplace(spec_key(rank_e, spec_seq++), j);
             }
             sl.wg[e].pending++;
         }
     }
 
-    // read the experts that are not cached, most used first
-    void speculate(int s) {
+    // read the experts that are not cached, most used first, interleaved with the other tensors read ahead by rank
+    // all: needed now (the router did not give the selection)
+    void speculate(int s, bool all = false) {
         auto & sl = slots[s];
         const auto & l = layers[tensors[sl.tensor].layer];
 
@@ -1489,11 +1510,16 @@ struct llama_moe_stream::impl {
 
         std::vector<job> head;
         std::lock_guard<std::mutex> lk(mtx);
-        for (int32_t e : rank) {
+        if (all) {
+            cancel_locked(s, [](int) { return true; }); // move them to the reads needed now
+        }
+        for (size_t r = 0; r < rank.size(); ++r) {
+            const int32_t e = rank[r];
             if (sl.state[e] != EXP_PLACED) {
-                place_locked(s, e, false, head);
+                place_locked(s, e, all ? -1 : (int32_t) r, head);
             }
         }
+        jobs.insert(jobs.begin(), head.begin(), head.end());
         cv_jobs.notify_all();
     }
 
@@ -1505,12 +1531,18 @@ struct llama_moe_stream::impl {
         std::vector<job> head;
         std::lock_guard<std::mutex> lk(mtx);
         cancel_locked(s, [&](int e) { return counts[e] == 0; });
-        for (int64_t e = 0; e < l.n_expert; ++e) {
-            if (counts[e] == 0 || l.slot_of[e] >= 0) {
+        // the speculative reads left are of selected experts: they are needed now, most used first
+        for (auto it = spec.begin(); it != spec.end(); ) {
+            if (it->second.slot == s) {
+                head.push_back(it->second);
+                it = spec.erase(it);
                 continue;
             }
-            if (sl.state[e] != EXP_PLACED) {
-                place_locked(s, e, true, head);
+            ++it;
+        }
+        for (int64_t e = 0; e < l.n_expert; ++e) {
+            if (counts[e] > 0 && l.slot_of[e] < 0 && sl.state[e] != EXP_PLACED) {
+                place_locked(s, e, -1, head);
             }
         }
         jobs.insert(jobs.begin(), head.begin(), head.end());
@@ -1631,10 +1663,17 @@ struct llama_moe_stream::impl {
             if (counts) {
                 // count how many of the selected experts that are not cached were already being read
                 const int s0 = find_slot(t);
+                std::lock_guard<std::mutex> lk(mtx);
                 for (int64_t e = 0; e < l.n_expert; ++e) {
                     if ((*counts)[e] > 0 && l.slot_of[e] < 0) {
                         pf_need++;
-                        pf_hit += s0 >= 0 && slots[s0].state[e] == EXP_PLACED;
+                        if (s0 >= 0 && slots[s0].state[e] == EXP_PLACED) {
+                            if (slots[s0].wg[e].pending == 0) {
+                                pf_done++;
+                            } else {
+                                pf_queue++;
+                            }
+                        }
                     }
                 }
             }
@@ -1649,7 +1688,7 @@ struct llama_moe_stream::impl {
                     }
                 }
             } else {
-                speculate(s); // all of them
+                speculate(s, true); // all of them
             }
 
             const double t0 = t_now();
@@ -1805,7 +1844,8 @@ struct llama_moe_stream::impl {
         n_misses      = 0;
         n_wasted      = 0;
         pf_need       = 0;
-        pf_hit        = 0;
+        pf_done       = 0;
+        pf_queue      = 0;
         bytes_up_slot = 0;
         bytes_up_res  = 0;
     }
@@ -1849,9 +1889,9 @@ struct llama_moe_stream::impl {
         const size_t read = bytes_read - bytes_read_start;
 
         LLAMA_LOG_INFO("moe_stream: %" PRId64 " tokens: %.1f s, read %.2f GiB (%.2f GiB/s), uploaded %.2f GiB staged + %.2f GiB cached, stalled %.1f s,"
-                " %.0f%% of the selected experts prefetched, %d misses, %d wasted\n",
+                " selected experts read ahead %.0f%% (+%.0f%% in progress), %d misses, %d wasted\n",
                 n_tokens, t, read/GiB, read/GiB/t, bytes_up_slot/GiB, bytes_up_res/GiB, t_stalled,
-                100.0*pf_hit/std::max<int64_t>(pf_need, 1), n_misses, n_wasted);
+                100.0*pf_done/std::max<int64_t>(pf_need, 1), 100.0*pf_queue/std::max<int64_t>(pf_need, 1), n_misses, n_wasted);
 
         t_first = -1.0;
     }
