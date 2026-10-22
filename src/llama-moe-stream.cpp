@@ -584,6 +584,32 @@ struct llama_moe_stream::impl {
         return kb*1024;
     }
 
+    // the ZFS ARC is not counted in MemAvailable, but it shrinks down to its minimum size when memory is needed
+    static size_t arc_evictable() {
+        FILE * f = fopen("/proc/spl/kstat/zfs/arcstats", "r");
+        if (!f) {
+            return 0;
+        }
+        char line[256];
+        char name[128];
+        unsigned type = 0;
+        unsigned long long value = 0;
+        unsigned long long size = 0;
+        unsigned long long c_min = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "%127s %u %llu", name, &type, &value) != 3) {
+                continue;
+            }
+            if (strcmp(name, "size") == 0) {
+                size = value;
+            } else if (strcmp(name, "c_min") == 0) {
+                c_min = value;
+            }
+        }
+        fclose(f);
+        return size > c_min ? (size_t) (size - c_min) : 0;
+    }
+
     // the size of a staging buffer for the experts of a tensor that are not cached: each is read as its own
     // aligned range of the file, which can need up to 2 alignment blocks more
     size_t max_slot_bytes(const tensor & ti, int64_t n_cached) const {
@@ -617,15 +643,16 @@ struct llama_moe_stream::impl {
         if (resident == SIZE_MAX) {
             // what is available, minus the reserve, the staging buffers (which shrink as more experts are cached)
             // and the bounce buffers of the IO threads
-            const size_t avail  = mem_available();
+            const size_t arc    = arc_evictable();
+            const size_t avail  = mem_available() + arc;
             const size_t bounce = n_threads*(BOUNCE_CHUNK + 2*STREAM_ALIGN);
             frac = 0.0;
             for (int i = 0; i < 8; ++i) {
                 const double budget = (double) avail - (double) reserve - (double) staging_size(frac) - (double) bounce;
                 frac = std::clamp(budget / (double) total, 0.0, 1.0);
             }
-            LLAMA_LOG_INFO("moe_stream: %s: %.2f GiB available, %.2f GiB reserved, %.2f GiB for the staging buffers -> %.2f GiB of cached experts\n",
-                    __func__, avail/GiB, reserve/GiB, staging_size(frac)/GiB, frac*total/GiB);
+            LLAMA_LOG_INFO("moe_stream: %s: %.2f GiB available (%.2f GiB of it ZFS ARC above its minimum), %.2f GiB reserved, %.2f GiB for the staging buffers -> %.2f GiB of cached experts\n",
+                    __func__, avail/GiB, arc/GiB, reserve/GiB, staging_size(frac)/GiB, frac*total/GiB);
         } else {
             frac = std::min(1.0, (double) resident / (double) total);
         }
