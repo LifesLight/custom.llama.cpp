@@ -162,6 +162,8 @@ struct mtmd_cli_context {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.video_image_min_tokens = params.video_image_min_tokens;
+        mparams.video_image_max_tokens = params.video_image_max_tokens;
         {
             // non-causal models need the whole image in one ubatch
             const int n_ubatch = llama_n_ubatch(lctx);
@@ -171,6 +173,11 @@ struct mtmd_cli_context {
                 LOG_WRN("%s: increase n_ubatch (-ub) to increase vision token budget\n", __func__);
                 mparams.image_max_tokens = n_ubatch;
                 mparams.image_min_tokens = std::min(mparams.image_min_tokens, n_ubatch);
+            }
+            if (mem.use_non_causal && mem.video_image_max_tokens > n_ubatch) {
+                LOG_WRN("%s: cap video_image_max_tokens (original=%d) to n_ubatch (%d)\n", __func__, mem.video_image_max_tokens, n_ubatch);
+                mparams.video_image_max_tokens = n_ubatch;
+                mparams.video_image_min_tokens = std::min(mparams.video_image_min_tokens > 0 ? mparams.video_image_min_tokens : mparams.image_min_tokens, n_ubatch);
             }
         }
         if (std::getenv("MTMD_DEBUG_GRAPH") != nullptr) {

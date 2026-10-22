@@ -607,6 +607,8 @@ struct common_params {
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    int video_image_min_tokens = -1;
+    int video_image_max_tokens = -1;
     int mtmd_batch_max_tokens = 1024;
 
     // for video input

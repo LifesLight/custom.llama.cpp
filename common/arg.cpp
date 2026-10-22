@@ -2653,6 +2653,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
     add_opt(common_arg(
+        {"--video-image-min-tokens"}, "N",
+        "minimum number of tokens each video frame can take, only used by vision models with dynamic resolution (default: --image-min-tokens)",
+        [](common_params & params, int value) {
+            params.video_image_min_tokens = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_IMAGE_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--video-image-max-tokens"}, "N",
+        "maximum number of tokens each video frame can take, only used by vision models with dynamic resolution (default: --image-max-tokens)",
+        [](common_params & params, int value) {
+            params.video_image_max_tokens = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_IMAGE_MAX_TOKENS"));
+    add_opt(common_arg(
         {"--mtmd-batch-max-tokens"}, "N",
         string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
         [](common_params & params, int value) {

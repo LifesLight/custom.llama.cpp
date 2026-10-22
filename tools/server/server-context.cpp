@@ -1232,6 +1232,8 @@ private:
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
+            mparams.video_image_min_tokens = params_base.video_image_min_tokens;
+            mparams.video_image_max_tokens = params_base.video_image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
             // progress callback
@@ -1367,6 +1369,11 @@ private:
                         SRV_WRN("%s\n", "increase n_ubatch (-ub) to increase vision token budget");
                         mparams.image_max_tokens = n_max;
                         mparams.image_min_tokens = std::min(mparams.image_min_tokens, n_max);
+                    }
+                    if (mmproj_usage.video_image_max_tokens > n_max) {
+                        SRV_WRN("cap video_image_max_tokens (original=%d) to %d (n_ubatch = %d)\n", mmproj_usage.video_image_max_tokens, n_max, n_ubatch);
+                        mparams.video_image_max_tokens = n_max;
+                        mparams.video_image_min_tokens = std::min(mparams.video_image_min_tokens > 0 ? mparams.video_image_min_tokens : mparams.image_min_tokens, n_max);
                     }
                 }
             }

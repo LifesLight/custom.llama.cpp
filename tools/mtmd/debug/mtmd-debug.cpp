@@ -91,6 +91,8 @@ int main(int argc, char ** argv) {
         mparams.warmup           = params.warmup;
         mparams.image_min_tokens = params.image_min_tokens;
         mparams.image_max_tokens = params.image_max_tokens;
+        mparams.video_image_min_tokens = params.video_image_min_tokens;
+        mparams.video_image_max_tokens = params.video_image_max_tokens;
         {
             // always enable debug callback
             mparams.cb_eval_user_data = &cb_data;

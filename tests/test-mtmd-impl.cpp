@@ -66,6 +66,36 @@ MAKE_TEST(test_image_preprocessor_longest_edge) {
     }
 }
 
+MAKE_TEST(test_video_image_token_limits) {
+    clip_hparams hparams;
+    hparams.patch_size = 16;
+    hparams.n_merge = 2;
+    hparams.set_limit_image_tokens(64, 1024);
+    mtmd_image_preprocessor_dyn_size image(hparams);
+    mtmd_image_preprocessor_dyn_size video(hparams);
+    clip_image_u8 large, small;
+    large.set_size({2048, 2048}, true);
+    small.set_size({32, 32}, true);
+
+    video.set_image_token_limits(-1, -1);
+    t.assert_equal("default video max", 1024, video.preprocess(large).entries[0].nx());
+    t.assert_equal("default video min", 256, video.preprocess(small).entries[0].nx());
+    video.set_image_token_limits(-1, 256);
+    t.assert_equal("video max override", 512, video.preprocess(large).entries[0].nx());
+    t.assert_equal("video min fallback", 256, video.preprocess(small).entries[0].nx());
+    mtmd_image_preprocessor_dyn_size min_only(hparams);
+    min_only.set_image_token_limits(16, -1);
+    t.assert_equal("video max fallback", 1024, min_only.preprocess(large).entries[0].nx());
+    t.assert_equal("video min override", 128, min_only.preprocess(small).entries[0].nx());
+    video.set_image_token_limits(16, 64);
+    for (int i = 0; i < 2; ++i) {
+        t.assert_equal("video max", 256, video.preprocess(large).entries[0].nx());
+        t.assert_equal("video min", 128, video.preprocess(small).entries[0].nx());
+        t.assert_equal("image max unchanged", 1024, image.preprocess(large).entries[0].nx());
+        t.assert_equal("image min unchanged", 256, image.preprocess(small).entries[0].nx());
+    }
+}
+
 MAKE_TEST(test_image_preprocessor_dyn_size) {
     // { patch_size, image size, expected size }
     // a side that is an even number plus .5 merged patches rounds down, like Python round() in smart_resize
