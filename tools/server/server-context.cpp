@@ -1586,6 +1586,9 @@ private:
         }
 
         if (!params_base.cache_disk_path.empty()) {
+            if (params_base.n_parallel > 1) {
+                SRV_WRN("%s", "disk cache with multiple slots: idle slots keep their KV, so a restore can fail for lack of space; -np 1 is recommended\n");
+            }
             if (params_base.cache_ram_mib != 0) {
                 SRV_INF("%s", "disk cache enabled: disabling the RAM prompt cache\n");
             }

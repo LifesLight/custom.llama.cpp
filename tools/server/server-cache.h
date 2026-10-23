@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_set>
 
 // Same rollback rules as prompt processing, without changing the context.
 size_t server_cache_reusable(const server_prompt & prompt, const server_tokens & input, llama_pos pos_min, int32_t n_swa);
@@ -29,6 +30,8 @@ public:
 private:
     std::string path;
     uint64_t limit_bytes;
+    // Entries whose restore failed in this process. They stay on disk but are not re-read.
+    std::unordered_set<std::string> failed;
 
     // Called under the pool lock. Busy readers/writers cannot be evicted.
     bool make_room(uint64_t needed, const std::string & keep = "");

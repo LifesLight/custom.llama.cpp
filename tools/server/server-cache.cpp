@@ -1,7 +1,6 @@
 #include "server-cache.h"
 
 #include "hash/hash.h"
-#include "build-info.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -131,6 +130,63 @@ json cache_read_json(const fs::path & path, uint64_t max_size = CACHE_META_LIMIT
     return json::parse(data);
 }
 
+// Flushes a file to stable storage. Snapshots are published by rename, and a superseded
+// snapshot is deleted right after, so the new files must be durable before that happens.
+void cache_sync_file(const fs::path & path) {
+#if defined(_WIN32)
+    HANDLE handle = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("cannot open disk cache file for sync");
+    }
+    const BOOL ok = FlushFileBuffers(handle);
+    CloseHandle(handle);
+    if (!ok) {
+        throw std::runtime_error("cannot sync disk cache file");
+    }
+#else
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        throw std::system_error(errno, std::generic_category(), "open disk cache file for sync");
+    }
+    int result;
+#if defined(__APPLE__)
+    // fsync does not flush the drive cache on macOS. F_FULLFSYNC is not supported everywhere.
+    result = fcntl(fd, F_FULLFSYNC);
+    if (result != 0) {
+        result = fsync(fd);
+    }
+#else
+    do {
+        result = fsync(fd);
+    } while (result != 0 && errno == EINTR);
+#endif
+    const int error = errno;
+    close(fd);
+    if (result != 0) {
+        throw std::system_error(error, std::generic_category(), "sync disk cache file");
+    }
+#endif
+}
+
+// Makes created, renamed and removed names in a directory durable. Best effort: some
+// filesystems reject directory syncs, and Windows has no portable equivalent.
+void cache_sync_dir(const fs::path & path) {
+#if !defined(_WIN32)
+    const int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    int result;
+    do {
+        result = fsync(fd);
+    } while (result != 0 && errno == EINTR);
+    close(fd);
+#else
+    (void) path;
+#endif
+}
+
 void cache_write_json(const fs::path & path, const json & data) {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file << data.dump();
@@ -138,6 +194,18 @@ void cache_write_json(const fs::path & path, const json & data) {
     if (!file) {
         throw std::runtime_error("cannot write disk cache metadata");
     }
+    cache_sync_file(path);
+}
+
+// The native loader reports every failure the same way. A bad header is permanent corruption,
+// so it is checked here; any later restore failure keeps the snapshot.
+bool cache_state_header_ok(const fs::path & path) {
+    std::ifstream file(path, std::ios::binary);
+    uint32_t header[2] = {};
+    if (!file.read(reinterpret_cast<char *>(header), sizeof(header))) {
+        return false;
+    }
+    return header[0] == LLAMA_STATE_SEQ_MAGIC && header[1] == LLAMA_STATE_SEQ_VERSION;
 }
 
 uint64_t cache_entry_size(const fs::path & path) {
@@ -204,18 +272,19 @@ json cache_file_identity(const std::string & path) {
     if (path.empty()) {
         return nullptr;
     }
-    const auto file_path = fs::canonical(fs::u8path(path));
+    const auto file_path = fs::u8path(path);
     const auto size = fs::file_size(file_path);
-    // Avoid hashing an entire model on startup. Stat identity plus the ends catches replacements.
+    // Content identity only: moving, renaming or copying a file keeps its snapshots, while a
+    // different quant or a re-converted model changes the size or the header and tail bytes.
+    // Hashing the ends avoids reading all weights at startup.
     std::ifstream file(file_path, std::ios::binary);
-    const size_t n = (size_t) std::min<uint64_t>(size, 65536);
+    const size_t n = (size_t) std::min<uint64_t>(size, 1 << 20);
     std::vector<char> sample(2 * n);
     if (!file.read(sample.data(), n) || !file.seekg(size - n) || !file.read(sample.data() + n, n)) {
         throw std::runtime_error("cannot fingerprint disk cache model file");
     }
     return {
-        {"path", file_path.u8string()}, {"size", size},
-        {"mtime", fs::last_write_time(file_path).time_since_epoch().count()},
+        {"size", size},
         {"sample", hash_sha256_hex(sample.data(), sample.size())},
     };
 }
@@ -253,20 +322,22 @@ std::string server_cache_model_key(const common_params & params, llama_context *
     if (params.model.path.empty()) {
         throw std::runtime_error("disk cache requires a resolved model file path");
     }
+    // Only settings that change the stored KV values or the token sequence belong here.
+    // Context size, batch sizes and the build do not: the native loader validates the state
+    // version and cache layout, n_tokens is checked against n_ctx, and a snapshot that still
+    // fails to restore is skipped rather than deleted.
+    (void) ctx;
     json data = {
-        {"version", CACHE_VERSION}, {"state_version", LLAMA_STATE_SEQ_VERSION}, {"build", llama_commit()},
-        {"target", llama_build_target()}, {"model", cache_model_files(params.model.path)},
+        {"version", CACHE_VERSION}, {"state_version", LLAMA_STATE_SEQ_VERSION},
+        {"model", cache_model_files(params.model.path)},
         {"projector", cache_model_files(params.mmproj.path)},
         {"draft", cache_model_files(params.speculative.draft.mparams.path)},
-        {"ctx", llama_n_ctx(ctx)}, {"parallel", params.n_parallel}, {"kv_unified", params.kv_unified},
-        {"batch", llama_n_batch(ctx)}, {"ubatch", llama_n_ubatch(ctx)},
         {"type_k", params.cache_type_k}, {"type_v", params.cache_type_v},
         {"flash_attn", params.flash_attn_type},
         {"draft_type_k", params.speculative.draft.cache_type_k}, {"draft_type_v", params.speculative.draft.cache_type_v},
-        {"draft_max", params.speculative.draft.n_max}, {"draft_ubatch", params.speculative.draft.n_ubatch},
         {"rope", json::array({params.rope_scaling_type, params.rope_freq_base, params.rope_freq_scale})},
         {"yarn", json::array({params.yarn_ext_factor, params.yarn_attn_factor, params.yarn_beta_fast, params.yarn_beta_slow, params.yarn_orig_ctx})},
-        {"swa_full", params.swa_full}, {"attention", params.attention_type}, {"pooling", params.pooling_type},
+        {"swa_full", params.swa_full}, {"attention", params.attention_type},
         {"control_layers", json::array({params.control_vector_layer_start, params.control_vector_layer_end})},
         {"image_tokens", json::array({params.image_min_tokens, params.image_max_tokens})},
     };
@@ -355,6 +426,7 @@ server_disk_cache::server_disk_cache(const std::string & path, uint64_t requeste
         limit_bytes = requested_limit ? requested_limit : CACHE_LIMIT_DEFAULT;
         cache_write_json(root / "pool.json.tmp", {{"version", CACHE_VERSION}, {"limit_bytes", limit_bytes}});
         fs::rename(root / "pool.json.tmp", config);
+        cache_sync_dir(root);
     }
     make_room(0);
 }
@@ -431,7 +503,8 @@ bool server_disk_cache::save(const std::string & cache_key, const server_prompt 
         {
             cache_lock lock(root / ".lock");
             if (fs::exists(entry)) {
-                if (cache_regular(entry / "meta.json")) {
+                // An identical snapshot that failed to restore in this process is rewritten.
+                if (cache_regular(entry / "meta.json") && !failed.count(entry.filename().string())) {
                     try {
                         const auto meta = cache_read_json(entry / "meta.json");
                         if (cache_regular(entry / "state.bin") && fs::file_size(entry / "state.bin") == meta.at("state_bytes").get<uint64_t>()) {
@@ -464,6 +537,8 @@ bool server_disk_cache::save(const std::string & cache_key, const server_prompt 
             if (!file || !write_state((entry / "state.bin").u8string())) {
                 throw std::runtime_error("cannot write disk cache snapshot");
             }
+            cache_sync_file(entry / "prompt.bin");
+            cache_sync_file(entry / "state.bin");
         }
         json checkpoints = json::array();
         for (const auto & checkpoint : prompt.checkpoints) {
@@ -474,11 +549,16 @@ bool server_disk_cache::save(const std::string & cache_key, const server_prompt 
             {"n_tokens", prompt.tokens.size()}, {"pos_min", pos_min}, {"checkpoints", checkpoints},
             {"state_bytes", fs::file_size(entry / "state.bin")},
         });
+        // The entry directory and its file names must be durable before it is published.
+        cache_sync_dir(entry);
+        cache_sync_dir(root);
         {
             cache_lock lock(root / ".lock");
             // No partially written state is visible to readers.
             fs::remove(entry / "reservation.json");
             fs::rename(entry / "meta.json.tmp", entry / "meta.json");
+            // Publish durably before any superseded snapshot is removed below.
+            cache_sync_dir(entry);
             // A continuation replaces older snapshots only when it can still resume them.
             for (const auto & item : fs::directory_iterator(root)) {
                 const auto older = item.path();
@@ -510,6 +590,7 @@ bool server_disk_cache::save(const std::string & cache_key, const server_prompt 
                 return false;
             }
         }
+        failed.erase(entry.filename().string());
         SRV_INF("disk cache saved %zu tokens (%.3f MiB)\n", prompt.tokens.size(), cache_entry_size(entry) / (1024.0 * 1024.0));
         return true;
     } catch (const std::exception & error) {
@@ -540,7 +621,7 @@ bool server_disk_cache::load(const std::string & cache_key, const server_tokens 
                     continue;
                 }
                 const auto entry = item.path();
-                if (!cache_regular(entry / "meta.json")) {
+                if (!cache_regular(entry / "meta.json") || failed.count(entry.filename().string())) {
                     continue;
                 }
                 try {
@@ -550,6 +631,14 @@ bool server_disk_cache::load(const std::string & cache_key, const server_tokens 
                             fs::file_size(entry / "state.bin") != meta.at("state_bytes").get<uint64_t>() ||
                             meta.at("n_tokens").get<uint64_t>() <= n_reusable ||
                             meta.at("n_tokens").get<uint64_t>() < min_reuse) {
+                        continue;
+                    }
+                    if (!cache_state_header_ok(entry / "state.bin")) {
+                        SRV_WRN("removing disk cache entry '%s': invalid state header\n", entry.filename().u8string().c_str());
+                        cache_lock invalid(entry / ".lock", false);
+                        if (invalid) {
+                            fs::remove_all(entry);
+                        }
                         continue;
                     }
                     const auto prompt = cache_read_prompt(entry, meta, n_ctx, has_mtmd, n_checkpoints);
@@ -572,12 +661,13 @@ bool server_disk_cache::load(const std::string & cache_key, const server_tokens 
             cache_touch(best);
         }
         if (!read_state((best / "state.bin").u8string())) {
-            cache_lock lock(root / ".lock");
-            entry_lock.reset();
-            cache_lock invalid(best / ".lock", false);
-            if (invalid) {
-                fs::remove_all(best);
-            }
+            // The header and size were valid, so this may be a transient or configuration-specific
+            // failure (KV space, allocation, a changed cache layout). Keep the snapshot for a later
+            // run, but do not re-read it for every request in this process. LRU eviction removes
+            // it if it is never usable again.
+            SRV_WRN("keeping disk cache entry '%s' after a failed restore; skipping it until restart\n",
+                    best.filename().u8string().c_str());
+            failed.insert(best.filename().string());
             return false;
         }
         SRV_INF("disk cache restored a prefix of %zu tokens\n", n_reusable);

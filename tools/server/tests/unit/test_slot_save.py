@@ -498,8 +498,39 @@ def test_disk_prompt_cache_invalid_state_falls_back(disk_pool):
     restored = server.make_request("POST", "/completion", data=request)
     assert restored.status_code == 200
     assert restored.body["content"] == first.body["content"]
-    assert restored.body["timings"]["prompt_n"] == first.body["timings"]["prompt_n"]
+    # The invalid snapshot is rejected before any restore, so the live slot is untouched and
+    # only its shared BOS can be reused.
+    assert restored.body["timings"]["cache_n"] <= 1
+    assert restored.body["timings"]["prompt_n"] >= first.body["timings"]["prompt_n"] - 1
     assert not entry.exists()
+
+
+def test_disk_prompt_cache_failed_restore_keeps_snapshot(disk_pool):
+    server.cache_ram = 0
+    server.start()
+    request = {
+        "prompt": "The quick brown fox jumps over the lazy dog. " * 8,
+        "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    }
+    first = server.make_request("POST", "/completion", data=request)
+    assert first.status_code == 200
+    switched = server.make_request("POST", "/completion", data={
+        "prompt": "An unrelated conversation replaces this slot.", "id_slot": 0,
+        "n_predict": 1, "cache_prompt": True,
+    })
+    assert switched.status_code == 200
+    entries = list(disk_pool.glob("*/meta.json"))
+    assert len(entries) == 1
+    entry = entries[0].parent
+    # Valid header and length, but a corrupt payload: the native restore fails.
+    with (entry / "state.bin").open("r+b") as state:
+        state.seek(STATE_FILE_HEADER_SIZE)
+        state.write(b"\xff" * 64)
+    restored = server.make_request("POST", "/completion", data=request)
+    assert restored.status_code == 200
+    assert restored.body["content"] == first.body["content"]
+    assert restored.body["timings"]["prompt_n"] == first.body["timings"]["prompt_n"]
+    assert entry.exists()
 
 
 def test_disk_prompt_cache_uses_rendered_template_kwargs(disk_pool, tmp_path):

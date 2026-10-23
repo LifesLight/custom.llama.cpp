@@ -1726,7 +1726,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--cache-disk"}, "PATH",
-        "enable persistent prompt caching in a shared SSD pool (disables the RAM prompt cache)",
+        "enable persistent prompt caching in a shared SSD pool (disables the RAM prompt cache, -np auto uses 1 slot)",
         [](common_params & params, const std::string & value) {
             if (value.empty()) {
                 throw std::invalid_argument("cache-disk requires a non-empty pool path");

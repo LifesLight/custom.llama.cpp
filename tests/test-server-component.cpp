@@ -5,6 +5,7 @@
 #include "../tools/server/server-cache.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -492,7 +493,9 @@ static server_prompt cache_test_prompt(std::initializer_list<llama_token> tokens
 
 static bool cache_test_write(const std::string & path) {
     std::ofstream file(std::filesystem::u8path(path), std::ios::binary);
-    const std::string data(2048, 's');
+    std::string data(2048, 's');
+    const uint32_t header[2] = {LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION};
+    std::memcpy(data.data(), header, sizeof(header));
     file.write(data.data(), data.size());
     file.close();
     return bool(file);
@@ -681,6 +684,53 @@ static void test_disk_cache(testing & t) {
         t.assert_equal("superseded snapshot removed", (size_t) 1, cache_test_count(dir.path));
         t.assert_true("branch", cache.save("model", branch, 0, 0, 2300, cache_test_write));
         t.assert_equal("fork retained", (size_t) 2, cache_test_count(dir.path));
+    });
+
+    t.test("failed restores keep the snapshot", [](testing & t) {
+        cache_test_directory dir;
+        auto prompt = cache_test_prompt({1, 2, 3});
+        server_tokens input(llama_tokens{1, 2, 3, 4}, false);
+        size_t writes = 0;
+        auto writer = [&](const std::string & path) {
+            ++writes;
+            return cache_test_write(path);
+        };
+        {
+            server_disk_cache cache(dir.path.u8string(), 65536);
+            t.assert_true("save", cache.save("model", prompt, 0, 0, 2300, writer));
+            size_t reads = 0;
+            auto failing = [&](const std::string &) { ++reads; return false; };
+            t.assert_true("restore fails", !cache.load("model", input, 64, false, 0, 32, 1, 0, failing));
+            t.assert_equal("snapshot kept", (size_t) 1, cache_test_count(dir.path));
+            t.assert_true("not retried in this process", !cache.load("model", input, 64, false, 0, 32, 1, 0, failing));
+            t.assert_equal("one failed read", (size_t) 1, reads);
+            t.assert_true("identical save rewrites it", cache.save("model", prompt, 0, 0, 2300, writer));
+            t.assert_equal("rewritten", (size_t) 2, writes);
+            t.assert_true("usable after rewrite", cache.load("model", input, 64, false, 0, 32, 1, 0,
+                [](const std::string &) { return true; }));
+        }
+        server_disk_cache restarted(dir.path.u8string());
+        t.assert_true("retried after restart", restarted.load("model", input, 64, false, 0, 32, 1, 0,
+            [](const std::string &) { return true; }));
+    });
+
+    t.test("invalid state header is removed", [](testing & t) {
+        cache_test_directory dir;
+        server_disk_cache cache(dir.path.u8string(), 65536);
+        auto prompt = cache_test_prompt({1, 2, 3});
+        t.assert_true("save", cache.save("model", prompt, 0, 0, 2300, cache_test_write));
+        for (const auto & item : std::filesystem::directory_iterator(dir.path)) {
+            if (item.is_directory()) {
+                std::fstream state(item.path() / "state.bin", std::ios::binary | std::ios::in | std::ios::out);
+                state.write("BAD!", 4);
+            }
+        }
+        server_tokens input(llama_tokens{1, 2, 3, 4}, false);
+        bool read = false;
+        t.assert_true("not loaded", !cache.load("model", input, 64, false, 0, 32, 1, 0,
+            [&](const std::string &) { read = true; return true; }));
+        t.assert_true("reader not called", !read);
+        t.assert_equal("removed", (size_t) 0, cache_test_count(dir.path));
     });
 }
 

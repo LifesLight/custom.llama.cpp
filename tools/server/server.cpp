@@ -21,18 +21,44 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <cerrno>
+#include <unistd.h>
 #endif
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
+#if !defined(_WIN32)
+// The handler runs on whichever thread the signal interrupts, possibly while that thread holds
+// the task queue mutex, so it must not call shutdown_handler (which locks it) directly. It only
+// writes to a pipe; a dedicated thread performs the shutdown.
+static int shutdown_pipe[2] = {-1, -1};
+#endif
+
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
+#if !defined(_WIN32)
+        static const char message[] = "Received second interrupt, terminating immediately.\n";
+        (void) !write(STDERR_FILENO, message, sizeof(message) - 1);
+        _exit(1);
+#else
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
         exit(1);
+#endif
     }
+
+#if !defined(_WIN32)
+    if (shutdown_pipe[1] >= 0) {
+        const int saved_errno = errno;
+        const char value = (char) signal;
+        (void) !write(shutdown_pipe[1], &value, 1);
+        errno = saved_errno;
+        return;
+    }
+#endif
 
     shutdown_handler(signal);
 }
@@ -166,7 +192,11 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
             params.n_batch = params.n_ubatch;
         }
 
-        if (params.n_parallel < 0) {
+        if (params.n_parallel < 0 && !params.cache_disk_path.empty()) {
+            SRV_TRC("%s", "n_parallel is set to auto, the disk cache uses n_parallel = 1\n");
+
+            params.n_parallel = 1;
+        } else if (params.n_parallel < 0) {
             SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
 
             params.n_parallel = 4;
@@ -530,6 +560,18 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     // register signal handler if not running by CLI
     if (!is_run_by_cli) {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+        if (pipe(shutdown_pipe) == 0) {
+            std::thread([]() {
+                char value = 0;
+                ssize_t n;
+                do {
+                    n = read(shutdown_pipe[0], &value, 1);
+                } while (n < 0 && errno == EINTR);
+                if (n == 1) {
+                    shutdown_handler(value);
+                }
+            }).detach();
+        }
         struct sigaction sigint_action;
         sigint_action.sa_handler = signal_handler;
         sigemptyset (&sigint_action.sa_mask);
