@@ -132,6 +132,22 @@ struct llama_moe_stream::impl {
         bool streamed() const { return n_uniform < n_expert; }
     };
 
+    // the eviction order of a cache slot: slru: the probation segment first; lfu: the least used first; then
+    // the least recently used first
+    struct okey {
+        uint8_t  prot;
+        double   score;
+        uint64_t stamp;
+        int32_t  slot;
+
+        bool operator<(const okey & o) const {
+            if (prot  != o.prot)  { return prot  < o.prot;  }
+            if (score != o.score) { return score < o.score; }
+            if (stamp != o.stamp) { return stamp < o.stamp; }
+            return slot < o.slot;
+        }
+    };
+
     // the cache slots of layers with the same experts layout (all of a layer without a shared pool)
     // a bank per role (gate, up, down...): [ne0, ne1, n_slots + n_window], an expert per slot, the window after
     // the slots is an alias of the staging buffer of the role, for the experts of a batch computed on the CPU that
@@ -145,6 +161,11 @@ struct llama_moe_stream::impl {
         std::vector<int32_t> slot_expert; // [n_slots] the expert in the slot
 
         std::set<std::pair<uint64_t, int32_t>> prot; // slru: the protected segment, by (stamp, slot)
+
+        // shared pools: the slots in eviction order, rebuilt when it is not valid
+        std::set<okey>    order;
+        std::vector<okey> key_of; // [n_slots] the key of the slot in order
+        bool              order_valid = false;
 
         std::vector<ggml_tensor *> bank;      // [n_roles]
         std::vector<uint8_t *>     bank_data; // [n_roles]
@@ -324,6 +345,7 @@ struct llama_moe_stream::impl {
     int64_t cpu_window  = 0;
     size_t  cpu_bytes   = 0;
     double  cpu_t_read  = 0.0;
+    double  cpu_t_policy = 0.0; // in the cache bookkeeping of ensure, without waiting for its reads
     // how predictable the misses were: among the 2 / 8 most used experts that were not cached, or most recently evicted
     int64_t cpu_pred_used[2]    = { 0, 0 };
     int64_t cpu_pred_evicted[2] = { 0, 0 };
@@ -337,6 +359,7 @@ struct llama_moe_stream::impl {
         int64_t cpu_tokens = 0, cpu_batches = 0, cpu_access = 0, cpu_hits = 0, cpu_window = 0;
         size_t  cpu_bytes  = 0;
         double  cpu_t_read = 0.0;
+        double  cpu_t_policy = 0.0;
         int64_t cpu_pred_used[2] = { 0, 0 }, cpu_pred_evicted[2] = { 0, 0 };
         int64_t gpu_graphs = 0, gpu_tokens = 0, gpu_misses = 0, gpu_wasted = 0;
         int64_t gpu_pf_need = 0, gpu_pf_done = 0, gpu_pf_queue = 0;
@@ -851,7 +874,8 @@ struct llama_moe_stream::impl {
                     n_own++;
                 }
             }
-            std::string own = n_own > 0 ? ", " + std::to_string(n_own) + " layers with a unique layout keep their own cache" : "";
+            std::string own = n_own == 0 ? "" : n_own == 1 ? ", 1 layer with a unique layout keeps its own cache" :
+                ", " + std::to_string(n_own) + " layers with a unique layout keep their own cache";
             LLAMA_LOG_INFO("moe_stream: pooled cache: %d pool%s (%s layers), each layer keeps >= %.0f%% of its share%s\n",
                     n_shared, n_shared == 1 ? "" : "s", sizes.empty() ? "0" : sizes.c_str(), 100.0*pool_min, own.c_str());
         }
@@ -1366,6 +1390,9 @@ struct llama_moe_stream::impl {
                     v *= f;
                 }
             }
+            for (auto & p : pools) {
+                p.order_valid = false;
+            }
             sbase += SCORE_RESCALE;
         }
     }
@@ -1414,21 +1441,44 @@ struct llama_moe_stream::impl {
         return steal && layers[lo].n_cached > layers[lo].n_min;
     }
 
-    // the victim candidates of layer li, the first n_want in eviction order at the front
-    void collect_victims(const pool & p, int li, bool steal, size_t n_want) {
+    okey make_key(const pool & p, int32_t s) const {
+        const auto & l = layers[p.slot_layer[s]];
+        const int32_t e = p.slot_expert[s];
+        okey k;
+        k.prot  = policy == LLAMA_MOE_STREAM_POLICY_SLRU ? l.prot[e] : 0;
+        k.score = policy == LLAMA_MOE_STREAM_POLICY_LFU  ? l.score[e] : 0.0;
+        k.stamp = l.stamp[e];
+        k.slot  = s;
+        return k;
+    }
+
+    // the policy state of the expert in slot s changed
+    void rekey(pool & p, int32_t s) {
+        if (!p.order_valid) {
+            return;
+        }
+        p.order.erase(p.key_of[s]);
+        p.key_of[s] = make_key(p, s);
+        p.order.insert(p.key_of[s]);
+    }
+
+    void build_order(pool & p) {
+        p.order.clear();
+        p.key_of.resize(p.n_slots);
+        for (int32_t s = 0; s < (int32_t) p.n_slots; ++s) {
+            p.key_of[s] = make_key(p, s);
+            p.order.insert(p.key_of[s]);
+        }
+        p.order_valid = true;
+    }
+
+    // the victim candidates of layer li among its own experts, the first n_want in eviction order at the front
+    void collect_victims(const pool & p, int li, size_t n_want) {
         cand.clear();
-        if (steal) {
-            for (int32_t s = 0; s < (int32_t) p.n_slots; ++s) {
-                if (can_evict(p, li, s, true)) {
-                    cand.push_back(s);
-                }
-            }
-        } else {
-            const auto & l = layers[li];
-            for (int64_t e = 0; e < l.n_expert; ++e) {
-                if (l.slot_of[e] >= 0 && l.mark[e] != l.mark_gen) {
-                    cand.push_back(l.slot_of[e]);
-                }
+        const auto & l = layers[li];
+        for (int64_t e = 0; e < l.n_expert; ++e) {
+            if (l.slot_of[e] >= 0 && l.mark[e] != l.mark_gen) {
+                cand.push_back(l.slot_of[e]);
             }
         }
         auto less = [&](int32_t a, int32_t b) { return evict_before(p, a, b); };
@@ -1446,6 +1496,7 @@ struct llama_moe_stream::impl {
         }
         const int32_t s = l.slot_of[e];
         l.prot[e] = 1;
+        rekey(p, s);
         p.prot.emplace(l.stamp[e], s);
         if ((int64_t) p.prot.size() > p.n_slots/2) {
             auto it = p.prot.begin();
@@ -1453,8 +1504,10 @@ struct llama_moe_stream::impl {
                 ++it;
             }
             if (it != p.prot.end()) {
-                layers[p.slot_layer[it->second]].prot[p.slot_expert[it->second]] = 0;
+                const int32_t d = it->second;
+                layers[p.slot_layer[d]].prot[p.slot_expert[d]] = 0;
                 p.prot.erase(it);
+                rekey(p, d);
             }
         }
     }
@@ -1467,6 +1520,19 @@ struct llama_moe_stream::impl {
         auto & p = pools[l.pool];
 
         GGML_ASSERT(pend_li < 0 && "the previous layer did not wait for its reads");
+
+        const double t_ensure = t_now();
+        double t_waited = 0.0;
+
+        // the experts of the other layers of the pool can be evicted when no layer of the graph is streamed:
+        // then nothing uploads from the cache while it changes. the eviction order of the pool is kept for that
+        const bool steal = shared(l) && order.empty();
+        if (steal && !p.order_valid) {
+            build_order(p);
+        }
+        if (!steal) {
+            p.order_valid = false;
+        }
 
         const int64_t k = ids->ne[0];
         const int64_t n = ids->ne[1];
@@ -1532,6 +1598,9 @@ struct llama_moe_stream::impl {
             }
             l.stamp[e]  = clock;
             l.score[e] += cnt[e]*w;
+            if (l.slot_of[e] >= 0) {
+                rekey(p, l.slot_of[e]);
+            }
         }
 
         // LRU stack distances: how many other experts were selected since the last batch that selected e
@@ -1563,29 +1632,26 @@ struct llama_moe_stream::impl {
             // the most used first, so that with lfu they are the ones admitted
             std::stable_sort(missing.begin(), missing.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
 
-            // the experts of the other layers of the pool can be evicted when no layer of the graph is streamed:
-            // then nothing uploads from the cache while it changes
-            const bool steal = shared(l) && order.empty();
-
             bool changed = false;
             size_t ci = 0;
-            collect_victims(p, li, steal, missing.size());
+            auto it = p.order.begin(); // steal: the next candidate in the eviction order of the pool
+            if (!steal) {
+                collect_victims(p, li, missing.size());
+            }
             for (int32_t e : missing) {
-                // the next candidate that can still be evicted, the floors of the other layers change as they lose slots
+                // the next candidate that can be evicted: the candidates skipped stay unavailable during the
+                // batch (selected by it, or of layers at their least slots, which only lose more)
                 int32_t s = -1;
-                for (;;) {
-                    while (ci < cand.size() && !can_evict(p, li, cand[ci], steal)) {
+                if (steal) {
+                    while (it != p.order.end() && !can_evict(p, li, it->slot, true)) {
+                        ++it;
+                    }
+                    s = it != p.order.end() ? it->slot : -1;
+                } else {
+                    while (ci < cand.size() && !can_evict(p, li, cand[ci], false)) {
                         ci++;
                     }
-                    if (ci < cand.size()) {
-                        s = cand[ci];
-                        break;
-                    }
-                    if (!steal || cand.empty()) {
-                        break;
-                    }
-                    collect_victims(p, li, steal, missing.size());
-                    ci = 0;
+                    s = ci < cand.size() ? cand[ci] : -1;
                 }
                 if (s < 0) {
                     overflow.push_back(e);
@@ -1598,7 +1664,11 @@ struct llama_moe_stream::impl {
                     overflow.push_back(e);
                     continue;
                 }
-                ci++;
+                if (steal) {
+                    ++it; // the key of s changes below, the new one is after the current position or not a candidate
+                } else {
+                    ci++;
+                }
 
                 if (lv.prot[v]) {
                     lv.prot[v] = 0;
@@ -1615,6 +1685,7 @@ struct llama_moe_stream::impl {
                 p.slot_layer [s] = li;
                 p.slot_expert[s] = e;
                 changed          = true;
+                rekey(p, s);
 
                 read_experts(l, e, s, 1, wg);
             }
@@ -1647,11 +1718,13 @@ struct llama_moe_stream::impl {
             }
 
             if (!overlap_mode) {
+                const double tw = t_now();
                 if (!wait(wg)) {
                     GGML_ABORT("moe_stream: failed to read the experts of layer %d", l.il);
                 }
                 cpu_bytes  += bytes_read - read_start;
                 cpu_t_read += t_now() - t0;
+                t_waited    = t_now() - tw;
             }
         }
 
@@ -1685,6 +1758,8 @@ struct llama_moe_stream::impl {
             pend_li         = li;
             pend_read_start = read_start;
         }
+
+        cpu_t_policy += t_now() - t_ensure - t_waited;
     }
 
     // the cached experts are computed: wait for the missing ones
@@ -2156,6 +2231,9 @@ struct llama_moe_stream::impl {
             for (int64_t e = 0; e < l.n_expert; ++e) {
                 l.score[e] += l.counts[e]*w;
             }
+            if (policy == LLAMA_MOE_STREAM_POLICY_LFU) {
+                pools[l.pool].order_valid = false;
+            }
         }
 
         int s = -1;
@@ -2372,6 +2450,7 @@ struct llama_moe_stream::impl {
         a.cpu_window  += b.cpu_window;
         a.cpu_bytes   += b.cpu_bytes;
         a.cpu_t_read  += b.cpu_t_read;
+        a.cpu_t_policy += b.cpu_t_policy;
         for (int i = 0; i < 2; ++i) {
             a.cpu_pred_used[i]    += b.cpu_pred_used[i];
             a.cpu_pred_evicted[i] += b.cpu_pred_evicted[i];
@@ -2461,7 +2540,7 @@ struct llama_moe_stream::impl {
             const double n_miss = (double) std::max<int64_t>(t.cpu_access - t.cpu_hits, 1);
             o << "{\"tokens\": " << t.cpu_tokens << ", \"batches\": " << t.cpu_batches
               << ", \"selected\": " << t.cpu_access << ", \"cached\": " << t.cpu_hits << ", \"overflow_window\": " << t.cpu_window
-              << ", \"read_gib\": " << t.cpu_bytes/GiB << ", \"read_or_wait_s\": " << t.cpu_t_read
+              << ", \"read_gib\": " << t.cpu_bytes/GiB << ", \"read_or_wait_s\": " << t.cpu_t_read << ", \"policy_s\": " << t.cpu_t_policy
               << ", \"misses_in_top2_used\": " << t.cpu_pred_used[0]/n_miss << ", \"misses_in_top8_used\": " << t.cpu_pred_used[1]/n_miss
               << ", \"misses_in_last2_evicted\": " << t.cpu_pred_evicted[0]/n_miss << ", \"misses_in_last8_evicted\": " << t.cpu_pred_evicted[1]/n_miss << "}";
         };
@@ -2475,6 +2554,7 @@ struct llama_moe_stream::impl {
         cur_iv.cpu_window  = cpu_window;
         cur_iv.cpu_bytes   = cpu_bytes;
         cur_iv.cpu_t_read  = cpu_t_read;
+        cur_iv.cpu_t_policy = cpu_t_policy;
         for (int i = 0; i < 2; ++i) {
             cur_iv.cpu_pred_used[i]    = cpu_pred_used[i];
             cur_iv.cpu_pred_evicted[i] = cpu_pred_evicted[i];
@@ -2550,6 +2630,7 @@ struct llama_moe_stream::impl {
                 last.cpu_window  = cpu_window;
                 last.cpu_bytes   = cpu_bytes;
                 last.cpu_t_read  = cpu_t_read;
+                last.cpu_t_policy = cpu_t_policy;
                 for (int i = 0; i < 2; ++i) {
                     last.cpu_pred_used[i]    = cpu_pred_used[i];
                     last.cpu_pred_evicted[i] = cpu_pred_evicted[i];
@@ -2570,9 +2651,9 @@ struct llama_moe_stream::impl {
                         spread = ", layers at " + std::to_string(lo) + "-" + std::to_string(hi) + "% of their share";
                     }
                 }
-                LLAMA_LOG_INFO("moe_stream: decode: %" PRId64 " tokens, %.1f%% hits, %.2f misses/token, read %.2f GiB, %s %.1f s%s\n",
+                LLAMA_LOG_INFO("moe_stream: decode: %" PRId64 " tokens, %.1f%% hits, %.2f misses/token, read %.2f GiB, %s %.1f s, cache policy %.2f ms/token%s\n",
                         cpu_tokens, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/std::max<int64_t>(cpu_tokens, 1),
-                        cpu_bytes/GiB, overlap_mode ? "waited" : "read time", cpu_t_read, spread.c_str());
+                        cpu_bytes/GiB, overlap_mode ? "waited" : "read time", cpu_t_read, 1e3*cpu_t_policy/std::max<int64_t>(cpu_tokens, 1), spread.c_str());
 
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
                 cpu_pred_evicted[0] = cpu_pred_evicted[1] = 0;
@@ -2583,6 +2664,7 @@ struct llama_moe_stream::impl {
                 cpu_window  = 0;
                 cpu_bytes   = 0;
                 cpu_t_read  = 0.0;
+                cpu_t_policy = 0.0;
 
                 write_stats();
             }
