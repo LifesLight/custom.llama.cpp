@@ -109,6 +109,9 @@ struct llama_cross {
     std::vector<std::set<llama_seq_id>> seq_ids_enc;
 };
 
+// logs the dropping of routed experts (LLAMA_MOE_DROP, LLAMA_MOE_TOP_P), if enabled
+void llama_moe_drop_log();
+
 struct llm_graph_params;
 
 //

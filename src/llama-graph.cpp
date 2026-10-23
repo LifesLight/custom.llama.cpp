@@ -31,13 +31,15 @@
 // dropping of the routed experts with a small weight (experimental), relative to the weights of the selected experts:
 // - LLAMA_MOE_DROP=f:  the experts with a weight below f of the total
 // - LLAMA_MOE_TOP_P=p: the experts after the heaviest ones that make p of the total
-// the others are renormalized when the model normalizes its weights. by default only the batches computed on the CPU
+// the others are renormalized when the model normalizes its weights (LLAMA_MOE_DROP_RENORM=0: never, the routed
+// output shrinks by the dropped weight instead). by default only the batches computed on the CPU
 // from the cache of the MoE stream (decode) drop experts, LLAMA_MOE_DROP_ALL=1: every batch (to measure the quality
 // with llama-perplexity, or without the MoE stream)
 struct llama_moe_drop_params {
     float drop  = 0.0f;
     float top_p = 1.0f;
-    bool  all   = false;
+    bool  all    = false;
+    bool  renorm = true;
 
     bool enabled() const { return drop > 0.0f || top_p < 1.0f; }
 };
@@ -56,13 +58,21 @@ static const llama_moe_drop_params & llama_moe_drop() {
         if (const char * env = getenv("LLAMA_MOE_DROP_ALL")) {
             p.all = atoi(env) != 0;
         }
-        if (p.enabled()) {
-            LLAMA_LOG_INFO("%s: dropping routed experts: weight < %.3f, top-p %.3f, %s\n", __func__, p.drop, p.top_p,
-                    p.all ? "all batches" : "batches computed on the CPU from the MoE stream cache");
+        if (const char * env = getenv("LLAMA_MOE_DROP_RENORM")) {
+            p.renorm = atoi(env) != 0;
         }
         return p;
     }();
     return v;
+}
+
+void llama_moe_drop_log() {
+    const auto & p = llama_moe_drop();
+    if (p.enabled()) {
+        LLAMA_LOG_INFO("moe_drop: dropping routed experts: weight < %.3f, top-p %.3f, %s, %s\n", p.drop, p.top_p,
+                p.renorm ? "renormalized" : "not renormalized",
+                p.all ? "in all batches" : "in the batches computed on the CPU from the MoE stream cache");
+    }
 }
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -2459,7 +2469,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         weights = ggml_mul(ctx0, weights, keep);
         cb(weights, "ffn_moe_weights_dropped", il);
 
-        if (norm_w || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+        if (dp.renorm && (norm_w || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT)) {
             ggml_tensor * ksum = ggml_clamp(ctx0, ggml_sum_rows(ctx0, weights), 6.103515625e-5, INFINITY);
             weights = ggml_div(ctx0, ggml_mul(ctx0, weights, wsum), ksum);
             cb(weights, "ffn_moe_weights_renorm", il);

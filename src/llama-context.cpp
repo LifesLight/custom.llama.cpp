@@ -592,6 +592,8 @@ llama_context::llama_context(
             }
         }
 
+        llama_moe_drop_log();
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
