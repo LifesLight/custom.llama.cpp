@@ -2807,9 +2807,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             } break;
         case LLM_ARCH_MINIMAX_M3:
             {
-                // sparse (MSA) layers carry an indexer key cache, but leading dense layers do not
+                // Indexer presence is independent of the FFN type in M3.1.
                 llama_kv_cache::layer_filter_cb filter_idx =
-                    [&](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
+                    [&](int32_t il) { return layers[il].index_q_proj != nullptr; };
 
                 res = new llama_kv_cache_msa(
                         *this,
