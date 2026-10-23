@@ -339,6 +339,12 @@ struct server_slot {
 
     server_prompt prompt;
     std::string disk_cache_key;
+    // The input boundary can exceed the cached length while prefill is in progress.
+    size_t n_tokens_input = 0;
+
+    size_t n_tokens_input_cached() const {
+        return std::min(n_tokens_input, prompt.tokens.size());
+    }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -381,6 +387,7 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        n_tokens_input = 0;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -835,6 +842,7 @@ struct server_slot {
         mem.seq_cp(id, other.id, -1, -1);
 
         other.prompt = prompt.clone();
+        other.n_tokens_input = n_tokens_input;
     }
 
     void copy_state_to(server_slot & other) const {
@@ -848,6 +856,7 @@ struct server_slot {
         other.stats = stats;
 
         other.prompt = prompt.clone();
+        other.n_tokens_input = n_tokens_input;
         other.init_sampler();
     }
 };
@@ -1918,7 +1927,7 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
-                if (disk_cache && server_cache_should_save(slot.prompt.tokens.size(), 0, params_base.cache_disk_min_loss)) {
+                if (disk_cache && server_cache_should_save(slot.n_tokens_input_cached(), 0, params_base.cache_disk_min_loss)) {
                     save_disk_slot(slot);
                 }
                 slot.prompt_clear();
@@ -3022,6 +3031,8 @@ private:
 
         slot.prompt.clear();
         slot.prompt.tokens = std::move(restored);
+        // The native file does not record the input/generation boundary.
+        slot.n_tokens_input = slot.prompt.tokens.size();
         const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
         const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
         slot.disk_cache_key = disk_cache ? server_cache_adapter_key(disk_model_key, slot.lora) : "";
@@ -3081,7 +3092,7 @@ private:
                 n_reusable = std::min(n_reusable, (size_t) task.n_tokens_shared);
             }
         }
-        if (server_cache_should_save(slot.prompt.tokens.size(), n_reusable,
+        if (server_cache_should_save(slot.n_tokens_input_cached(), n_reusable,
                 params_base.cache_disk_min_loss)) {
             save_disk_slot(slot);
         }
@@ -3813,8 +3824,11 @@ private:
 
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
+                    const size_t n_input = slot.n_tokens_input_cached();
+                    const size_t n_input_discard = std::min((size_t) n_discard, n_input - std::min(n_input, (size_t) n_keep));
                     slot.prompt.clear();
                     slot.prompt.tokens.insert(new_tokens);
+                    slot.n_tokens_input = n_input - n_input_discard;
                 }
 
                 slot.truncated = true;
@@ -4318,6 +4332,7 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+                        slot.n_tokens_input = input_tokens.size();
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {

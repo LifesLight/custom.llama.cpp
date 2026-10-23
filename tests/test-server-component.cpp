@@ -515,6 +515,8 @@ static void test_disk_cache(testing & t) {
         t.assert_true("majority below threshold", !server_cache_should_save(8000, 3999, 8192));
         t.assert_true("short context entirely replaced", !server_cache_should_save(8000, 0, 8192));
         t.assert_true("unchanged", !server_cache_should_save(8000, 8000, 0));
+        t.assert_true("generated tail discarded, input retained", !server_cache_should_save(16384, 16384, 8192));
+        t.assert_true("reuse extends into generated tail", !server_cache_should_save(16384, 24576, 8192));
     });
 
     t.test("checkpoint reuse", [](testing & t) {

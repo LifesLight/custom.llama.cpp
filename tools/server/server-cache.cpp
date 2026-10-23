@@ -332,8 +332,8 @@ size_t server_cache_reusable(const server_prompt & prompt, const server_tokens &
     return n == input.size() ? n - 1 : n;
 }
 
-bool server_cache_should_save(size_t n_cached, size_t n_reusable, size_t min_loss) {
-    const size_t lost = n_cached - std::min(n_cached, n_reusable);
+bool server_cache_should_save(size_t n_input_cached, size_t n_reusable, size_t min_loss) {
+    const size_t lost = n_input_cached - std::min(n_input_cached, n_reusable);
     return lost > 0 && lost >= min_loss;
 }
 

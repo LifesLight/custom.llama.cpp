@@ -1760,7 +1760,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_DISK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk-min-loss"}, "N",
-        string_format("save before losing at least N cached tokens (default: %d)", params.cache_disk_min_loss),
+        string_format("save before losing at least N cached input tokens (default: %d)", params.cache_disk_min_loss),
         [](common_params & params, int value) {
             if (value < 0) { throw std::invalid_argument("cache-disk-min-loss must be non-negative"); }
             params.cache_disk_min_loss = value;

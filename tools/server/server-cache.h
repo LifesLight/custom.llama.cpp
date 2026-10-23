@@ -8,7 +8,7 @@
 
 // Same rollback rules as prompt processing, without changing the context.
 size_t server_cache_reusable(const server_prompt & prompt, const server_tokens & input, llama_pos pos_min, int32_t n_swa);
-bool server_cache_should_save(size_t n_cached, size_t n_reusable, size_t min_loss);
+bool server_cache_should_save(size_t n_input_cached, size_t n_reusable, size_t min_loss);
 std::string server_cache_model_key(const common_params & params, llama_context * ctx);
 std::string server_cache_adapter_key(const std::string & model_key, const std::vector<common_adapter_lora_info> & adapters);
 

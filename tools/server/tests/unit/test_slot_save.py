@@ -151,6 +151,160 @@ def disk_pool(tmp_path, monkeypatch):
     return pool
 
 
+@pytest.fixture
+def disk_generated_server(disk_pool, monkeypatch):
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_LOSS", "32")
+    server.cache_ram = 0
+    server.n_slots = 1
+    server.n_ctx = 1024
+    return server
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_disk_prompt_cache_generated_tail_skips_save(disk_generated_server, disk_pool, restart):
+    if restart and os.name == "nt":
+        pytest.skip("Popen.terminate uses TerminateProcess on Windows")
+    server = disk_generated_server
+    server.start()
+    original = [10 + i % 50 for i in range(80)]
+
+    def complete(tokens, n_predict):
+        result = server.make_request("POST", "/completion", data={
+            "prompt": tokens, "id_slot": 0, "n_predict": n_predict, "ignore_eos": True,
+            "cache_prompt": True, "return_tokens": True,
+        })
+        assert result.status_code == 200
+        assert len(result.body["tokens"]) == n_predict
+        return result.body
+
+    first = complete(original, 96)
+    assert not list(disk_pool.glob("*/meta.json"))
+    current_input = original
+    if restart:
+        server.stop()
+        # Shutdown still saves the full state, including the generated tail.
+        metadata = [json.loads(path.read_text()) for path in disk_pool.glob("*/meta.json")]
+        assert any(item["n_tokens"] > len(original) + 32 for item in metadata)
+        server.start()
+        current_input = original + first["tokens"] + [90, 91]
+        resumed = complete(current_input, 96)
+        assert resumed["timings"]["cache_n"] >= len(original)
+
+    before = set(disk_pool.glob("*/meta.json"))
+    # A template clearing reasoning presents the same input prefix without the generated tail.
+    cleared = complete(current_input + [94, 95], 1)
+    assert cleared["timings"]["cache_n"] >= len(current_input) - 1
+    assert set(disk_pool.glob("*/meta.json")) == before
+
+
+def test_disk_prompt_cache_generated_text_becomes_input(disk_generated_server, disk_pool):
+    server = disk_generated_server
+    server.start()
+    original = [10 + i % 50 for i in range(80)]
+    first = server.make_request("POST", "/completion", data={
+        "prompt": original, "id_slot": 0, "n_predict": 64, "ignore_eos": True,
+        "cache_prompt": True, "return_tokens": True,
+    })
+    assert first.status_code == 200
+    assert len(first.body["tokens"]) == 64
+    continued = original + first.body["tokens"] + [90, 91]
+    result = server.make_request("POST", "/completion", data={
+        "prompt": continued, "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    })
+    assert result.status_code == 200
+    assert not list(disk_pool.glob("*/meta.json"))
+    # The generated text is now part of a request's input, so editing it counts toward loss.
+    result = server.make_request("POST", "/completion", data={
+        "prompt": original + [94, 95], "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    })
+    assert result.status_code == 200
+    assert list(disk_pool.glob("*/meta.json"))
+
+
+def test_disk_prompt_cache_cancelled_generated_tail(disk_generated_server, disk_pool):
+    server = disk_generated_server
+    server.n_ctx = 4096
+    server.server_slots = True
+    server.start()
+    original = [10 + i % 50 for i in range(80)]
+    with requests.post(server.make_url("/completion"), json={
+        "prompt": original, "id_slot": 0, "n_predict": -1, "ignore_eos": True,
+        "cache_prompt": True, "return_tokens": True, "stream": True,
+    }, stream=True, timeout=30) as response:
+        assert response.status_code == 200
+        generated = 0
+        for line in response.iter_lines(chunk_size=1):
+            if line.startswith(b"data: "):
+                generated += len(json.loads(line[6:]).get("tokens", []))
+                if generated >= 64:
+                    break
+        assert generated >= 64
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        slots = server.make_request("GET", "/slots")
+        assert slots.status_code == 200
+        if not slots.body[0]["is_processing"]:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("cancelled request did not release its slot")
+    result = server.make_request("POST", "/completion", data={
+        "prompt": original + [94, 95], "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    })
+    assert result.status_code == 200
+    assert result.body["timings"]["cache_n"] >= len(original)
+    assert not list(disk_pool.glob("*/meta.json"))
+
+
+def test_disk_prompt_cache_generated_tail_after_context_shift(disk_generated_server, disk_pool):
+    server = disk_generated_server
+    server.n_ctx = 256
+    server.enable_ctx_shift = True
+    server.start()
+    original = [10 + i % 50 for i in range(160)]
+    first = server.make_request("POST", "/completion", data={
+        "prompt": original, "id_slot": 0, "n_predict": 160, "ignore_eos": True,
+        "n_keep": 15, "n_discard": 96, "cache_prompt": True, "return_tokens": True,
+    })
+    assert first.status_code == 200
+    assert len(first.body["tokens"]) == 160
+    assert first.body["truncated"]
+    # n_keep includes one extra BOS position: [16, 112) was removed, leaving 64 input tokens.
+    retained_input = original[:16] + original[112:]
+    result = server.make_request("POST", "/completion", data={
+        "prompt": retained_input + [94, 95], "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    })
+    assert result.status_code == 200
+    assert result.body["timings"]["cache_n"] >= len(retained_input)
+    assert not list(disk_pool.glob("*/meta.json"))
+
+
+def test_disk_prompt_cache_multimodal_generated_tail(mmproj_server, disk_pool, monkeypatch):
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_LOSS", "32")
+    server = mmproj_server
+    server.cache_ram = 0
+    server.n_slots = 1
+    server.n_ctx = 1024
+    server.swa_full = True
+    server.n_ubatch = 512
+    server.start()
+    image = _get_img_base64(IMG_URL_CAT)
+
+    def complete(suffix, n_predict):
+        result = server.make_request("POST", "/completion", data={
+            "prompt": {"prompt_string": "Describe this: <__media__>\n" + suffix, "multimodal_data": [image]},
+            "id_slot": 0, "n_predict": n_predict, "ignore_eos": True, "cache_prompt": True,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    first = complete("", 64)
+    assert first["timings"]["predicted_n"] == 64
+    cleared = complete("Now summarize it.", 1)
+    assert cleared["timings"]["cache_n"] >= first["timings"]["prompt_n"] - 8
+    assert not list(disk_pool.glob("*/meta.json"))
+
+
 def test_disk_prompt_cache_sleep(disk_pool):
     server.cache_ram = 0
     server.sleep_idle_seconds = 1
