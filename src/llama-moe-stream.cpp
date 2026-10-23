@@ -346,6 +346,8 @@ struct llama_moe_stream::impl {
     size_t  cpu_bytes   = 0;
     double  cpu_t_read  = 0.0;
     double  cpu_t_policy = 0.0; // in the cache bookkeeping of ensure, without waiting for its reads
+    int64_t cpu_routed  = 0;   // selected experts, of which
+    int64_t cpu_dropped = 0;   // dropped for their small weight (LLAMA_MOE_DROP)
     // how predictable the misses were: among the 2 / 8 most used experts that were not cached, or most recently evicted
     int64_t cpu_pred_used[2]    = { 0, 0 };
     int64_t cpu_pred_evicted[2] = { 0, 0 };
@@ -1515,7 +1517,8 @@ struct llama_moe_stream::impl {
     // make the experts selected by a batch computed on the CPU available and write their slots:
     // the missing experts replace cached ones, or go to the overflow window when the cache is full of experts
     // selected by the batch (or, with lfu, when they are used less than the expert they would replace)
-    void ensure(int li, const ggml_tensor * ids, ggml_tensor * out) {
+    // wts: the routing weights [1, k, n] if experts can be dropped (weight 0: not read, not computed)
+    void ensure(int li, const ggml_tensor * ids, const ggml_tensor * wts, ggml_tensor * out) {
         auto & l = layers[li];
         auto & p = pools[l.pool];
 
@@ -1542,6 +1545,10 @@ struct llama_moe_stream::impl {
         auto id_at = [&](int64_t i0, int64_t i1) {
             return *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
         };
+        auto dropped = [&](int64_t i0, int64_t i1) {
+            return wts && *(const float *) ((const char *) wts->data + i0*wts->nb[1] + i1*wts->nb[2]) == 0.0f;
+        };
+        cpu_routed += k*n;
 
         if (++l.mark_gen == 0) {
             std::fill(l.mark.begin(), l.mark.end(), 0);
@@ -1555,6 +1562,10 @@ struct llama_moe_stream::impl {
             for (int64_t i0 = 0; i0 < k; ++i0) {
                 const int32_t e = id_at(i0, i1);
                 GGML_ASSERT(e >= 0 && e < l.n_expert);
+                if (dropped(i0, i1)) {
+                    cpu_dropped++;
+                    continue;
+                }
                 if (l.mark[e] != l.mark_gen) {
                     l.mark[e] = l.mark_gen;
                     cnt[e] = 0;
@@ -1739,6 +1750,12 @@ struct llama_moe_stream::impl {
         for (int64_t i1 = 0; i1 < n; ++i1) {
             for (int64_t i0 = 0; i0 < k; ++i0) {
                 const int32_t e    = id_at(i0, i1);
+                if (dropped(i0, i1)) {
+                    pend_all [i1*k + i0] = -1;
+                    pend_read[i1*k + i0] = 0;
+                    dst[i1*k + i0] = -1;
+                    continue;
+                }
                 const int32_t slot = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) p.n_slots + ov_index[e];
                 const bool    rd   = being_read[e] != 0;
                 pend_all [i1*k + i0] = slot;
@@ -1814,29 +1831,35 @@ struct llama_moe_stream::impl {
             return;
         }
         auto * c = (op_ctx *) userdata;
-        c->self->ensure(c->li, dst->src[0], dst);
+        c->self->ensure(c->li, dst->src[0], dst->src[1], dst);
     }
 
-    ggml_tensor * build_slots(ggml_context * ctx, ggml_tensor * selected, int il) const {
+    bool cpu_path(int il, int64_t n) const {
         if (il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
-            return nullptr;
+            return false;
         }
-        const int li = layer_of_il[il];
-        const auto & l = layers[li];
-
-        const int64_t k = selected->ne[0];
-        const int64_t n = selected->ne[1];
+        const auto & l = layers[layer_of_il[il]];
         if (n > cpu_limit(l) || n == 0) {
-            return nullptr;
+            return false;
         }
         for (int idx : l.tensors) {
             if (!tensors[idx].bank) {
-                return nullptr;
+                return false;
             }
         }
+        return true;
+    }
 
-        ggml_tensor * args[1] = { selected };
-        return ggml_custom_4d(ctx, GGML_TYPE_I32, k, n, 1, 1, args, 1, ensure_op, 1, const_cast<op_ctx *>(&op_ctxs[li]));
+    ggml_tensor * build_slots(ggml_context * ctx, ggml_tensor * selected, ggml_tensor * weights, int il) const {
+        const int64_t k = selected->ne[0];
+        const int64_t n = selected->ne[1];
+        if (!cpu_path(il, n)) {
+            return nullptr;
+        }
+        const int li = layer_of_il[il];
+
+        ggml_tensor * args[2] = { selected, weights };
+        return ggml_custom_4d(ctx, GGML_TYPE_I32, k, n, 1, 1, args, weights ? 2 : 1, ensure_op, 1, const_cast<op_ctx *>(&op_ctxs[li]));
     }
 
     //
@@ -2651,9 +2674,16 @@ struct llama_moe_stream::impl {
                         spread = ", layers at " + std::to_string(lo) + "-" + std::to_string(hi) + "% of their share";
                     }
                 }
+                if (cpu_dropped > 0) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), ", %.2f of %" PRId64 " experts kept", (double) n_expert_used*(cpu_routed - cpu_dropped)/cpu_routed, n_expert_used);
+                    spread += buf;
+                }
                 LLAMA_LOG_INFO("moe_stream: decode: %" PRId64 " tokens, %.1f%% hits, %.2f misses/token, read %.2f GiB, %s %.1f s, cache policy %.2f ms/token%s\n",
                         cpu_tokens, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/std::max<int64_t>(cpu_tokens, 1),
                         cpu_bytes/GiB, overlap_mode ? "waited" : "read time", cpu_t_read, 1e3*cpu_t_policy/std::max<int64_t>(cpu_tokens, 1), spread.c_str());
+                cpu_routed  = 0;
+                cpu_dropped = 0;
 
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
                 cpu_pred_evicted[0] = cpu_pred_evicted[1] = 0;
@@ -2731,6 +2761,16 @@ bool llama_moe_stream::overlap() const {
     return pimpl->is_active && pimpl->overlap_mode;
 }
 
+bool llama_moe_stream::cpu_path(int il, int64_t n_tokens) const {
+#ifdef __linux__
+    return pimpl->is_active && pimpl->cpu_path(il, n_tokens);
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(n_tokens);
+    return false;
+#endif
+}
+
 ggml_tensor * llama_moe_stream::build_wait(ggml_context * ctx, ggml_tensor * slots, const std::vector<ggml_tensor *> & deps, int il) const {
 #ifdef __linux__
     return pimpl->is_active ? pimpl->build_wait(ctx, slots, deps, il) : nullptr;
@@ -2762,9 +2802,9 @@ ggml_backend_t llama_moe_stream::offload_backend(const ggml_tensor * w) const {
     return pimpl->target_backend;
 }
 
-ggml_tensor * llama_moe_stream::build_slots(ggml_context * ctx, ggml_tensor * selected_experts, int il) const {
+ggml_tensor * llama_moe_stream::build_slots(ggml_context * ctx, ggml_tensor * selected_experts, ggml_tensor * weights, int il) const {
 #ifdef __linux__
-    return pimpl->is_active ? pimpl->build_slots(ctx, selected_experts, il) : nullptr;
+    return pimpl->is_active ? pimpl->build_slots(ctx, selected_experts, weights, il) : nullptr;
 #else
     GGML_UNUSED(ctx);
     GGML_UNUSED(selected_experts);

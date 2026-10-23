@@ -28,6 +28,43 @@
 
 // dedup helpers
 
+// dropping of the routed experts with a small weight (experimental), relative to the weights of the selected experts:
+// - LLAMA_MOE_DROP=f:  the experts with a weight below f of the total
+// - LLAMA_MOE_TOP_P=p: the experts after the heaviest ones that make p of the total
+// the others are renormalized when the model normalizes its weights. by default only the batches computed on the CPU
+// from the cache of the MoE stream (decode) drop experts, LLAMA_MOE_DROP_ALL=1: every batch (to measure the quality
+// with llama-perplexity, or without the MoE stream)
+struct llama_moe_drop_params {
+    float drop  = 0.0f;
+    float top_p = 1.0f;
+    bool  all   = false;
+
+    bool enabled() const { return drop > 0.0f || top_p < 1.0f; }
+};
+
+static const llama_moe_drop_params & llama_moe_drop() {
+    static const llama_moe_drop_params v = [] {
+        llama_moe_drop_params p;
+        if (const char * env = getenv("LLAMA_MOE_DROP")) {
+            const float f = (float) atof(env);
+            p.drop = std::isfinite(f) && f > 0.0f ? std::min(f, 1.0f) : 0.0f;
+        }
+        if (const char * env = getenv("LLAMA_MOE_TOP_P")) {
+            const float f = (float) atof(env);
+            p.top_p = std::isfinite(f) && f > 0.0f && f < 1.0f ? f : 1.0f;
+        }
+        if (const char * env = getenv("LLAMA_MOE_DROP_ALL")) {
+            p.all = atoi(env) != 0;
+        }
+        if (p.enabled()) {
+            LLAMA_LOG_INFO("%s: dropping routed experts: weight < %.3f, top-p %.3f, %s\n", __func__, p.drop, p.top_p,
+                    p.all ? "all batches" : "batches computed on the CPU from the MoE stream cache");
+        }
+        return p;
+    }();
+    return v;
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -2389,6 +2426,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
+
+    // drop the experts with a small weight: their weight becomes 0 (the cache of the MoE stream does not read or
+    // compute them), the others are renormalized if the weights are normalized
+    ggml_tensor * drop_weights = nullptr;
+    const auto & dp = llama_moe_drop();
+    const bool drop_here = dp.enabled() && n_expert_used > 1 && !weight_before_ffn && n_tokens > 0 &&
+        (dp.all || (moe_cache == nullptr && moe_stream != nullptr && moe_stream->cpu_path(il, n_tokens)));
+    if (drop_here) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+
+        ggml_tensor * wsum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+        ggml_tensor * keep = nullptr;                      // [n_expert_used, n_tokens]
+
+        if (dp.drop > 0.0f) {
+            // below 1/k, so that the largest weight is always kept
+            const float thr = std::min(dp.drop, 0.9f / (float) n_expert_used);
+            keep = ggml_step(ctx0, ggml_sub(ctx0, weights, ggml_scale(ctx0, wsum, thr)));
+        }
+        if (dp.top_p < 1.0f) {
+            // the weight of the experts heavier than each expert: kept while it is below top_p of the total,
+            // so the heaviest one is always kept
+            ggml_tensor * wj = ggml_reshape_3d(ctx0, weights, n_expert_used, 1, n_tokens);             // [k, 1, n]
+            ggml_tensor * wi = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);             // [1, k, n]
+            ggml_tensor * wjr = ggml_repeat_4d(ctx0, wj, n_expert_used, n_expert_used, n_tokens, 1);  // [k, k, n] w_j
+            ggml_tensor * heavier = ggml_mul(ctx0, wjr, ggml_step(ctx0, ggml_sub(ctx0, wjr, wi)));    // w_j if w_j > w_i
+            ggml_tensor * before  = ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, heavier), n_expert_used, n_tokens);
+            ggml_tensor * kp = ggml_step(ctx0, ggml_neg(ctx0, ggml_sub(ctx0, before, ggml_scale(ctx0, wsum, dp.top_p))));
+            keep = keep ? ggml_mul(ctx0, keep, kp) : kp;
+        }
+
+        weights = ggml_mul(ctx0, weights, keep);
+        cb(weights, "ffn_moe_weights_dropped", il);
+
+        if (norm_w || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+            ggml_tensor * ksum = ggml_clamp(ctx0, ggml_sum_rows(ctx0, weights), 6.103515625e-5, INFINITY);
+            weights = ggml_div(ctx0, ggml_mul(ctx0, weights, wsum), ksum);
+            cb(weights, "ffn_moe_weights_renorm", il);
+        }
+
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        drop_weights = weights;
+    }
+
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
@@ -2398,7 +2478,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, drop_weights, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2653,6 +2733,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * selected_experts,
+         ggml_tensor * weights,
          ggml_tensor * up_exps,
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
@@ -2669,7 +2750,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
                 return nullptr;
             }
         }
-        ggml_tensor * slots = moe_stream->build_slots(ctx0, selected_experts, il);
+        ggml_tensor * slots = moe_stream->build_slots(ctx0, selected_experts, weights, il);
         if (slots == nullptr) {
             return nullptr;
         }
