@@ -1725,6 +1725,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "enable persistent prompt caching in a shared SSD pool (disables the RAM prompt cache)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("cache-disk requires a non-empty pool path");
+            }
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-size"}, "SIZE",
+        "shared disk pool limit in bytes, or with K/M/G/T binary suffix (default: adopt pool limit, create with 64G)",
+        [](common_params & params, const std::string & value) {
+            size_t end = 0;
+            if (value.empty() || value.front() < '0' || value.front() > '9') {
+                throw std::invalid_argument("cache-disk-size must be positive");
+            }
+            uint64_t size = std::stoull(value, &end);
+            uint64_t multiplier = 1;
+            const std::string suffix = value.substr(end);
+            if (!suffix.empty()) {
+                if (suffix == "K" || suffix == "k") { multiplier = 1ull << 10; }
+                else if (suffix == "M" || suffix == "m") { multiplier = 1ull << 20; }
+                else if (suffix == "G" || suffix == "g") { multiplier = 1ull << 30; }
+                else if (suffix == "T" || suffix == "t") { multiplier = 1ull << 40; }
+                else { throw std::invalid_argument("cache-disk-size suffix must be K, M, G or T"); }
+            }
+            if (size == 0 || size > UINT64_MAX / multiplier) {
+                throw std::invalid_argument("cache-disk-size is out of range");
+            }
+            params.cache_disk_bytes = size * multiplier;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-min-loss"}, "N",
+        string_format("save before losing at least N cached tokens (default: %d)", params.cache_disk_min_loss),
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("cache-disk-min-loss must be non-negative"); }
+            params.cache_disk_min_loss = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_LOSS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-min-reuse"}, "N",
+        string_format("minimum reusable prefix to load a disk snapshot (default: %d)", params.cache_disk_min_reuse),
+        [](common_params & params, int value) {
+            if (value < 1) { throw std::invalid_argument("cache-disk-min-reuse must be positive"); }
+            params.cache_disk_min_reuse = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_REUSE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

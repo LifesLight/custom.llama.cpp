@@ -3,6 +3,9 @@ from utils import *
 import base64
 import requests
 import struct
+import json
+import time
+from pathlib import Path
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -77,6 +80,426 @@ def test_slot_save_restore():
     assert res.status_code == 200
     assert match_regex("(Jack|said)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 1
+
+
+@pytest.mark.parametrize("save_on_shutdown", [False, True])
+def test_disk_prompt_cache_restart(tmp_path, monkeypatch, save_on_shutdown):
+    if save_on_shutdown and os.name == "nt":
+        pytest.skip("Popen.terminate uses TerminateProcess on Windows")
+    pool = tmp_path / "pool"
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK", str(pool))
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_SIZE", "64M")
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_LOSS", "8")
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_REUSE", "1")
+    server.cache_ram = 0
+    server.start()
+    prompt = "The quick brown fox jumps over the lazy dog. " * 8
+    request = {"prompt": prompt, "id_slot": 0, "n_predict": 1, "cache_prompt": True}
+    first = server.make_request("POST", "/completion", data=request)
+    assert first.status_code == 200
+    assert not list(pool.glob("*/meta.json"))  # a finished turn does not write
+
+    if save_on_shutdown:
+        process = server.process
+        server.stop()
+        assert process.returncode == 0
+    else:
+        switched = server.make_request("POST", "/completion", data={
+            "prompt": "Something completely unrelated.", "id_slot": 0,
+            "n_predict": 1, "cache_prompt": True,
+        })
+        assert switched.status_code == 200
+    assert list(pool.glob("*/meta.json"))
+
+    if save_on_shutdown:
+        server.start()
+    resumed = server.make_request("POST", "/completion", data=request)
+    assert resumed.status_code == 200
+    assert resumed.body["timings"]["prompt_n"] < first.body["timings"]["prompt_n"]
+
+    # Automatic caching and the existing manual slot endpoints use the same format.
+    saved = server.make_request("POST", "/slots/0?action=save", data={"filename": "native.bin"})
+    assert saved.status_code == 200
+    assert server.make_request("POST", "/slots/0?action=erase").status_code == 200
+    restored = server.make_request("POST", "/slots/0?action=restore", data={"filename": "native.bin"})
+    assert restored.status_code == 200
+    assert restored.body["n_restored"] == saved.body["n_saved"]
+
+
+def test_disk_prompt_cache_small_loss_skips_save(tmp_path, monkeypatch):
+    pool = tmp_path / "pool"
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK", str(pool))
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_LOSS", "8192")
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_REUSE", "1")
+    server.cache_ram = 0
+    server.start()
+    for prompt in ("A small cached conversation.", "An entirely different conversation."):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        assert not list(pool.glob("*/meta.json"))
+
+
+@pytest.fixture
+def disk_pool(tmp_path, monkeypatch):
+    pool = tmp_path / "pool"
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK", str(pool))
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_SIZE", "64M")
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_LOSS", "8")
+    monkeypatch.setenv("LLAMA_ARG_CACHE_DISK_MIN_REUSE", "1")
+    return pool
+
+
+def test_disk_prompt_cache_sleep(disk_pool):
+    server.cache_ram = 0
+    server.sleep_idle_seconds = 1
+    server.start()
+    request = {"prompt": "The quick brown fox jumps over the lazy dog. " * 8,
+               "id_slot": 0, "n_predict": 1, "cache_prompt": True}
+    first = server.make_request("POST", "/completion", data=request)
+    assert first.status_code == 200
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        props = server.make_request("GET", "/props")
+        assert props.status_code == 200
+        if props.body["is_sleeping"] and list(disk_pool.glob("*/meta.json")):
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("server did not flush its disk cache on sleep")
+    resumed = server.make_request("POST", "/completion", data=request)
+    assert resumed.status_code == 200
+    assert resumed.body["timings"]["cache_n"] == first.body["timings"]["prompt_n"] - 1
+    assert resumed.body["content"] == first.body["content"]
+
+
+def test_disk_prompt_cache_request_opt_out(disk_pool):
+    server.cache_ram = 0
+    server.start()
+    prompt = "The quick brown fox jumps over the lazy dog. " * 8
+    request = {"prompt": prompt, "id_slot": 0, "n_predict": 1, "cache_prompt": False}
+    first = server.make_request("POST", "/completion", data=request)
+    assert first.status_code == 200
+    server.stop()
+    assert not list(disk_pool.glob("*/meta.json"))
+    server.start()
+    resumed = server.make_request("POST", "/completion", data=request)
+    assert resumed.status_code == 200
+    assert resumed.body["timings"]["cache_n"] == 0
+    assert resumed.body["timings"]["prompt_n"] == first.body["timings"]["prompt_n"]
+
+
+@pytest.mark.parametrize("setting", ["kv-type", "flash-attention"])
+def test_disk_prompt_cache_separates_context_settings(disk_pool, setting):
+    server.cache_ram = 0
+    server.fa = "on"
+    server.start()
+    request = {"prompt": "The quick brown fox jumps over the lazy dog. " * 8,
+               "id_slot": 0, "n_predict": 1, "cache_prompt": True}
+    first = server.make_request("POST", "/completion", data=request)
+    assert first.status_code == 200
+    server.stop()
+    assert list(disk_pool.glob("*/meta.json"))
+    if setting == "kv-type":
+        server.ctk = "f32"
+    else:
+        server.fa = "off"
+    server.start()
+    resumed = server.make_request("POST", "/completion", data=request)
+    assert resumed.status_code == 200
+    assert resumed.body["timings"]["cache_n"] == 0
+    assert resumed.body["timings"]["prompt_n"] == first.body["timings"]["prompt_n"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Popen.terminate uses TerminateProcess on Windows")
+def test_disk_prompt_cache_shutdown_during_generation(disk_pool):
+    server.cache_ram = 0
+    server.n_predict = -1
+    server.n_ctx = 2048
+    server.enable_ctx_shift = True
+    server.start()
+    prompt = "The quick brown fox jumps over the lazy dog. " * 8
+    tokenized = server.make_request("POST", "/tokenize", data={"content": prompt, "add_special": True})
+    assert tokenized.status_code == 200
+    with requests.post(server.make_url("/completion"), json={
+        "prompt": prompt, "id_slot": 0, "n_predict": -1, "ignore_eos": True,
+        "cache_prompt": True, "stream": True,
+    }, stream=True, timeout=30) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines(chunk_size=1):
+            if line.startswith(b"data: "):
+                assert not json.loads(line[6:]).get("stop", False)
+                break
+        else:
+            pytest.fail("generation did not produce a streamed token")
+        process = server.process
+        assert process is not None
+        process.terminate()
+        process.wait(timeout=30)
+        assert process.returncode == 0
+    server.stop()
+    assert list(disk_pool.glob("*/meta.json"))
+    server.start()
+    resumed = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    })
+    assert resumed.status_code == 200
+    assert resumed.body["timings"]["cache_n"] == len(tokenized.body["tokens"]) - 1
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_disk_prompt_cache_draft_state(disk_pool, restart):
+    server.cache_ram = 0
+    server.model_draft_hf_repo = server.model_hf_repo
+    server.spec_type = "draft-simple"
+    server.start()
+    prompt = "The quick brown fox jumps over the lazy dog. " * 8
+
+    def complete(text, slot, n_predict=16):
+        result = server.make_request("POST", "/completion", data={
+            "prompt": text, "id_slot": slot, "n_predict": n_predict, "cache_prompt": True,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    original = complete(prompt, 0)
+    assert complete(prompt, 1)["content"] == original["content"]
+    complete("An unrelated conversation replaces this slot.", 0, 1)
+    continuation = prompt + original["content"] + " And"
+    direct = complete(continuation, 1, 32)
+    assert server.make_request("POST", "/slots/1?action=erase").status_code == 200
+    if restart:
+        server.stop()
+        server.start()
+    resumed = complete(continuation, 0, 32)
+    assert resumed["content"] == direct["content"]
+    for metric in ("cache_n", "prompt_n", "draft_n", "draft_n_accepted"):
+        assert resumed["timings"][metric] == direct["timings"][metric]
+    assert resumed["timings"]["draft_n_accepted"] > 0
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_disk_prompt_cache_restored_checkpoint(swa_window_server, disk_pool, restart, monkeypatch):
+    monkeypatch.setenv("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT", "32")
+    server = swa_window_server
+    server.n_ubatch = 32
+    server.cache_ram = 0
+    server.start()
+    base = "The quick brown fox jumps over the lazy dog. " * 40
+    original = base + "The first ending of this story is a happy one."
+    edited = "The quick brown fox jumps over the lazy dog. " * 15 + "But the second ending was different and sad."
+
+    def complete(prompt, slot):
+        result = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "id_slot": slot, "n_predict": 1,
+            "cache_prompt": True, "return_tokens": True,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    # Keep checkpoints from an earlier turn, then extend well past the SWA window.
+    warmup = "The quick brown fox jumps over the lazy dog. " * 12
+    complete(warmup, 0)
+    first = complete(original, 0)
+    complete(warmup, 1)
+    complete(original, 1)
+    complete("An unrelated chat replaces the first slot.", 0)
+    metadata = [json.loads(path.read_text()) for path in disk_pool.glob("*/meta.json")]
+    assert any(entry["checkpoints"] for entry in metadata)
+
+    direct = complete(edited, 1)
+    assert 0 < direct["timings"]["cache_n"] < first["timings"]["prompt_n"] - 16
+    # Do not let the baseline's new ending become a shortcut in the restart case.
+    assert server.make_request("POST", "/slots/1?action=erase").status_code == 200
+    if restart:
+        server.stop()
+        server.start()
+    restored = complete(edited, 0)
+    assert restored["timings"]["cache_n"] == direct["timings"]["cache_n"]
+    assert restored["timings"]["prompt_n"] == direct["timings"]["prompt_n"]
+    assert restored["tokens"] == direct["tokens"]
+
+
+def test_disk_prompt_cache_invalid_state_falls_back(disk_pool):
+    server.cache_ram = 0
+    server.start()
+    request = {
+        "prompt": "The quick brown fox jumps over the lazy dog. " * 8,
+        "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    }
+    first = server.make_request("POST", "/completion", data=request)
+    assert first.status_code == 200
+    switched = server.make_request("POST", "/completion", data={
+        "prompt": "An unrelated conversation replaces this slot.", "id_slot": 0,
+        "n_predict": 1, "cache_prompt": True,
+    })
+    assert switched.status_code == 200
+    entries = list(disk_pool.glob("*/meta.json"))
+    assert len(entries) == 1
+    entry = entries[0].parent
+    # Keep the length valid, but invalidate the native state header.
+    with (entry / "state.bin").open("r+b") as state:
+        state.write(b"BAD!")
+    restored = server.make_request("POST", "/completion", data=request)
+    assert restored.status_code == 200
+    assert restored.body["content"] == first.body["content"]
+    assert restored.body["timings"]["prompt_n"] == first.body["timings"]["prompt_n"]
+    assert not entry.exists()
+
+
+def test_disk_prompt_cache_uses_rendered_template_kwargs(disk_pool, tmp_path):
+    template = tmp_path / "cache-template.jinja"
+    template.write_text(
+        "{{ marker | default('default') }}\n"
+        "{% for message in messages %}{{ message['role'] }}: {{ message['content'] }}\n{% endfor %}"
+        "{% if add_generation_prompt %}assistant: {% endif %}"
+    )
+    server.jinja = True
+    server.chat_template_file = str(template)
+    server.cache_ram = 0
+    server.start()
+    original = "The quick brown fox jumps over the lazy dog. " * 8
+
+    def chat(content, kwargs):
+        result = server.make_request("POST", "/v1/chat/completions", data={
+            "messages": [{"role": "user", "content": content}], "max_tokens": 1,
+            "chat_template_kwargs": kwargs, "temperature": 0.0,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    first = chat(original, {"marker": "A"})
+    chat("A completely unrelated conversation.", {"marker": "A"})
+    resumed = chat(original, {"marker": "A", "unused_argument": True})
+    assert resumed["timings"]["cache_n"] == first["timings"]["prompt_n"] - 1
+    changed = chat(original, {"marker": "B"})
+    assert changed["timings"]["cache_n"] < 16
+    assert changed["timings"]["prompt_n"] > first["timings"]["prompt_n"] // 2
+
+
+@pytest.mark.parametrize("architecture", ["qwen35", "mamba"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_disk_prompt_cache_recurrent_checkpoint(disk_pool, tmp_path, monkeypatch, architecture, restart):
+    # Generate these with test-llama-archs -a '^(qwen35|mamba)$' -o DIR.
+    directory = os.environ.get("LLAMA_TEST_RECURRENT_MODELS")
+    if not directory:
+        pytest.skip("set LLAMA_TEST_RECURRENT_MODELS to generated test-models directory")
+    model = Path(directory) / f"{architecture}-dense.gguf"
+    if not model.is_file():
+        pytest.skip(f"generated test model missing: {model}")
+    monkeypatch.setenv("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT", "16")
+    recurrent = ServerProcess()
+    recurrent.model_file = str(model)
+    recurrent.model_hf_repo = None
+    recurrent.model_hf_file = None
+    recurrent.model_alias = architecture
+    recurrent.n_ctx = 512
+    recurrent.n_slots = 2
+    recurrent.n_batch = 64
+    recurrent.n_ubatch = 16
+    recurrent.n_threads = 2
+    recurrent.temperature = 0.0
+    recurrent.cache_ram = 0
+    recurrent.slot_save_path = str(tmp_path)
+    recurrent.start()
+
+    def complete(prompt, slot):
+        result = recurrent.make_request("POST", "/completion", data={
+            "prompt": prompt, "id_slot": slot, "n_predict": 1,
+            "cache_prompt": True, "return_tokens": True,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    original = [10 + i % 50 for i in range(180)]
+    edited = original[:80] + [90 + i for i in range(10)]
+    complete(original[:72], 0)
+    complete(original, 0)
+    complete(original[:72], 1)
+    complete(original, 1)
+    complete([100] * 20, 0)
+    direct = complete(edited, 1)
+    assert 0 < direct["timings"]["cache_n"] < 80
+    assert recurrent.make_request("POST", "/slots/1?action=erase").status_code == 200
+    if restart:
+        recurrent.stop()
+        recurrent.start()
+    restored = complete(edited, 0)
+    assert restored["timings"]["cache_n"] == direct["timings"]["cache_n"]
+    assert restored["timings"]["prompt_n"] == direct["timings"]["prompt_n"]
+    assert restored["tokens"] == direct["tokens"]
+
+
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("change_image", [False, True])
+@pytest.mark.parametrize("mmproj_server", ["tinygemma3", "causal", "causal-unmixed"], indirect=True)
+def test_disk_prompt_cache_multimodal(mmproj_server, disk_pool, restart, change_image):
+    server = mmproj_server
+    server.swa_full = True
+    server.cache_ram = 0
+    server.n_ubatch = 512
+    server.start()
+    cat = _get_img_base64(IMG_URL_CAT)
+    truck = _get_img_base64(IMG_URL_TRUCK)
+
+    def complete(image, slot):
+        result = server.make_request("POST", "/completions", data={
+            "prompt": {"prompt_string": "What is this: <__media__>\n", "multimodal_data": [image]},
+            "id_slot": slot, "cache_prompt": True, "temperature": 0.0, "top_k": 1,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    first = complete(cat, 0)
+    complete(cat, 1)
+    switched = server.make_request("POST", "/completion", data={
+        "prompt": "An unrelated plain text conversation.", "id_slot": 0, "n_predict": 1, "cache_prompt": True,
+    })
+    assert switched.status_code == 200
+    assert list(disk_pool.glob("*/meta.json"))
+    image = truck if change_image else cat
+    direct = complete(image, 1)
+    assert server.make_request("POST", "/slots/1?action=erase").status_code == 200
+    if restart:
+        server.stop()
+        server.start()
+    restored = complete(image, 0)
+    assert restored["timings"]["cache_n"] == direct["timings"]["cache_n"]
+    assert restored["timings"]["prompt_n"] == direct["timings"]["prompt_n"]
+    assert restored["content"] == direct["content"]
+    if change_image:
+        assert restored["timings"]["cache_n"] < 16
+    else:
+        assert restored["timings"]["cache_n"] == first["timings"]["prompt_n"] - 1
+
+
+def test_disk_prompt_cache_multimodal_text_prefix(mmproj_server, disk_pool):
+    server = mmproj_server
+    server.swa_full = True
+    server.cache_ram = 0
+    server.n_ubatch = 512
+    server.start()
+    prefix = "The quick brown fox jumps over the lazy dog. " * 4
+    prompt = {"prompt_string": prefix + "<__media__>\n", "multimodal_data": [_get_img_base64(IMG_URL_CAT)]}
+
+    def complete(text, slot):
+        result = server.make_request("POST", "/completion", data={
+            "prompt": text, "id_slot": slot, "n_predict": 1, "cache_prompt": True,
+        })
+        assert result.status_code == 200
+        return result.body
+
+    complete(prompt, 0)
+    complete(prompt, 1)
+    complete("An unrelated conversation replaces the slot.", 0)
+    edited = prefix + "A fresh ending without an image."
+    direct = complete(edited, 1)
+    restored = complete(edited, 0)
+    assert restored["timings"]["cache_n"] > 30
+    assert restored["timings"]["cache_n"] == direct["timings"]["cache_n"]
+    assert restored["timings"]["prompt_n"] == direct["timings"]["prompt_n"]
+    assert restored["content"] == direct["content"]
 
 
 def test_slot_restore_legacy_token_list():
@@ -228,10 +651,29 @@ def _get_img_base64(url: str) -> str:
 
 
 @pytest.fixture
-def mmproj_server():
+def mmproj_server(request, monkeypatch):
     # tinygemma3 is a small multimodal model: the mmproj is provided by the HF registry API and auto-downloaded on first run.
-    os.environ['LLAMA_MEDIA_MARKER'] = '<__media__>'
-    mm_server = ServerPreset.tinygemma3()
+    monkeypatch.setenv("LLAMA_MEDIA_MARKER", "<__media__>")
+    kind = getattr(request, "param", "tinygemma3")
+    if kind.startswith("causal"):
+        model = os.environ.get("LLAMA_TEST_CAUSAL_MM_MODEL")
+        projector = os.environ.get("LLAMA_TEST_CAUSAL_MM_PROJECTOR")
+        if not model or not projector:
+            pytest.skip("set LLAMA_TEST_CAUSAL_MM_MODEL and LLAMA_TEST_CAUSAL_MM_PROJECTOR to a causal vision model")
+        mm_server = ServerProcess()
+        mm_server.model_file = model
+        mm_server.model_hf_repo = None
+        mm_server.model_hf_file = None
+        mm_server.model_alias = "causal-vision-test"
+        mm_server.n_ctx = 2048
+        mm_server.n_batch = 512
+        mm_server.n_slots = 2
+        mm_server.n_predict = 4
+        mm_server.n_threads = 2
+        monkeypatch.setenv("LLAMA_ARG_MMPROJ", projector)
+        monkeypatch.setenv("LLAMA_SERVER_MTMD_MIXED", "0" if kind == "causal-unmixed" else "1")
+    else:
+        mm_server = ServerPreset.tinygemma3()
     mm_server.slot_save_path = "./tmp"
     mm_server.temperature = 0.0
     return mm_server
