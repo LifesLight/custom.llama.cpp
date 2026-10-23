@@ -602,6 +602,7 @@ struct common_params {
     size_t  moe_stream_reserve  = 8ull*1024*1024*1024; // RAM left available when sizing the resident experts automatically
     enum llama_moe_stream_policy moe_stream_policy = LLAMA_MOE_STREAM_POLICY_LRU;
     std::string moe_stream_state; // file to save the cached experts to, empty = next to the model, "none" = disabled
+    float   moe_stream_pool = -1.0f;  // >= 0: shared cache slots per expert layout, min fraction of the uniform share per layer
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

@@ -378,6 +378,7 @@ llama_context::llama_context(
     cparams.moe_stream_reserve  = params.moe_stream_reserve;
     cparams.moe_stream_policy   = params.moe_stream_policy;
     cparams.moe_stream_state    = params.moe_stream_state ? params.moe_stream_state : "";
+    cparams.moe_stream_pool     = params.moe_stream_pool;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -583,6 +584,7 @@ llama_context::llama_context(
                 sparams.reserve   = cparams.moe_stream_reserve;
                 sparams.policy    = cparams.moe_stream_policy;
                 sparams.state     = cparams.moe_stream_state;
+                sparams.pool      = cparams.moe_stream_pool;
                 moe_stream = std::make_unique<llama_moe_stream>(model, backend_ptrs, sparams);
                 if (!moe_stream->active()) {
                     moe_stream.reset();
@@ -4073,6 +4075,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_stream_reserve          =*/ 8ull*1024*1024*1024,
         /*.moe_stream_policy           =*/ LLAMA_MOE_STREAM_POLICY_LRU,
         /*.moe_stream_state            =*/ nullptr,
+        /*.moe_stream_pool             =*/ -1.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

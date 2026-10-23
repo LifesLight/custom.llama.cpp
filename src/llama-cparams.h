@@ -65,6 +65,7 @@ struct llama_cparams {
     size_t  moe_stream_reserve;
     enum llama_moe_stream_policy moe_stream_policy;
     std::string moe_stream_state;
+    float   moe_stream_pool;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

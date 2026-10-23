@@ -16,12 +16,16 @@ struct llama_moe_stream_params {
     size_t      reserve;   // with resident = SIZE_MAX: RAM left available
     enum llama_moe_stream_policy policy;
     std::string state;     // file to save and restore the cached experts, empty = next to the model, "none" = disabled
+    float       pool = -1.0f; // >= 0: layers with the same expert layout share a pool of cache slots, each keeping at least
+                              // this fraction of its uniform share; < 0: fixed per-layer caches
 };
 
 // keeps the MoE experts of host-resident layers in an expert cache in RAM, filled with O_DIRECT reads,
 // bypassing the page cache of the memory mapped model files entirely
 //
-// - every layer has the same fraction of its experts as cache slots (gate, up and down of an expert together)
+// - every layer has the same fraction of its experts as cache slots (gate, up and down of an expert together),
+//   or with a pool (--moe-stream-pool F), the layers with the same experts layout share their slots with one
+//   replacement policy, each keeping at least F of its uniform share; the size of the cache does not change
 // - batches of up to LLAMA_MOE_STREAM_CPU_MAX tokens are computed on the CPU from the cache: an op between the
 //   router and the expert matmuls reads the missing experts in parallel into the slots of evicted ones (lru, slru
 //   or lfu policy), or into an overflow window over the staging buffers, and remaps the selected experts

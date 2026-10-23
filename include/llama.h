@@ -413,6 +413,8 @@ extern "C" {
         size_t       moe_stream_reserve;  // with moe_stream_resident = SIZE_MAX: RAM left available
         enum llama_moe_stream_policy moe_stream_policy;
         const char * moe_stream_state;    // file to save the cached experts to, nullptr = next to the model, "none" = disabled
+        float        moe_stream_pool;     // >= 0: the layers with the same expert layout share their cache slots, each keeping
+                                          // at least this fraction of its uniform share, < 0 = disabled (fixed per-layer caches)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

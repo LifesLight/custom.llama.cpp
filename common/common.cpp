@@ -1756,6 +1756,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.moe_stream_reserve  = params.moe_stream_reserve;
     cparams.moe_stream_policy   = params.moe_stream_policy;
     cparams.moe_stream_state    = params.moe_stream_state.empty() ? nullptr : params.moe_stream_state.c_str();
+    cparams.moe_stream_pool     = params.moe_stream_pool;
 
     return cparams;
 }

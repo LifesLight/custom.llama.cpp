@@ -16,6 +16,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -40,9 +41,6 @@ constexpr size_t STREAM_CHUNK = 4ull*1024*1024;
 constexpr size_t BOUNCE_CHUNK = 1ull*1024*1024;
 
 constexpr double GiB = 1024.0*1024.0*1024.0;
-
-// statistics of the batches computed on the CPU are logged and written to the stats file every that many tokens
-constexpr int CPU_STATS_TOKENS = 1024;
 
 // the cached experts are saved every that many tokens computed on the CPU
 constexpr int STATE_SAVE_TOKENS = 256;
@@ -78,16 +76,15 @@ struct llama_moe_stream::impl {
         const ggml_tensor * t;
 
         int     layer;       // index in layers
-        int     index;       // index in the tensors of the layer, also its staging buffer for the CPU overflow
+        int     index;       // index in the tensors of the layer
+        int     role;        // index in the banks of the pool, also the staging buffer of its overflow window
         int     file;        // index in files
         size_t  file_offs;   // offset of the data in the file
         size_t  nbytes;
         size_t  expert_size;
         int64_t n_expert;
 
-        // the cache: [ne0, ne1, n_slots + n_window], an expert per slot
-        // the window after the cache slots is an alias of the staging buffer of the tensor, for the experts of
-        // a batch computed on the CPU that do not fit in the cache
+        // the bank of its role in the pool of the layer (shared by all the layers of the pool)
         ggml_tensor * bank      = nullptr;
         uint8_t *     bank_data = nullptr;
     };
@@ -95,17 +92,19 @@ struct llama_moe_stream::impl {
     struct layer {
         int il;
         int64_t n_expert = 0;
-        int64_t n_slots  = 0;     // cache slots
         bool    window   = false; // the cache has an overflow window
         std::vector<int> tensors;
 
-        std::vector<int32_t> slot_of;   // [n_expert] cache slot of the expert, -1 if not cached
-        std::vector<int32_t> expert_of; // [n_slots]  expert in the cache slot
+        int     pool      = -1;
+        int64_t n_uniform = 0; // cache slots with the uniform split
+        int64_t n_min     = 0; // the least cache slots it keeps (n_uniform without a shared pool)
+        int64_t n_cached  = 0; // cache slots it has
+
+        std::vector<int32_t> slot_of;   // [n_expert] cache slot of the expert in the pool, -1 if not cached
 
         // replacement policy
         std::vector<uint64_t> stamp;    // [n_expert] last use
         std::vector<uint8_t>  prot;     // [n_expert] in the protected segment (slru)
-        int64_t n_prot = 0;
         std::vector<double>   score;    // [n_expert] usage, decayed
 
         std::vector<uint32_t> mark;     // [n_expert] selected by the current batch
@@ -130,7 +129,25 @@ struct llama_moe_stream::impl {
         uint64_t st_hits   = 0;
         uint64_t st_window = 0;
 
-        bool streamed() const { return n_slots < n_expert; }
+        bool streamed() const { return n_uniform < n_expert; }
+    };
+
+    // the cache slots of layers with the same experts layout (all of a layer without a shared pool)
+    // a bank per role (gate, up, down...): [ne0, ne1, n_slots + n_window], an expert per slot, the window after
+    // the slots is an alias of the staging buffer of the role, for the experts of a batch computed on the CPU that
+    // do not fit in the cache
+    struct pool {
+        std::vector<int> layers;
+        int64_t n_slots = 0;
+        bool    window  = false;
+
+        std::vector<int32_t> slot_layer;  // [n_slots] the layer of the expert in the slot
+        std::vector<int32_t> slot_expert; // [n_slots] the expert in the slot
+
+        std::set<std::pair<uint64_t, int32_t>> prot; // slru: the protected segment, by (stamp, slot)
+
+        std::vector<ggml_tensor *> bank;      // [n_roles]
+        std::vector<uint8_t *>     bank_data; // [n_roles]
     };
 
     // a set of reads to wait for
@@ -190,6 +207,8 @@ struct llama_moe_stream::impl {
     std::vector<file>   files;
     std::vector<tensor> tensors;
     std::vector<layer>  layers;
+    std::vector<pool>   pools;
+    std::vector<int32_t> cand; // victim candidates
     std::vector<int>    layer_of_il; // [il] index in layers, -1 if not streamed
     std::vector<op_ctx> op_ctxs;     // [layers.size()]
     std::unordered_map<const ggml_tensor *, int> tensor_idx;
@@ -208,6 +227,14 @@ struct llama_moe_stream::impl {
 
     // compute the cached experts while the missing ones are read (LLAMA_MOE_STREAM_OVERLAP)
     bool overlap_mode = false;
+
+    // the layers with the same experts layout share their cache slots, keeping at least that fraction of their
+    // uniform share each (--moe-stream-pool), < 0 = per-layer caches
+    double pool_min = -1.0;
+
+    // the statistics of the batches computed on the CPU are logged (and written to the stats file) every that many
+    // tokens (LLAMA_MOE_STREAM_INTERVAL)
+    int64_t stats_interval = 1024;
 
     // the reads of the batch computed on the CPU between the start and the wait ops
     int                  pend_li = -1;
@@ -301,7 +328,7 @@ struct llama_moe_stream::impl {
     int64_t cpu_pred_used[2]    = { 0, 0 };
     int64_t cpu_pred_evicted[2] = { 0, 0 };
 
-    // stats file (LLAMA_MOE_STREAM_STATS, default next to the model, "none" = disabled)
+    // stats file (LLAMA_MOE_STREAM_STATS: a path, or 1 for next to the model; disabled by default)
     std::string stats_path;
     double      alloc_min = 0.5; // minimum slots of a layer in the projected split, relative to the uniform split (LLAMA_MOE_STREAM_ALLOC_MIN)
     double      t_start_all = 0.0;
@@ -318,6 +345,7 @@ struct llama_moe_stream::impl {
     };
     totals tot;  // since the start
     totals last; // of the last interval
+    totals agg;  // gpu: the ubatches of the current prompt, logged together
 
     bool    graph_cached = false; // the current graph was computed from the cache
     int64_t state_tokens = 0;     // tokens computed on the CPU since the state was saved
@@ -328,9 +356,10 @@ struct llama_moe_stream::impl {
         GGML_UNUSED(model);
         GGML_UNUSED(backends);
         GGML_UNUSED(params);
-        LLAMA_LOG_WARN("moe_stream: %s: MoE streaming is only supported on Linux, disabled\n", __func__);
+        LLAMA_LOG_WARN("moe_stream: MoE streaming is only supported on Linux, disabled\n");
 #else
         policy        = params.policy;
+        pool_min      = params.pool;
         n_expert_used = model.hparams.n_expert_used_max();
         page_size     = sysconf(_SC_PAGESIZE);
 
@@ -345,13 +374,19 @@ struct llama_moe_stream::impl {
             }
         }
         if (!target_dev) {
-            LLAMA_LOG_WARN("moe_stream: %s: no GPU to stream the experts to, MoE streaming disabled\n", __func__);
+            LLAMA_LOG_WARN("moe_stream: no GPU to stream the experts to, MoE streaming disabled\n");
             return;
         }
 
         if (!collect(model)) {
             return;
         }
+
+        if (pool_min >= 0.0 && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
+            LLAMA_LOG_WARN("moe_stream: the model has folded Hadamard rotations, the expert cache is not pooled\n");
+            pool_min = -1.0;
+        }
+        make_pools();
 
         int n_slots = 3;
         if (const char * env = getenv("LLAMA_MOE_STREAM_SLOTS")) {
@@ -368,6 +403,9 @@ struct llama_moe_stream::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_STREAM_ALLOC_MIN")) {
             alloc_min = std::clamp(atof(env), 0.0, 1.0);
+        }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_INTERVAL")) {
+            stats_interval = std::max<int64_t>(1, atoll(env));
         }
         t_start_all = t_now();
         slots.resize(n_slots);
@@ -387,11 +425,12 @@ struct llama_moe_stream::impl {
         if (params.state != "none") {
             state_path = params.state.empty() ? files[0].path + ".moe-stream" : params.state;
         }
-        {
-            const char * env = getenv("LLAMA_MOE_STREAM_STATS");
-            const std::string v = env ? env : "";
-            if (v != "none") {
-                stats_path = v.empty() ? files[0].path + ".moe-stream-stats.json" : v;
+        if (const char * env = getenv("LLAMA_MOE_STREAM_STATS")) {
+            const std::string v = env;
+            if (v == "1") {
+                stats_path = files[0].path + ".moe-stream-stats.json";
+            } else if (!v.empty() && v != "0" && v != "none") {
+                stats_path = v;
             }
         }
 
@@ -425,6 +464,9 @@ struct llama_moe_stream::impl {
 
     ~impl() {
 #ifdef __linux__
+        if (is_active) {
+            log_gpu();
+        }
         if (is_active && state_dirty) {
             save_state();
         }
@@ -492,12 +534,12 @@ struct llama_moe_stream::impl {
         f.path = path;
         f.fd_buffered = open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (f.fd_buffered < 0) {
-            LLAMA_LOG_WARN("moe_stream: %s: failed to open %s: %s\n", __func__, path.c_str(), strerror(errno));
+            LLAMA_LOG_WARN("moe_stream: failed to open %s: %s\n", path.c_str(), strerror(errno));
             return -1;
         }
         f.fd_direct = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (f.fd_direct < 0) {
-            LLAMA_LOG_WARN("moe_stream: %s: O_DIRECT is not supported for %s (%s), using buffered reads\n", __func__, path.c_str(), strerror(errno));
+            LLAMA_LOG_WARN("moe_stream: O_DIRECT is not supported for %s (%s), using buffered reads\n", path.c_str(), strerror(errno));
         }
         struct stat st;
         if (fstat(f.fd_buffered, &st) == 0) {
@@ -558,8 +600,8 @@ struct llama_moe_stream::impl {
         }
 
         if (n_unmapped > 0) {
-            LLAMA_LOG_WARN("moe_stream: %s: %d expert tensors in host memory are not memory mapped from the model files, they are not streamed (is mmap disabled?)\n",
-                    __func__, n_unmapped);
+            LLAMA_LOG_WARN("moe_stream: %d expert tensors in host memory are not memory mapped from the model files, they are not streamed (is mmap disabled?)\n",
+                    n_unmapped);
         }
 
         for (auto & [il, ts] : by_layer) {
@@ -575,7 +617,7 @@ struct llama_moe_stream::impl {
                 ok = ok && ti.n_expert == l.n_expert;
             }
             if (!ok) {
-                LLAMA_LOG_WARN("moe_stream: %s: layer %d has expert tensors with different expert counts, not streamed\n", __func__, il);
+                LLAMA_LOG_WARN("moe_stream: layer %d has expert tensors with different expert counts, not streamed\n", il);
                 continue;
             }
 
@@ -597,7 +639,7 @@ struct llama_moe_stream::impl {
         }
 
         if (layers.empty()) {
-            LLAMA_LOG_WARN("moe_stream: %s: no memory mapped expert tensors in host memory, MoE streaming disabled\n", __func__);
+            LLAMA_LOG_WARN("moe_stream: no memory mapped expert tensors in host memory, MoE streaming disabled\n");
             return false;
         }
 
@@ -607,6 +649,66 @@ struct llama_moe_stream::impl {
         }
 
         return true;
+    }
+
+    // group the layers in pools: without a shared pool, one per layer, otherwise by experts layout (the type and
+    // the shape of each of their tensors)
+    void make_pools() {
+        pools.clear();
+        std::map<std::string, int> by_key;
+        for (size_t li = 0; li < layers.size(); ++li) {
+            auto & l = layers[li];
+            if (pool_min < 0.0) {
+                pool p;
+                p.layers = { (int) li };
+                l.pool = (int) pools.size();
+                for (int idx : l.tensors) {
+                    tensors[idx].role = tensors[idx].index;
+                }
+                pools.push_back(std::move(p));
+                continue;
+            }
+
+            // the roles by name without the layer prefix
+            std::vector<std::pair<std::string, int>> roles;
+            for (int idx : l.tensors) {
+                const char * name = tensors[idx].t->name;
+                const char * p    = strchr(name, '.');
+                p = p ? strchr(p + 1, '.') : nullptr;
+                roles.emplace_back(p ? p + 1 : name, idx);
+            }
+            std::sort(roles.begin(), roles.end());
+
+            std::string key;
+            for (size_t r = 0; r < roles.size(); ++r) {
+                const auto * t = tensors[roles[r].second].t;
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s:%d:%" PRId64 "x%" PRId64 "x%" PRId64 ":%zu;", roles[r].first.c_str(), (int) t->type,
+                        t->ne[0], t->ne[1], t->ne[2], (size_t) t->nb[2]);
+                key += buf;
+                tensors[roles[r].second].role = (int) r;
+            }
+
+            auto it = by_key.find(key);
+            if (it == by_key.end()) {
+                it = by_key.emplace(key, (int) pools.size()).first;
+                pools.emplace_back();
+            }
+            l.pool = it->second;
+            pools[it->second].layers.push_back((int) li);
+        }
+    }
+
+    bool shared(const layer & l) const {
+        return pools[l.pool].layers.size() > 1;
+    }
+
+    // the least cache slots of a layer with n slots in the uniform split
+    int64_t min_slots(const layer & l, int64_t n) const {
+        if (!shared(l)) {
+            return n;
+        }
+        return std::min<int64_t>(n, (int64_t) std::ceil(pool_min*(double) n - 1e-9));
     }
 
     static size_t mem_available() {
@@ -664,7 +766,7 @@ struct llama_moe_stream::impl {
     size_t staging_size(double frac) const {
         size_t res = 0;
         for (const auto & l : layers) {
-            const int64_t n_cached = (int64_t) (frac * (double) l.n_expert);
+            const int64_t n_cached = min_slots(l, (int64_t) (frac * (double) l.n_expert));
             for (int idx : l.tensors) {
                 res = std::max(res, max_slot_bytes(tensors[idx], n_cached));
             }
@@ -692,18 +794,27 @@ struct llama_moe_stream::impl {
                 const double budget = (double) avail - (double) reserve - (double) staging_size(frac) - (double) bounce;
                 frac = std::clamp(budget / (double) total, 0.0, 1.0);
             }
-            LLAMA_LOG_INFO("moe_stream: %s: %.2f GiB available (%.2f GiB of it ZFS ARC above its minimum), %.2f GiB reserved, %.2f GiB for the staging buffers -> %.2f GiB of cached experts\n",
-                    __func__, avail/GiB, arc/GiB, reserve/GiB, staging_size(frac)/GiB, frac*total/GiB);
+            if (arc > 0) {
+                LLAMA_LOG_INFO("moe_stream: auto size: %.2f GiB available (%.2f GiB of it ZFS ARC), %.2f GiB reserved\n",
+                        avail/GiB, arc/GiB, reserve/GiB);
+            } else {
+                LLAMA_LOG_INFO("moe_stream: auto size: %.2f GiB available, %.2f GiB reserved\n", avail/GiB, reserve/GiB);
+            }
         } else {
             frac = std::min(1.0, (double) resident / (double) total);
         }
 
+        for (auto & p : pools) {
+            p.n_slots = 0;
+        }
+
         size_t total_res = 0;
         for (auto & l : layers) {
-            l.n_slots = (int64_t) (frac * (double) l.n_expert);
+            l.n_uniform = (int64_t) (frac * (double) l.n_expert);
+            l.n_min     = min_slots(l, l.n_uniform);
+            pools[l.pool].n_slots += l.n_uniform;
 
             l.slot_of  .assign(l.n_expert, -1);
-            l.expert_of.assign(l.n_slots,  -1);
             l.stamp    .assign(l.n_expert, 0);
             l.prot     .assign(l.n_expert, 0);
             l.score    .assign(l.n_expert, 0.0);
@@ -716,13 +827,34 @@ struct llama_moe_stream::impl {
 
             for (int idx : l.tensors) {
                 auto & ti = tensors[idx];
-                total_res += (size_t) l.n_slots * ti.expert_size;
-                slot_size = std::max(slot_size, max_slot_bytes(ti, l.n_slots));
+                total_res += (size_t) l.n_uniform * ti.expert_size;
+                slot_size = std::max(slot_size, max_slot_bytes(ti, l.n_min));
             }
         }
+        for (auto & p : pools) {
+            p.slot_layer .assign(p.n_slots, -1);
+            p.slot_expert.assign(p.n_slots, -1);
+        }
 
-        LLAMA_LOG_INFO("moe_stream: %s: %zu layers, %.2f GiB of experts, %.2f GiB cached (%" PRId64 "/%" PRId64 " experts per layer), %.2f GiB streamed per ubatch, %s policy\n",
-                __func__, layers.size(), total/GiB, total_res/GiB, layers[0].n_slots, layers[0].n_expert, (total - total_res)/GiB, policy_name(policy));
+        LLAMA_LOG_INFO("moe_stream: %zu layers, %.2f GiB of experts, %.2f GiB cached (%" PRId64 "/%" PRId64 " per layer), %s policy\n",
+                layers.size(), total/GiB, total_res/GiB, layers[0].n_uniform, layers[0].n_expert, policy_name(policy));
+
+        if (pool_min >= 0.0) {
+            int n_shared = 0;
+            int n_own    = 0;
+            std::string sizes;
+            for (const auto & p : pools) {
+                if (p.layers.size() > 1) {
+                    n_shared++;
+                    sizes += (sizes.empty() ? "" : " + ") + std::to_string(p.layers.size());
+                } else {
+                    n_own++;
+                }
+            }
+            std::string own = n_own > 0 ? ", " + std::to_string(n_own) + " layers with a unique layout keep their own cache" : "";
+            LLAMA_LOG_INFO("moe_stream: pooled cache: %d pool%s (%s layers), each layer keeps >= %.0f%% of its share%s\n",
+                    n_shared, n_shared == 1 ? "" : "s", sizes.empty() ? "0" : sizes.c_str(), 100.0*pool_min, own.c_str());
+        }
     }
 
     //
@@ -744,7 +876,7 @@ struct llama_moe_stream::impl {
     // tensors computed on the CPU, and registered as pinned memory for the uploads
     bool alloc_staging() {
         if (slot_size == 0) {
-            LLAMA_LOG_INFO("moe_stream: %s: all the experts are cached, nothing to stream\n", __func__);
+            LLAMA_LOG_INFO("moe_stream: all the experts are cached, nothing to stream\n");
             return true;
         }
 
@@ -761,13 +893,13 @@ struct llama_moe_stream::impl {
                 staging = p;
                 base    = (uint8_t *) p;
                 if (mlock(staging, staging_size_) != 0) {
-                    LLAMA_LOG_WARN("moe_stream: %s: failed to lock the staging buffers: %s\n", __func__, strerror(errno));
+                    LLAMA_LOG_WARN("moe_stream: failed to lock the staging buffers: %s\n", strerror(errno));
                 }
                 pin = register_pinned(staging, staging_size_);
             }
         }
         if (!base) {
-            LLAMA_LOG_WARN("moe_stream: %s: memfd failed (%s), batches computed on the CPU are limited to the cache size\n", __func__, strerror(errno));
+            LLAMA_LOG_WARN("moe_stream: memfd failed (%s), batches computed on the CPU are limited to the cache size\n", strerror(errno));
             if (memfd >= 0) {
                 close(memfd);
                 memfd = -1;
@@ -783,7 +915,7 @@ struct llama_moe_stream::impl {
             }
         }
         if (!base) {
-            LLAMA_LOG_ERROR("moe_stream: %s: failed to allocate %.2f GiB for the staging buffers, MoE streaming disabled\n", __func__, staging_size_/GiB);
+            LLAMA_LOG_ERROR("moe_stream: failed to allocate %.2f GiB for the staging buffers, MoE streaming disabled\n", staging_size_/GiB);
             return false;
         }
 
@@ -793,18 +925,20 @@ struct llama_moe_stream::impl {
         }
 
         if (!pin) {
-            LLAMA_LOG_WARN("moe_stream: %s: the staging buffers are not pinned, uploads from them will be slower\n", __func__);
+            LLAMA_LOG_WARN("moe_stream: the staging buffers are not pinned, uploads from them will be slower\n");
         }
-        LLAMA_LOG_INFO("moe_stream: %s: %zu x %.2f GiB %s staging buffers (%.2f GiB), %zu IO threads\n", __func__,
-                n_slots, slot_size/GiB, pin ? "pinned" : "normal", staging_size_/GiB, workers.size());
+        LLAMA_LOG_INFO("moe_stream: staging: %zu x %.2f GiB %s buffers, %zu IO threads\n",
+                n_slots, slot_size/GiB, pin ? "pinned" : "unpinned", workers.size());
 
         return true;
     }
 
-    // the cache: for each tensor its slots, ending at a page boundary, followed by its overflow window if any
+    // the cache: for each role of each pool its slots, ending at a page boundary, followed by its overflow window if any
     bool alloc_cache() {
         struct region {
-            int    t;
+            int    pool;
+            int    role;
+            int    t;      // a tensor of the role
             size_t bank;   // bytes of the cache slots
             size_t padded; // rounded up to pages
             bool   window;
@@ -814,16 +948,25 @@ struct llama_moe_stream::impl {
         size_t total_banks = 0;
         int    n_windows = 0;
 
-        for (auto & l : layers) {
-            // a window per tensor of the layer, each over its own staging buffer
-            l.window = memfd >= 0 && l.streamed() && l.tensors.size() <= slots.size();
-            for (int idx : l.tensors) {
+        for (size_t pi = 0; pi < pools.size(); ++pi) {
+            auto & p = pools[pi];
+            const auto & l0 = layers[p.layers[0]];
+            // a window per role, each over its own staging buffer
+            p.window = memfd >= 0 && l0.streamed() && l0.tensors.size() <= slots.size();
+            p.bank     .assign(l0.tensors.size(), nullptr);
+            p.bank_data.assign(l0.tensors.size(), nullptr);
+            for (int li : p.layers) {
+                layers[li].window = p.window;
+            }
+            for (int idx : l0.tensors) {
                 const auto & ti = tensors[idx];
                 region r;
+                r.pool   = (int) pi;
+                r.role   = ti.role;
                 r.t      = idx;
-                r.bank   = l.n_slots*ti.expert_size;
+                r.bank   = p.n_slots*ti.expert_size;
                 r.padded = align_up(r.bank, page_size);
-                r.window = l.window;
+                r.window = p.window;
                 if (r.bank == 0 && !r.window) {
                     continue;
                 }
@@ -843,7 +986,7 @@ struct llama_moe_stream::impl {
         arena = mmap(nullptr, arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (arena == MAP_FAILED) {
             arena = nullptr;
-            LLAMA_LOG_ERROR("moe_stream: %s: failed to allocate %.2f GiB for the expert cache: %s\n", __func__, total_banks/GiB, strerror(errno));
+            LLAMA_LOG_ERROR("moe_stream: failed to allocate %.2f GiB for the expert cache: %s\n", total_banks/GiB, strerror(errno));
             return false;
         }
 
@@ -857,14 +1000,13 @@ struct llama_moe_stream::impl {
         std::vector<uint8_t *> starts(regions.size());
         for (size_t i = 0; i < regions.size(); ++i) {
             const auto & r  = regions[i];
-            const auto & ti = tensors[r.t];
 
             if (r.padded > 0) {
                 // locking also allocates all the pages now
                 if (!lock_failed && mlock(cur, r.padded) != 0) {
                     lock_failed = true;
-                    LLAMA_LOG_WARN("moe_stream: %s: failed to lock the expert cache (%s), it may be swapped out\n", __func__, strerror(errno));
-                    LLAMA_LOG_WARN("moe_stream: %s: raise the limit with 'ulimit -l unlimited' (or LimitMEMLOCK=infinity for a systemd service)\n", __func__);
+                    LLAMA_LOG_WARN("moe_stream: failed to lock the expert cache (%s), it may be swapped out\n", strerror(errno));
+                    LLAMA_LOG_WARN("moe_stream: raise the limit with 'ulimit -l unlimited' (or LimitMEMLOCK=infinity for a systemd service)\n");
                 }
                 if (want_pin && register_pinned(cur, r.padded)) {
                     n_pinned += r.padded;
@@ -875,9 +1017,9 @@ struct llama_moe_stream::impl {
             cur += r.padded;
 
             if (r.window) {
-                void * p = mmap(cur, slot_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memfd, (off_t) (ti.index*slot_size));
+                void * p = mmap(cur, slot_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memfd, (off_t) (r.role*slot_size));
                 if (p == MAP_FAILED) {
-                    LLAMA_LOG_ERROR("moe_stream: %s: failed to map an overflow window: %s\n", __func__, strerror(errno));
+                    LLAMA_LOG_ERROR("moe_stream: failed to map an overflow window: %s\n", strerror(errno));
                     return false;
                 }
                 cur += slot_size;
@@ -896,22 +1038,41 @@ struct llama_moe_stream::impl {
 
         for (size_t i = 0; i < regions.size(); ++i) {
             const auto & r  = regions[i];
-            auto       & ti = tensors[r.t];
-            const auto & l  = layers[ti.layer];
+            const auto & ti = tensors[r.t];
+            auto       & p  = pools[r.pool];
 
             const int64_t n_window = r.window ? (int64_t) (slot_size / ti.expert_size) : 0;
-            GGML_ASSERT(!r.window || n_window >= l.n_expert - l.n_slots);
+            for (int li : p.layers) {
+                GGML_ASSERT(!r.window || n_window >= layers[li].n_expert - layers[li].n_min);
+            }
 
-            ti.bank = ggml_new_tensor_3d(bank_ctx, ti.t->type, ti.t->ne[0], ti.t->ne[1], l.n_slots + n_window);
-            GGML_ASSERT((size_t) ti.bank->nb[2] == ti.expert_size);
-            ggml_format_name(ti.bank, "%s.cache", ti.t->name);
-            ggml_backend_tensor_alloc(bank_buf, ti.bank, starts[i]);
-            ti.bank_data = starts[i];
+            ggml_tensor * bank = ggml_new_tensor_3d(bank_ctx, ti.t->type, ti.t->ne[0], ti.t->ne[1], p.n_slots + n_window);
+            GGML_ASSERT((size_t) bank->nb[2] == ti.expert_size);
+            if (p.layers.size() > 1) {
+                const char * name = ti.t->name;
+                const char * dot  = strchr(name, '.');
+                dot = dot ? strchr(dot + 1, '.') : nullptr;
+                ggml_format_name(bank, "pool%d.%s.cache", r.pool, dot ? dot + 1 : name);
+            } else {
+                ggml_format_name(bank, "%s.cache", ti.t->name);
+            }
+            ggml_backend_tensor_alloc(bank_buf, bank, starts[i]);
+            p.bank     [r.role] = bank;
+            p.bank_data[r.role] = starts[i];
+
+            for (int li : p.layers) {
+                for (int idx : layers[li].tensors) {
+                    if (tensors[idx].role == r.role) {
+                        tensors[idx].bank      = bank;
+                        tensors[idx].bank_data = starts[i];
+                    }
+                }
+            }
         }
 
         pinned = want_pin && n_pinned > 0;
 
-        LLAMA_LOG_INFO("moe_stream: %s: allocated %.2f GiB of %s memory for the expert cache in %.1f s, %d overflow windows\n", __func__,
+        LLAMA_LOG_INFO("moe_stream: cache: %.2f GiB %s in %.1f s, %d overflow windows\n",
                 total_banks/GiB, pinned ? "pinned" : "locked", t_now() - t_start, n_windows);
 
         return true;
@@ -925,47 +1086,115 @@ struct llama_moe_stream::impl {
         }
     }
 
+    // the slots of each layer of a pool, from the number of experts it wants: the same proportions, each layer
+    // keeping at least n_min, the pool full
+    void split_pool(const pool & p, const std::vector<int64_t> & want, std::vector<int64_t> & n) const {
+        const size_t m = p.layers.size();
+        n.assign(m, 0);
+        if (m == 1) {
+            n[0] = p.n_slots;
+            return;
+        }
+        double sum = 0.0;
+        for (size_t i = 0; i < m; ++i) {
+            sum += (double) want[i];
+        }
+        const double scale = sum > 0.0 ? (double) p.n_slots / sum : 0.0;
+        std::vector<double> ideal(m);
+        int64_t used = 0;
+        for (size_t i = 0; i < m; ++i) {
+            const auto & l = layers[p.layers[i]];
+            ideal[i] = sum > 0.0 ? (double) want[i]*scale : (double) l.n_uniform;
+            n[i] = std::clamp<int64_t>((int64_t) ideal[i], l.n_min, l.n_expert);
+            used += n[i];
+        }
+        while (used != p.n_slots) {
+            // the layer furthest from its ideal size in the direction needed
+            int64_t best = -1;
+            double  bd   = 0.0;
+            for (size_t i = 0; i < m; ++i) {
+                const auto & l = layers[p.layers[i]];
+                const double d = used < p.n_slots ? ideal[i] - (double) n[i] : (double) n[i] - ideal[i];
+                const bool ok = used < p.n_slots ? n[i] < l.n_expert : n[i] > l.n_min;
+                if (ok && (best < 0 || d > bd)) {
+                    best = (int64_t) i;
+                    bd   = d;
+                }
+            }
+            GGML_ASSERT(best >= 0);
+            const int64_t step = used < p.n_slots ? 1 : -1;
+            n[best] += step;
+            used    += step;
+        }
+    }
+
     // fill the cache with the saved experts, or the first ones
     bool fill_cache() {
-        const int n_loaded = load_state();
+        std::vector<std::vector<int32_t>> saved(layers.size());
+        std::vector<uint8_t> has_saved(layers.size(), 0);
+        const int n_loaded = load_state(saved, has_saved);
 
         const double t_start = t_now();
         const size_t read_start = bytes_read;
 
         wait_group wg;
-        for (auto & l : layers) {
-            // the remaining slots get the first experts that are not cached yet
-            int64_t e = 0;
-            for (int64_t s = 0; s < l.n_slots; ++s) {
-                if (l.expert_of[s] >= 0) {
-                    continue;
-                }
-                while (l.slot_of[e] >= 0) {
-                    e++;
-                }
-                l.expert_of[s] = (int32_t) e;
-                l.slot_of[e]   = (int32_t) s;
+        std::vector<int64_t> want;
+        std::vector<int64_t> n;
+        for (auto & p : pools) {
+            // a run of slots per layer, sized like the saved lists
+            want.clear();
+            for (int li : p.layers) {
+                want.push_back(has_saved[li] ? (int64_t) saved[li].size() : layers[li].n_uniform);
             }
+            split_pool(p, want, n);
 
-            // read runs of consecutive experts in consecutive slots together
-            for (int64_t s = 0; s < l.n_slots; ) {
-                int64_t n = 1;
-                while (s + n < l.n_slots && l.expert_of[s + n] == l.expert_of[s] + n) {
-                    n++;
+            int64_t base = 0;
+            for (size_t i = 0; i < p.layers.size(); ++i) {
+                const int li = p.layers[i];
+                auto & l = layers[li];
+                l.n_cached = n[i];
+
+                // the saved experts first, most recently used first, then the first experts that are not cached yet
+                int64_t s = base;
+                for (size_t j = 0; j < saved[li].size() && s < base + n[i]; ++j) {
+                    const int32_t e = saved[li][j];
+                    l.slot_of[e]     = (int32_t) s;
+                    p.slot_layer [s] = li;
+                    p.slot_expert[s] = e;
+                    l.stamp[e]       = (uint64_t) (saved[li].size() - j);
+                    s++;
                 }
-                read_experts(l, l.expert_of[s], s, n, wg);
-                s += n;
+                int64_t e = 0;
+                for (; s < base + n[i]; ++s) {
+                    while (l.slot_of[e] >= 0) {
+                        e++;
+                    }
+                    l.slot_of[e]     = (int32_t) s;
+                    p.slot_layer [s] = li;
+                    p.slot_expert[s] = (int32_t) e;
+                }
+
+                // read runs of consecutive experts in consecutive slots together
+                for (int64_t s0 = base; s0 < base + n[i]; ) {
+                    int64_t k = 1;
+                    while (s0 + k < base + n[i] && p.slot_expert[s0 + k] == p.slot_expert[s0] + k) {
+                        k++;
+                    }
+                    read_experts(l, p.slot_expert[s0], s0, k, wg);
+                    s0 += k;
+                }
+                base += n[i];
             }
         }
         if (!wait(wg)) {
-            LLAMA_LOG_ERROR("moe_stream: %s: failed to read the experts into the cache\n", __func__);
+            LLAMA_LOG_ERROR("moe_stream: failed to read the experts into the cache\n");
             return false;
         }
 
         const double t    = std::max(t_now() - t_start, 1e-6);
         const size_t read = bytes_read - read_start;
-        LLAMA_LOG_INFO("moe_stream: %s: read %.2f GiB of experts into the cache in %.1f s (%.2f GiB/s), %d layers from %s\n", __func__,
-                read/GiB, t, read/GiB/t, n_loaded, n_loaded > 0 ? state_path.c_str() : "nowhere (first experts)");
+        LLAMA_LOG_INFO("moe_stream: cache: filled %.2f GiB in %.1f s (%.2f GiB/s), %s\n",
+                read/GiB, t, read/GiB/t, n_loaded > 0 ? ("experts of " + std::to_string(n_loaded) + " layers from " + state_path).c_str() : "first experts");
 
         return true;
     }
@@ -976,7 +1205,7 @@ struct llama_moe_stream::impl {
             return cpu_max;
         }
         // without a window, all the experts of a batch must fit in the cache
-        return std::min<int64_t>(cpu_max, n_expert_used > 0 ? l.n_slots / n_expert_used : 0);
+        return std::min<int64_t>(cpu_max, n_expert_used > 0 ? l.n_min / n_expert_used : 0);
     }
 
     // log how batches are computed
@@ -985,11 +1214,13 @@ struct llama_moe_stream::impl {
         for (const auto & l : layers) {
             lim = std::min(lim, cpu_limit(l));
         }
-        LLAMA_LOG_INFO("moe_stream: %s: batches of up to %" PRId64 " tokens are computed on the CPU from the cache (LLAMA_MOE_STREAM_CPU_MAX=%" PRId64 "),"
-                " larger ones on %s, prefetching the experts in the order of their usage\n", __func__,
-                lim, cpu_max, ggml_backend_name(target_backend));
+        LLAMA_LOG_INFO("moe_stream: batches of up to %" PRId64 " tokens on the CPU from the cache%s, larger ones on %s\n",
+                lim, overlap_mode ? " (reads overlapped)" : "", ggml_backend_name(target_backend));
         if (lim < cpu_max) {
-            LLAMA_LOG_WARN("moe_stream: %s: without overflow windows, batches on the CPU are limited to %" PRId64 " tokens\n", __func__, lim);
+            LLAMA_LOG_WARN("moe_stream: without overflow windows, batches on the CPU are limited to %" PRId64 " tokens\n", lim);
+        }
+        if (!stats_path.empty()) {
+            LLAMA_LOG_INFO("moe_stream: statistics written to %s every %" PRId64 " tokens\n", stats_path.c_str(), stats_interval);
         }
     }
 
@@ -997,7 +1228,8 @@ struct llama_moe_stream::impl {
     // saved state: the cached experts of each layer, most recently used first, and the usage scores
     //
 
-    int load_state() {
+    // the saved experts of each layer, most recently used first
+    int load_state(std::vector<std::vector<int32_t>> & saved, std::vector<uint8_t> & has_saved) {
         if (state_path.empty()) {
             return 0;
         }
@@ -1008,7 +1240,7 @@ struct llama_moe_stream::impl {
 
         std::string line;
         if (!std::getline(in, line) || (line != "moe-stream-state 1" && line != "moe-stream-state 2")) {
-            LLAMA_LOG_WARN("moe_stream: %s: %s is not a state file, ignored\n", __func__, state_path.c_str());
+            LLAMA_LOG_WARN("moe_stream: %s is not a state file, ignored\n", state_path.c_str());
             return 0;
         }
 
@@ -1042,21 +1274,23 @@ struct llama_moe_stream::impl {
             if (!(ss >> il >> n_expert >> count) || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
                 continue;
             }
-            auto & l = layers[layer_of_il[il]];
+            const int li = layer_of_il[il];
+            auto & l = layers[li];
             if (n_expert != l.n_expert) {
                 continue;
             }
-            int64_t s = 0;
-            for (int64_t i = 0; i < count && s < l.n_slots; ++i) {
+            std::vector<uint8_t> seen(l.n_expert, 0);
+            auto & list = saved[li];
+            list.clear();
+            for (int64_t i = 0; i < count; ++i) {
                 int64_t e = -1;
-                if (!(ss >> e) || e < 0 || e >= l.n_expert || l.slot_of[e] >= 0) {
+                if (!(ss >> e) || e < 0 || e >= l.n_expert || seen[e]) {
                     continue;
                 }
-                l.expert_of[s] = (int32_t) e;
-                l.slot_of[e]   = (int32_t) s;
-                l.stamp[e]     = (uint64_t) (count - i); // most recently used first
-                s++;
+                seen[e] = 1;
+                list.push_back((int32_t) e);
             }
+            has_saved[li] = 1;
             n_loaded++;
         }
         clock = 1ull << 20;
@@ -1074,7 +1308,7 @@ struct llama_moe_stream::impl {
             if (!out) {
                 static bool warned = false;
                 if (!warned) {
-                    LLAMA_LOG_WARN("moe_stream: %s: cannot write %s, the cached experts are not saved\n", __func__, tmp.c_str());
+                    LLAMA_LOG_WARN("moe_stream: cannot write %s, the cached experts are not saved\n", tmp.c_str());
                     warned = true;
                 }
                 return;
@@ -1085,8 +1319,11 @@ struct llama_moe_stream::impl {
             std::vector<int32_t> es;
             for (const auto & l : layers) {
                 es.clear();
-                for (int64_t s = 0; s < l.n_slots; ++s) {
-                    es.push_back(l.expert_of[s]);
+                const auto & p = pools[l.pool];
+                for (int64_t s = 0; s < p.n_slots; ++s) {
+                    if (p.slot_layer[s] == &l - layers.data()) {
+                        es.push_back(p.slot_expert[s]);
+                    }
                 }
                 std::sort(es.begin(), es.end(), [&](int32_t a, int32_t b) { return l.stamp[a] > l.stamp[b]; });
                 out << l.il << " " << l.n_expert << " " << es.size();
@@ -1104,7 +1341,7 @@ struct llama_moe_stream::impl {
             }
         }
         if (rename(tmp.c_str(), state_path.c_str()) != 0) {
-            LLAMA_LOG_WARN("moe_stream: %s: failed to save %s: %s\n", __func__, state_path.c_str(), strerror(errno));
+            LLAMA_LOG_WARN("moe_stream: failed to save %s: %s\n", state_path.c_str(), strerror(errno));
             return;
         }
         state_dirty  = false;
@@ -1148,49 +1385,76 @@ struct llama_moe_stream::impl {
     // replacement policy, for the batches computed on the CPU
     //
 
-    // the cached expert to evict that is not selected by the batch, -1 if there is none
-    int64_t victim(const layer & l) const {
-        int64_t best = -1;
-        int64_t best_prob = -1; // slru: the least recently used of the probation half first
-        for (int64_t s = 0; s < l.n_slots; ++s) {
-            const int64_t e = l.expert_of[s];
-            if (l.mark[e] == l.mark_gen) {
-                continue;
-            }
-            if (best < 0) {
-                best = e;
-            } else if (policy == LLAMA_MOE_STREAM_POLICY_LFU) {
-                if (l.score[e] < l.score[best] || (l.score[e] == l.score[best] && l.stamp[e] < l.stamp[best])) {
-                    best = e;
-                }
-            } else if (l.stamp[e] < l.stamp[best]) {
-                best = e;
-            }
-            if (policy == LLAMA_MOE_STREAM_POLICY_SLRU && !l.prot[e] && (best_prob < 0 || l.stamp[e] < l.stamp[best_prob])) {
-                best_prob = e;
-            }
+    // the order of eviction of the cache slots of a pool: lru: the least recently used first; slru: the same, the
+    // probation segment first; lfu: the least used first
+    bool evict_before(const pool & p, int32_t a, int32_t b) const {
+        const auto & la = layers[p.slot_layer[a]];
+        const auto & lb = layers[p.slot_layer[b]];
+        const int32_t ea = p.slot_expert[a];
+        const int32_t eb = p.slot_expert[b];
+        if (policy == LLAMA_MOE_STREAM_POLICY_SLRU && la.prot[ea] != lb.prot[eb]) {
+            return la.prot[ea] < lb.prot[eb];
         }
-        return best_prob >= 0 ? best_prob : best;
+        if (policy == LLAMA_MOE_STREAM_POLICY_LFU && la.score[ea] != lb.score[eb]) {
+            return la.score[ea] < lb.score[eb];
+        }
+        if (la.stamp[ea] != lb.stamp[eb]) {
+            return la.stamp[ea] < lb.stamp[eb];
+        }
+        return a < b;
     }
 
-    // a second use promotes to the protected half (slru), its least recently used expert goes back to probation
-    void promote(layer & l, int64_t e) {
+    // a slot of the pool of layer li that a missing expert of li can take: an expert of li that the batch did not
+    // select, or, if steal, an expert of another layer that has more than its least slots
+    bool can_evict(const pool & p, int li, int32_t s, bool steal) const {
+        const int lo = p.slot_layer[s];
+        if (lo == li) {
+            return layers[li].mark[p.slot_expert[s]] != layers[li].mark_gen;
+        }
+        return steal && layers[lo].n_cached > layers[lo].n_min;
+    }
+
+    // the victim candidates of layer li, the first n_want in eviction order at the front
+    void collect_victims(const pool & p, int li, bool steal, size_t n_want) {
+        cand.clear();
+        if (steal) {
+            for (int32_t s = 0; s < (int32_t) p.n_slots; ++s) {
+                if (can_evict(p, li, s, true)) {
+                    cand.push_back(s);
+                }
+            }
+        } else {
+            const auto & l = layers[li];
+            for (int64_t e = 0; e < l.n_expert; ++e) {
+                if (l.slot_of[e] >= 0 && l.mark[e] != l.mark_gen) {
+                    cand.push_back(l.slot_of[e]);
+                }
+            }
+        }
+        auto less = [&](int32_t a, int32_t b) { return evict_before(p, a, b); };
+        if (cand.size() > n_want) {
+            std::nth_element(cand.begin(), cand.begin() + n_want, cand.end(), less);
+            cand.resize(n_want);
+        }
+        std::sort(cand.begin(), cand.end(), less);
+    }
+
+    // a second use promotes to the protected half of the pool (slru), its least recently used expert goes back to probation
+    void promote(pool & p, layer & l, int64_t e) {
         if (policy != LLAMA_MOE_STREAM_POLICY_SLRU || l.prot[e]) {
             return;
         }
+        const int32_t s = l.slot_of[e];
         l.prot[e] = 1;
-        l.n_prot++;
-        if (l.n_prot > l.n_slots/2) {
-            int64_t d = -1;
-            for (int64_t s = 0; s < l.n_slots; ++s) {
-                const int64_t x = l.expert_of[s];
-                if (l.prot[x] && x != e && (d < 0 || l.stamp[x] < l.stamp[d])) {
-                    d = x;
-                }
+        p.prot.emplace(l.stamp[e], s);
+        if ((int64_t) p.prot.size() > p.n_slots/2) {
+            auto it = p.prot.begin();
+            if (it->second == s) {
+                ++it;
             }
-            if (d >= 0) {
-                l.prot[d] = 0;
-                l.n_prot--;
+            if (it != p.prot.end()) {
+                layers[p.slot_layer[it->second]].prot[p.slot_expert[it->second]] = 0;
+                p.prot.erase(it);
             }
         }
     }
@@ -1200,6 +1464,7 @@ struct llama_moe_stream::impl {
     // selected by the batch (or, with lfu, when they are used less than the expert they would replace)
     void ensure(int li, const ggml_tensor * ids, ggml_tensor * out) {
         auto & l = layers[li];
+        auto & p = pools[l.pool];
 
         GGML_ASSERT(pend_li < 0 && "the previous layer did not wait for its reads");
 
@@ -1242,7 +1507,7 @@ struct llama_moe_stream::impl {
                 continue;
             }
             cpu_hits++;
-            promote(l, e);
+            promote(p, l, e);
         }
 
         // how the misses could have been predicted, with the scores before this batch
@@ -1261,6 +1526,10 @@ struct llama_moe_stream::impl {
         }
 
         for (int32_t e : needed) {
+            if (l.prot[e]) {
+                p.prot.erase({ l.stamp[e], l.slot_of[e] });
+                p.prot.emplace(clock, l.slot_of[e]);
+            }
             l.stamp[e]  = clock;
             l.score[e] += cnt[e]*w;
         }
@@ -1294,25 +1563,58 @@ struct llama_moe_stream::impl {
             // the most used first, so that with lfu they are the ones admitted
             std::stable_sort(missing.begin(), missing.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
 
+            // the experts of the other layers of the pool can be evicted when no layer of the graph is streamed:
+            // then nothing uploads from the cache while it changes
+            const bool steal = shared(l) && order.empty();
+
             bool changed = false;
+            size_t ci = 0;
+            collect_victims(p, li, steal, missing.size());
             for (int32_t e : missing) {
-                const int64_t v = victim(l);
-                if (v < 0 || (l.window && policy == LLAMA_MOE_STREAM_POLICY_LFU && l.score[e] <= l.score[v])) {
+                // the next candidate that can still be evicted, the floors of the other layers change as they lose slots
+                int32_t s = -1;
+                for (;;) {
+                    while (ci < cand.size() && !can_evict(p, li, cand[ci], steal)) {
+                        ci++;
+                    }
+                    if (ci < cand.size()) {
+                        s = cand[ci];
+                        break;
+                    }
+                    if (!steal || cand.empty()) {
+                        break;
+                    }
+                    collect_victims(p, li, steal, missing.size());
+                    ci = 0;
+                }
+                if (s < 0) {
                     overflow.push_back(e);
                     continue;
                 }
-
-                const int32_t s = l.slot_of[v];
-                if (l.prot[v]) {
-                    l.prot[v] = 0;
-                    l.n_prot--;
+                const int lo = p.slot_layer[s];
+                auto & lv = layers[lo];
+                const int32_t v = p.slot_expert[s];
+                if (l.window && policy == LLAMA_MOE_STREAM_POLICY_LFU && l.score[e] <= lv.score[v]) {
+                    overflow.push_back(e);
+                    continue;
                 }
-                l.slot_of[v]   = -1;
-                l.slot_of[e]   = s;
-                l.expert_of[s] = e;
-                l.mark[v]      = l.mark_gen; // the slot is taken, not a victim again
-                l.evicted_at[v] = ++l.n_evict;
-                changed        = true;
+                ci++;
+
+                if (lv.prot[v]) {
+                    lv.prot[v] = 0;
+                    p.prot.erase({ lv.stamp[v], s });
+                }
+                lv.slot_of[v]    = -1;
+                lv.evicted_at[v] = ++lv.n_evict;
+                if (lo != li) {
+                    lv.n_cached--;
+                    l.n_cached++;
+                    lv.dirty = true;
+                }
+                l.slot_of[e]     = s;
+                p.slot_layer [s] = li;
+                p.slot_expert[s] = e;
+                changed          = true;
 
                 read_experts(l, e, s, 1, wg);
             }
@@ -1322,7 +1624,7 @@ struct llama_moe_stream::impl {
 
                 // the windows are the staging buffers of the tensors: wait for what uses them and drop their content
                 for (int idx : l.tensors) {
-                    const int s = tensors[idx].index;
+                    const int s = tensors[idx].role;
                     release(s);
                     reset(s, -1);
                 }
@@ -1331,7 +1633,7 @@ struct llama_moe_stream::impl {
                     ov_index[e] = (int32_t) j;
                     for (int idx : l.tensors) {
                         const auto & ti = tensors[idx];
-                        uint8_t * dst = ti.bank_data + (l.n_slots + j)*ti.expert_size;
+                        uint8_t * dst = ti.bank_data + (p.n_slots + j)*ti.expert_size;
                         submit_bounce(ti.file, ti.file_offs + e*ti.expert_size, ti.expert_size, dst, wg);
                     }
                 }
@@ -1364,7 +1666,7 @@ struct llama_moe_stream::impl {
         for (int64_t i1 = 0; i1 < n; ++i1) {
             for (int64_t i0 = 0; i0 < k; ++i0) {
                 const int32_t e    = id_at(i0, i1);
-                const int32_t slot = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) l.n_slots + ov_index[e];
+                const int32_t slot = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) p.n_slots + ov_index[e];
                 const bool    rd   = being_read[e] != 0;
                 pend_all [i1*k + i0] = slot;
                 pend_read[i1*k + i0] = rd;
@@ -1535,17 +1837,17 @@ struct llama_moe_stream::impl {
                 }
             }
             if (r < 0 && errno != EINVAL) {
-                LLAMA_LOG_ERROR("moe_stream: %s: read of %zu bytes at %zu of %s failed: %s\n", __func__, j.len, j.offs, f.path.c_str(), strerror(errno));
+                LLAMA_LOG_ERROR("moe_stream: read of %zu bytes at %zu of %s failed: %s\n", j.len, j.offs, f.path.c_str(), strerror(errno));
                 return false;
             }
             if (!warned_dio_fallback.exchange(true)) {
-                LLAMA_LOG_WARN("moe_stream: %s: O_DIRECT read failed for %s, falling back to buffered reads\n", __func__, f.path.c_str());
+                LLAMA_LOG_WARN("moe_stream: O_DIRECT read failed for %s, falling back to buffered reads\n", f.path.c_str());
             }
         }
 
         const ssize_t r = pread_full(f.fd_buffered, j.dst, need, j.offs);
         if (r < 0 || (size_t) r != need) {
-            LLAMA_LOG_ERROR("moe_stream: %s: read of %zu bytes at %zu of %s failed: %s\n", __func__, need, j.offs, f.path.c_str(),
+            LLAMA_LOG_ERROR("moe_stream: read of %zu bytes at %zu of %s failed: %s\n", need, j.offs, f.path.c_str(),
                     r < 0 ? strerror(errno) : "unexpected end of file");
             return false;
         }
@@ -1905,7 +2207,7 @@ struct llama_moe_stream::impl {
             t_stalled += t_now() - t0;
 
             if (!ok) {
-                GGML_ABORT("moe_stream: %s: failed to read %s", __func__, ti.t->name);
+                GGML_ABORT("moe_stream: failed to read %s", ti.t->name);
             }
         }
 
@@ -2036,6 +2338,7 @@ struct llama_moe_stream::impl {
             // and generation needs the IO threads
             ggml_backend_sched_synchronize(sched);
             cancel_prefetch();
+            log_gpu();
         }
         last_streamed = !order.empty();
 
@@ -2093,14 +2396,14 @@ struct llama_moe_stream::impl {
         std::vector<int64_t> c(layers.size());
         for (size_t li = 0; li < layers.size(); ++li) {
             const auto & l = layers[li];
-            for (int64_t d = 0; d < l.n_slots; ++d) {
+            for (int64_t d = 0; d < l.n_uniform; ++d) {
                 hits_cur += l.sd_hist[d];
             }
             for (uint64_t v : l.sd_hist) {
                 access += v;
             }
-            budget += l.n_slots*expert_bytes(l);
-            c[li] = std::min<int64_t>(l.n_expert, (int64_t) std::ceil(alloc_min*l.n_slots));
+            budget += l.n_uniform*expert_bytes(l);
+            c[li] = std::min<int64_t>(l.n_expert, (int64_t) std::ceil(alloc_min*l.n_uniform));
             budget -= c[li]*expert_bytes(l) <= budget ? c[li]*expert_bytes(l) : budget;
         }
 
@@ -2187,7 +2490,7 @@ struct llama_moe_stream::impl {
             if (!o) {
                 static bool warned = false;
                 if (!warned) {
-                    LLAMA_LOG_WARN("moe_stream: %s: cannot write %s\n", __func__, tmp.c_str());
+                    LLAMA_LOG_WARN("moe_stream: cannot write %s\n", tmp.c_str());
                     warned = true;
                 }
                 return;
@@ -2197,7 +2500,8 @@ struct llama_moe_stream::impl {
             o << "  \"version\": 1,\n";
             o << "  \"uptime_s\": " << t_now() - t_start_all << ",\n";
             o << "  \"policy\": \"" << policy_name(policy) << "\", \"halflife\": " << halflife << ", \"overlap\": " << (overlap_mode ? "true" : "false")
-              << ", \"cpu_max\": " << cpu_max << ", \"staging_buffers\": " << slots.size() << ", \"io_threads\": " << workers.size() << ",\n";
+              << ", \"cpu_max\": " << cpu_max << ", \"staging_buffers\": " << slots.size() << ", \"io_threads\": " << workers.size()
+              << ", \"pool_min\": " << pool_min << ", \"pools\": " << pools.size() << ",\n";
             o << "  \"cpu_total\": ";
             cpu_json(o, all);
             o << ",\n  \"cpu_last_interval\": ";
@@ -2212,7 +2516,8 @@ struct llama_moe_stream::impl {
             o << "  \"layers\": [\n";
             for (size_t li = 0; li < layers.size(); ++li) {
                 const auto & l = layers[li];
-                o << "    {\"il\": " << l.il << ", \"n_expert\": " << l.n_expert << ", \"slots\": " << l.n_slots
+                o << "    {\"il\": " << l.il << ", \"n_expert\": " << l.n_expert << ", \"pool\": " << l.pool << ", \"slots\": " << l.n_cached
+                  << ", \"uniform_slots\": " << l.n_uniform << ", \"min_slots\": " << l.n_min
                   << ", \"best_slots\": " << split[li] << ", \"expert_bytes\": " << expert_bytes(l)
                   << ", \"selected\": " << l.st_access << ", \"cached\": " << l.st_hits << ", \"overflow_window\": " << l.st_window;
                 o << ",\n     \"stack_distance\": [";
@@ -2228,7 +2533,7 @@ struct llama_moe_stream::impl {
             o << "  ]\n}\n";
         }
         if (rename(tmp.c_str(), stats_path.c_str()) != 0) {
-            LLAMA_LOG_WARN("moe_stream: %s: failed to write %s: %s\n", __func__, stats_path.c_str(), strerror(errno));
+            LLAMA_LOG_WARN("moe_stream: failed to write %s: %s\n", stats_path.c_str(), strerror(errno));
         }
     }
 
@@ -2237,7 +2542,7 @@ struct llama_moe_stream::impl {
             cpu_tokens   += n_tokens;
             cpu_batches  += 1;
             state_tokens += n_tokens;
-            if (cpu_tokens >= CPU_STATS_TOKENS && cpu_access > 0) {
+            if (cpu_tokens >= stats_interval && cpu_access > 0) {
                 last.cpu_tokens  = cpu_tokens;
                 last.cpu_batches = cpu_batches;
                 last.cpu_access  = cpu_access;
@@ -2251,13 +2556,23 @@ struct llama_moe_stream::impl {
                 }
                 add_cpu(tot, last);
 
-                double cur = 0.0, best = 0.0;
-                project(cur, best, nullptr);
-                LLAMA_LOG_INFO("moe_stream: cpu: %" PRId64 " tokens, %.1f%% of the selected experts cached, %.1f missing per token, read %.2f GiB, %s %.1f s;"
-                        " LRU hit rate projected with the uniform split %.1f%%, with the best split %.1f%%%s%s\n",
+                std::string spread;
+                if (pool_min >= 0.0) {
+                    // how far the layers of the shared pools moved from their uniform share
+                    int64_t lo = INT64_MAX, hi = 0;
+                    for (const auto & l : layers) {
+                        if (shared(l) && l.n_uniform > 0) {
+                            lo = std::min<int64_t>(lo, 100*l.n_cached/l.n_uniform);
+                            hi = std::max<int64_t>(hi, 100*l.n_cached/l.n_uniform);
+                        }
+                    }
+                    if (lo <= hi) {
+                        spread = ", layers at " + std::to_string(lo) + "-" + std::to_string(hi) + "% of their share";
+                    }
+                }
+                LLAMA_LOG_INFO("moe_stream: decode: %" PRId64 " tokens, %.1f%% hits, %.2f misses/token, read %.2f GiB, %s %.1f s%s\n",
                         cpu_tokens, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/std::max<int64_t>(cpu_tokens, 1),
-                        cpu_bytes/GiB, overlap_mode ? "waited" : "in", cpu_t_read, 100.0*cur, 100.0*best,
-                        stats_path.empty() ? "" : ", stats in ", stats_path.c_str());
+                        cpu_bytes/GiB, overlap_mode ? "waited" : "read time", cpu_t_read, spread.c_str());
 
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
                 cpu_pred_evicted[0] = cpu_pred_evicted[1] = 0;
@@ -2283,25 +2598,40 @@ struct llama_moe_stream::impl {
         const double t    = std::max(t_now() - t_first, 1e-6);
         const size_t read = bytes_read - bytes_read_start;
 
-        tot.gpu_graphs++;
-        tot.gpu_tokens   += n_tokens;
-        tot.gpu_time     += t;
-        tot.gpu_stalled  += t_stalled;
-        tot.gpu_read     += read;
-        tot.gpu_up_slot  += bytes_up_slot;
-        tot.gpu_up_res   += bytes_up_res;
-        tot.gpu_pf_need  += pf_need;
-        tot.gpu_pf_done  += pf_done;
-        tot.gpu_pf_queue += pf_queue;
-        tot.gpu_misses   += n_misses;
-        tot.gpu_wasted   += n_wasted;
-
-        LLAMA_LOG_INFO("moe_stream: %" PRId64 " tokens: %.1f s, read %.2f GiB (%.2f GiB/s), uploaded %.2f GiB staged + %.2f GiB cached, stalled %.1f s,"
-                " selected experts read ahead %.0f%% (+%.0f%% in progress), %d misses, %d wasted\n",
-                n_tokens, t, read/GiB, read/GiB/t, bytes_up_slot/GiB, bytes_up_res/GiB, t_stalled,
-                100.0*pf_done/std::max<int64_t>(pf_need, 1), 100.0*pf_queue/std::max<int64_t>(pf_need, 1), n_misses, n_wasted);
+        for (totals * a : { &tot, &agg }) {
+            a->gpu_graphs++;
+            a->gpu_tokens   += n_tokens;
+            a->gpu_time     += t;
+            a->gpu_stalled  += t_stalled;
+            a->gpu_read     += read;
+            a->gpu_up_slot  += bytes_up_slot;
+            a->gpu_up_res   += bytes_up_res;
+            a->gpu_pf_need  += pf_need;
+            a->gpu_pf_done  += pf_done;
+            a->gpu_pf_queue += pf_queue;
+            a->gpu_misses   += n_misses;
+            a->gpu_wasted   += n_wasted;
+        }
 
         t_first = -1.0;
+
+        // one line per prompt: after its last ubatch
+        if (!expect_more) {
+            log_gpu();
+        }
+    }
+
+    void log_gpu() {
+        if (agg.gpu_graphs == 0) {
+            return;
+        }
+        const double t = std::max(agg.gpu_time, 1e-6);
+        LLAMA_LOG_INFO("moe_stream: prompt: %" PRId64 " tokens in %" PRId64 " ubatches, %.1f s (%.1f t/s), read %.2f GiB (%.2f GiB/s), stalled %.1f s,"
+                " read ahead %.0f%% (+%.0f%% in progress)%s\n",
+                agg.gpu_tokens, agg.gpu_graphs, t, agg.gpu_tokens/t, agg.gpu_read/GiB, agg.gpu_read/GiB/t, agg.gpu_stalled,
+                100.0*agg.gpu_pf_done/std::max<int64_t>(agg.gpu_pf_need, 1), 100.0*agg.gpu_pf_queue/std::max<int64_t>(agg.gpu_pf_need, 1),
+                agg.gpu_misses + agg.gpu_wasted > 0 ? (", " + std::to_string(agg.gpu_misses) + " misses, " + std::to_string(agg.gpu_wasted) + " wasted").c_str() : "");
+        agg = totals();
     }
 #endif // __linux__
 };

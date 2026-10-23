@@ -2860,6 +2860,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_STATE"));
     add_opt(common_arg(
+        {"--moe-stream-pool"}, "F",
+        "with --moe-stream: the layers whose experts have the same types and shapes share one pool of cache slots with a\n"
+        "global replacement policy, so that the layers that need more experts get more of the cache. each layer keeps at\n"
+        "least F (0..1) of the slots it would have with the uniform split, 1 = the uniform split (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream_pool = f;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_POOL"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
