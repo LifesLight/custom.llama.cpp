@@ -1710,11 +1710,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
+                // the MTP context takes either token or embedding entries per call, never both:
+                // a target batch with media mixed into the text is decoded here as consecutive homogeneous runs
+                for (int32_t off = 0; off < batch.size() && ok; ) {
+                    const bool is_tok = batch.tokens[off].id != LLAMA_TOKEN_NULL;
+                    int32_t n = 1;
+                    while (off + n < batch.size() && (batch.tokens[off + n].id != LLAMA_TOKEN_NULL) == is_tok) {
+                        n++;
+                    }
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(off, n));
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[off].pos[0]);
+                        ok = false;
+                    }
+                    off += n;
+                }
+                if (!ok) {
                     break;
                 }
             }

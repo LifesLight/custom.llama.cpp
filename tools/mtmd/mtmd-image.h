@@ -5,6 +5,7 @@
 
 #include <vector>
 #include <string>
+#include <stdexcept>
 
 #define MTMD_INTERNAL_HEADER
 
@@ -28,10 +29,40 @@ struct mtmd_image_preproc_out {
 
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
-    const clip_hparams & hparams;
+    clip_hparams hparams;
 
     mtmd_image_preprocessor(const clip_ctx * ctx): hparams(*clip_get_hparams(ctx)) {}
     mtmd_image_preprocessor(const clip_hparams & hparams): hparams(hparams) {}
+
+    void set_image_token_limits(int min_tokens, int max_tokens) {
+        if ((min_tokens <= 0 && max_tokens <= 0) || (hparams.image_max_pixels <= 0 && hparams.image_longest_edge <= 0)) {
+            return;
+        }
+        if (hparams.dsv4_max_n_token > 0 && max_tokens > 0) {
+            max_tokens = std::max(max_tokens, 16);
+        }
+        const int64_t patch_side = int64_t(hparams.patch_size) * hparams.n_merge;
+        if (patch_side <= 0 || patch_side > 46340 || std::max(min_tokens, max_tokens) > INT32_MAX / (patch_side * patch_side)) {
+            throw std::runtime_error("video image token limit is too large");
+        }
+        if (min_tokens > 0) {
+            hparams.custom_image_min_tokens = min_tokens;
+            hparams.image_min_pixels = min_tokens * patch_side * patch_side;
+        }
+        if (max_tokens > 0) {
+            hparams.custom_image_max_tokens = max_tokens;
+            hparams.image_max_pixels = max_tokens * patch_side * patch_side;
+        }
+        if (hparams.dsv4_max_n_token > 0) {
+            if (max_tokens > 0) {
+                hparams.dsv4_max_n_token = max_tokens;
+            }
+            hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+        }
+        if (hparams.image_max_pixels > 0 && hparams.image_max_pixels < hparams.image_min_pixels) {
+            throw std::runtime_error("video image max tokens is less than min tokens");
+        }
+    }
 
     virtual ~mtmd_image_preprocessor() = default;
     virtual mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const = 0;
@@ -132,7 +163,7 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
 struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
-    mtmd_image_preprocessor_dyn_size(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    using mtmd_image_preprocessor::mtmd_image_preprocessor;
     static clip_image_size get_target_size(const clip_hparams & hparams, const clip_image_size & original_size);
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };

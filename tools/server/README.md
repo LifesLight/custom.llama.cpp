@@ -183,6 +183,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-mmdev, --mmproj-device DEVICE` | device to use for multimodal projector (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices<br/>(env: MTMD_BACKEND_DEVICE) |
 | `--image-min-tokens N` | minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MIN_TOKENS) |
 | `--image-max-tokens N` | maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MAX_TOKENS) |
+| `--video-image-min-tokens N` | minimum number of tokens each video frame can take, only used by vision models with dynamic resolution (default: --image-min-tokens)<br/>(env: LLAMA_ARG_VIDEO_IMAGE_MIN_TOKENS) |
+| `--video-image-max-tokens N` | maximum number of tokens each video frame can take, only used by vision models with dynamic resolution (default: --image-max-tokens)<br/>(env: LLAMA_ARG_VIDEO_IMAGE_MAX_TOKENS) |
 | `--mtmd-batch-max-tokens N` | maximum number of image tokens per batch when encoding images (default: 1024)<br/>(env: LLAMA_ARG_MTMD_BATCH_MAX_TOKENS) |
 | `--video-fps N` | target video frame rate (default: 4.0)<br/>(env: LLAMA_ARG_VIDEO_FPS) |
 | `--video-timestamp-interval N` | interval in milliseconds between text timestamps (default: 5000)<br/>(env: LLAMA_ARG_VIDEO_TIMESTAMP_INTERVAL) |
