@@ -3,15 +3,27 @@
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
 #include "../tools/server/server-schema.h"
+#include "../tools/server/server-cache.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <random>
 #include <regex>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 // unit tests for server internal components, no model required
 // NOTE: end-to-end tests live in tools/server/tests
@@ -665,7 +677,308 @@ static void test_glob_match(testing & t) {
     });
 }
 
+struct cache_test_directory {
+    std::filesystem::path path;
+
+    cache_test_directory() {
+        do {
+            path = std::filesystem::temp_directory_path() / ("llama-cache-test-" + std::to_string(std::random_device{}()));
+        } while (!std::filesystem::create_directory(path));
+    }
+
+    ~cache_test_directory() {
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+    }
+};
+
+static std::string cache_test_executable;
+
+#if !defined(_WIN32)
+static int cache_test_child(const std::filesystem::path & path, const std::string & mode) {
+    const std::string directory = path.u8string();
+    const char * const args[] = {cache_test_executable.c_str(), "--disk-cache-child", directory.c_str(), mode.c_str(), nullptr};
+    const auto pid = fork();
+    if (pid < 0) {
+        throw std::runtime_error("cannot fork disk cache test child");
+    }
+    if (pid == 0) {
+        execv(args[0], const_cast<char * const *>(args));
+        _exit(127);
+    }
+    int status = 0;
+    int result;
+    do {
+        result = waitpid(pid, &status, 0);
+    } while (result < 0 && errno == EINTR);
+    return result == pid && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+#endif
+
+static server_prompt cache_test_prompt(std::initializer_list<llama_token> tokens) {
+    server_prompt prompt;
+    prompt.tokens = server_tokens(llama_tokens(tokens), false);
+    return prompt;
+}
+
+static bool cache_test_write(const std::string & path) {
+    std::ofstream file(std::filesystem::u8path(path), std::ios::binary);
+    std::string data(2048, 's');
+    const uint32_t header[2] = {LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION};
+    std::memcpy(data.data(), header, sizeof(header));
+    file.write(data.data(), data.size());
+    file.close();
+    return bool(file);
+}
+
+static size_t cache_test_count(const std::filesystem::path & path) {
+    size_t count = 0;
+    for (const auto & item : std::filesystem::directory_iterator(path)) {
+        count += item.is_directory() && std::filesystem::exists(item.path() / "meta.json");
+    }
+    return count;
+}
+
+static void test_disk_cache(testing & t) {
+    t.test("loss thresholds", [](testing & t) {
+        t.assert_true("small edit", !server_cache_should_save(32768, 30000, 8192));
+        t.assert_true("8191 tokens", !server_cache_should_save(32768, 24577, 8192));
+        t.assert_true("8192 tokens", server_cache_should_save(32768, 24576, 8192));
+        t.assert_true("exactly half", !server_cache_should_save(8000, 4000, 8192));
+        t.assert_true("majority below threshold", !server_cache_should_save(8000, 3999, 8192));
+        t.assert_true("short context entirely replaced", !server_cache_should_save(8000, 0, 8192));
+        t.assert_true("unchanged", !server_cache_should_save(8000, 8000, 0));
+        t.assert_true("generated tail discarded, input retained", !server_cache_should_save(16384, 16384, 8192));
+        t.assert_true("reuse extends into generated tail", !server_cache_should_save(16384, 24576, 8192));
+    });
+
+    t.test("checkpoint reuse", [](testing & t) {
+        auto prompt = cache_test_prompt({1, 2, 3, 4, 5, 6, 7, 8});
+        server_tokens input(llama_tokens{1, 2, 3, 4, 9}, false);
+        t.assert_equal("full attention", (size_t) 4, server_cache_reusable(prompt, input, 0, 0));
+        t.assert_equal("recurrent state too recent", (size_t) 0, server_cache_reusable(prompt, input, 7, 0));
+        common_prompt_checkpoint checkpoint;
+        checkpoint.n_tokens = 3;
+        checkpoint.pos_min = 2;
+        checkpoint.pos_max = 3;
+        prompt.checkpoints.push_back(checkpoint);
+        checkpoint.n_tokens = 7;
+        checkpoint.pos_min = 6;
+        checkpoint.pos_max = 7;
+        prompt.checkpoints.push_back(checkpoint);
+        t.assert_equal("older checkpoint", (size_t) 3, server_cache_reusable(prompt, input, 7, 0));
+        prompt.checkpoints.clear();
+        t.assert_equal("SWA window present", (size_t) 4, server_cache_reusable(prompt, input, 1, 4));
+        t.assert_equal("SWA window missing", (size_t) 0, server_cache_reusable(prompt, input, 2, 4));
+        t.assert_equal("reevaluate final token", (size_t) 7, server_cache_reusable(prompt, prompt.tokens, 0, 0));
+    });
+
+    t.test("restart, namespaces and duplicate saves", [](testing & t) {
+        cache_test_directory dir;
+        auto prompt = cache_test_prompt({1, 2, 3});
+        size_t writes = 0;
+        auto writer = [&](const std::string & path) {
+            ++writes;
+            return cache_test_write(path);
+        };
+        {
+            server_disk_cache cache(dir.path.u8string(), 65536);
+            t.assert_true("save", cache.save("model-a", prompt, 0, 0, 2300, writer));
+            t.assert_true("duplicate", cache.save("model-a", prompt, 0, 0, 2300, writer));
+            t.assert_equal("one payload write", (size_t) 1, writes);
+        }
+        server_disk_cache cache(dir.path.u8string());
+        t.assert_equal("adopt pool quota", (uint64_t) 65536, cache.limit());
+        server_tokens input(llama_tokens{1, 2, 3, 4}, false);
+        size_t reads = 0;
+        auto reader = [&](const std::string & path) {
+            ++reads;
+            return std::filesystem::file_size(std::filesystem::u8path(path)) == 2048;
+        };
+        t.assert_true("restore after restart", cache.load("model-a", input, 64, false, 0, 32, 1, 0, reader));
+        t.assert_true("different model misses", !cache.load("model-b", input, 64, false, 0, 32, 1, 0, reader));
+        t.assert_true("short prefix misses", !cache.load("model-a", input, 64, false, 0, 32, 4, 0, reader));
+        t.assert_true("live slot wins a tie", !cache.load("model-a", input, 64, false, 0, 32, 1, 3, reader));
+        t.assert_equal("one payload read", (size_t) 1, reads);
+        bool rejected = false;
+        try {
+            server_disk_cache conflict(dir.path.u8string(), 32768);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        t.assert_true("conflicting pool limit rejected", rejected);
+    });
+
+    t.test("global LRU and pinned reader", [](testing & t) {
+        cache_test_directory dir;
+        server_disk_cache first(dir.path.u8string(), 6000);
+        server_disk_cache second(dir.path.u8string());
+        auto a = cache_test_prompt({1, 2, 3});
+        auto b = cache_test_prompt({4, 5, 6});
+        auto c = cache_test_prompt({7, 8, 9});
+        t.assert_true("first model", first.save("a", a, 0, 0, 2300, cache_test_write));
+        t.assert_true("second model", second.save("b", b, 0, 0, 2300, cache_test_write));
+        for (const auto & item : std::filesystem::directory_iterator(dir.path)) {
+            if (item.is_directory()) {
+                std::filesystem::last_write_time(item.path() / "meta.json",
+                    std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+            }
+        }
+        server_tokens input(llama_tokens{1, 2, 3, 10}, false);
+        t.assert_true("reader stays pinned while another pool instance saves",
+            first.load("a", input, 64, false, 0, 32, 1, 0, [&](const std::string & path) {
+                std::filesystem::last_write_time(std::filesystem::u8path(path).parent_path() / "meta.json",
+                    std::filesystem::file_time_type::clock::now() - std::chrono::hours(2));
+                t.assert_true("save third model", second.save("c", c, 0, 0, 2300, cache_test_write));
+                return std::filesystem::exists(std::filesystem::u8path(path));
+            }));
+        t.assert_equal("two snapshots fit", (size_t) 2, cache_test_count(dir.path));
+        server_tokens old(llama_tokens{4, 5, 6, 10}, false);
+        t.assert_true("other model evicted", !second.load("b", old, 64, false, 0, 32, 1, 0, [](const std::string &) { return true; }));
+        t.assert_true("oversize skipped", !first.save("large", a, 0, 0, 6001, [](const std::string &) { return true; }));
+    });
+
+    t.test("in-flight reservations count toward shared quota", [](testing & t) {
+        cache_test_directory dir;
+        server_disk_cache first(dir.path.u8string(), 6000);
+        server_disk_cache second(dir.path.u8string());
+        auto a = cache_test_prompt({1, 2, 3});
+        auto b = cache_test_prompt({4, 5, 6});
+        t.assert_true("first writer", first.save("a", a, 0, 0, 4000, [&](const std::string & path) {
+            bool wrote = false;
+            t.assert_true("second writer cannot overbook", !second.save("b", b, 0, 0, 4000,
+                [&](const std::string &) { wrote = true; return true; }));
+            t.assert_true("second payload never written", !wrote);
+            return cache_test_write(path);
+        }));
+        t.assert_equal("one snapshot published", (size_t) 1, cache_test_count(dir.path));
+    });
+
+#if !defined(_WIN32)
+    t.test("independent processes respect reservations and recover crashes", [](testing & t) {
+        cache_test_directory dir;
+        server_disk_cache cache(dir.path.u8string(), 6000);
+        auto prompt = cache_test_prompt({1, 2, 3});
+        t.assert_true("parent write", cache.save("parent", prompt, 0, 0, 4000, [&](const std::string & path) {
+            t.assert_equal("child cannot overbook parent's reservation", 10, cache_test_child(dir.path, "save"));
+            return cache_test_write(path);
+        }));
+        t.assert_equal("one complete snapshot", (size_t) 1, cache_test_count(dir.path));
+        t.assert_equal("child exits while writing", 23, cache_test_child(dir.path, "crash"));
+        server_disk_cache restarted(dir.path.u8string());
+        for (const auto & item : std::filesystem::directory_iterator(dir.path)) {
+            if (item.is_directory()) {
+                t.assert_true("no orphan reservation", !std::filesystem::exists(item.path() / "reservation.json"));
+            }
+        }
+        t.assert_true("write after recovery", restarted.save("recovered", prompt, 0, 0, 2300, cache_test_write));
+    });
+#endif
+
+    t.test("failed writes and interrupted saves", [](testing & t) {
+        cache_test_directory dir;
+        server_disk_cache cache(dir.path.u8string(), 65536);
+        auto prompt = cache_test_prompt({1, 2, 3});
+        t.assert_true("failed write", !cache.save("model", prompt, 0, 0, 2300, [](const std::string & path) {
+            cache_test_write(path);
+            return false;
+        }));
+        t.assert_equal("no incomplete snapshot published", (size_t) 0, cache_test_count(dir.path));
+        const auto abandoned = dir.path / std::string(64, 'a');
+        std::filesystem::create_directory(abandoned);
+        std::ofstream(abandoned / "state.bin") << "partial";
+        std::ofstream(abandoned / "reservation.json") << "{\"bytes\":60000}";
+        server_disk_cache restarted(dir.path.u8string());
+        t.assert_true("abandoned write removed", !std::filesystem::exists(abandoned));
+        t.assert_true("retry succeeds", restarted.save("model", prompt, 0, 0, 2300, cache_test_write));
+        for (const auto & item : std::filesystem::directory_iterator(dir.path)) {
+            if (item.is_directory()) {
+                std::ofstream(item.path() / "state.bin", std::ios::trunc) << "truncated";
+            }
+        }
+        server_tokens input(llama_tokens{1, 2, 3, 4}, false);
+        bool read = false;
+        t.assert_true("truncated payload skipped", !restarted.load("model", input, 64, false, 0, 32, 1, 0,
+            [&](const std::string &) { read = true; return true; }));
+        t.assert_true("invalid payload not loaded", !read);
+    });
+
+    t.test("continuations replace snapshots, branches survive", [](testing & t) {
+        cache_test_directory dir;
+        server_disk_cache cache(dir.path.u8string(), 65536);
+        auto old = cache_test_prompt({1, 2, 3});
+        auto extended = cache_test_prompt({1, 2, 3, 4});
+        auto branch = cache_test_prompt({1, 2, 9});
+        t.assert_true("old", cache.save("model", old, 0, 0, 2300, cache_test_write));
+        t.assert_true("extended", cache.save("model", extended, 0, 0, 2300, cache_test_write));
+        t.assert_equal("superseded snapshot removed", (size_t) 1, cache_test_count(dir.path));
+        t.assert_true("branch", cache.save("model", branch, 0, 0, 2300, cache_test_write));
+        t.assert_equal("fork retained", (size_t) 2, cache_test_count(dir.path));
+    });
+
+    t.test("failed restores keep the snapshot", [](testing & t) {
+        cache_test_directory dir;
+        auto prompt = cache_test_prompt({1, 2, 3});
+        server_tokens input(llama_tokens{1, 2, 3, 4}, false);
+        size_t writes = 0;
+        auto writer = [&](const std::string & path) {
+            ++writes;
+            return cache_test_write(path);
+        };
+        {
+            server_disk_cache cache(dir.path.u8string(), 65536);
+            t.assert_true("save", cache.save("model", prompt, 0, 0, 2300, writer));
+            size_t reads = 0;
+            auto failing = [&](const std::string &) { ++reads; return false; };
+            t.assert_true("restore fails", !cache.load("model", input, 64, false, 0, 32, 1, 0, failing));
+            t.assert_equal("snapshot kept", (size_t) 1, cache_test_count(dir.path));
+            t.assert_true("not retried in this process", !cache.load("model", input, 64, false, 0, 32, 1, 0, failing));
+            t.assert_equal("one failed read", (size_t) 1, reads);
+            t.assert_true("identical save rewrites it", cache.save("model", prompt, 0, 0, 2300, writer));
+            t.assert_equal("rewritten", (size_t) 2, writes);
+            t.assert_true("usable after rewrite", cache.load("model", input, 64, false, 0, 32, 1, 0,
+                [](const std::string &) { return true; }));
+        }
+        server_disk_cache restarted(dir.path.u8string());
+        t.assert_true("retried after restart", restarted.load("model", input, 64, false, 0, 32, 1, 0,
+            [](const std::string &) { return true; }));
+    });
+
+    t.test("invalid state header is removed", [](testing & t) {
+        cache_test_directory dir;
+        server_disk_cache cache(dir.path.u8string(), 65536);
+        auto prompt = cache_test_prompt({1, 2, 3});
+        t.assert_true("save", cache.save("model", prompt, 0, 0, 2300, cache_test_write));
+        for (const auto & item : std::filesystem::directory_iterator(dir.path)) {
+            if (item.is_directory()) {
+                std::fstream state(item.path() / "state.bin", std::ios::binary | std::ios::in | std::ios::out);
+                state.write("BAD!", 4);
+            }
+        }
+        server_tokens input(llama_tokens{1, 2, 3, 4}, false);
+        bool read = false;
+        t.assert_true("not loaded", !cache.load("model", input, 64, false, 0, 32, 1, 0,
+            [&](const std::string &) { read = true; return true; }));
+        t.assert_true("reader not called", !read);
+        t.assert_equal("removed", (size_t) 0, cache_test_count(dir.path));
+    });
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 4 && std::string(argv[1]) == "--disk-cache-child") {
+        server_disk_cache cache(argv[2]);
+        auto prompt = cache_test_prompt({4, 5, 6});
+        const bool crash = std::string(argv[3]) == "crash";
+        const bool saved = cache.save("child", prompt, 0, 0, 4000, [&](const std::string & path) {
+            if (crash) {
+                std::ofstream(std::filesystem::u8path(path)) << "incomplete state";
+                std::_Exit(23);
+            }
+            return cache_test_write(path);
+        });
+        return saved ? 0 : 10;
+    }
+    cache_test_executable = std::filesystem::absolute(argv[0]).u8string();
     testing t;
 
     const char * verbose = getenv("LLAMA_TEST_VERBOSE");
@@ -690,6 +1003,7 @@ int main(int argc, char ** argv) {
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
+    t.test("disk_cache", test_disk_cache);
 
     return t.summary();
 }

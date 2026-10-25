@@ -166,6 +166,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, 0 for decision models, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--cache-disk PATH` | enable a shared persistent prompt cache; disables the RAM prompt cache, and `-np` auto uses 1 slot (env: LLAMA_ARG_CACHE_DISK) |
+| `--cache-disk-size SIZE` | pool quota in bytes or with K/M/G/T binary suffix; adopts an existing pool's quota, or creates a 64G pool by default (env: LLAMA_ARG_CACHE_DISK_SIZE) |
+| `--cache-disk-min-loss N` | save before losing at least N cached input tokens, default: 8192 (env: LLAMA_ARG_CACHE_DISK_MIN_LOSS) |
+| `--cache-disk-min-reuse N` | minimum reusable prefix for a disk restore, default: 1024 (env: LLAMA_ARG_CACHE_DISK_MIN_REUSE) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -411,6 +415,32 @@ Related flags: `--cors-origins`, `--cors-methods`, `--cors-headers`, `--cors-cre
 ### Running behind a proxy
 
 If your host reaches the internet through a corporate proxy, export `HTTP_PROXY` and `HTTPS_PROXY` before running commands that download models (e.g. `export HTTPS_PROXY=http://proxy.example.com:8080`). Hosts listed in `NO_PROXY` and loopback addresses are contacted directly.
+
+### Persistent SSD prompt cache
+
+```sh
+llama-server -m model.gguf -cram 0 \
+    --cache-disk /srv/llama-kv-pool --cache-disk-size 64G \
+    --cache-disk-min-loss 8192
+```
+
+Point each model server at the same dedicated pool directory, including servers launched by llama-swap. The quota applies to all models together. The first server creates `pool.json`; later servers adopt its quota unless an explicit size conflicts, in which case startup fails. To change the quota, stop all servers using the pool and edit `limit_bytes` in `pool.json`. Use a local filesystem with working advisory locks and atomic rename; sharing this pool over a network filesystem is unsupported.
+
+The disk cache is opt-in and disables the RAM prompt cache and automatic idle-slot clearing. With `-np` left at auto it uses a single slot; with several slots, idle slots keep their KV, so a restore can fail for lack of KV space. Idle slots keep their live KV until they are needed. No snapshot is written merely because a turn finishes. Before a request replaces or rolls back a slot, or memory pressure purges an idle slot, the old state is saved only if at least `--cache-disk-min-loss` cached input tokens from the previous request would be lost. This estimate includes rollback to a context checkpoint and excludes the previous request's generated tail. Clearing thinking or regenerating an answer therefore does not trigger a save solely because many generated tokens are discarded. Once generated text appears in a later request's rendered input, it counts as input for that request. Returning to an unsaved generated version may require prefill again.
+
+Graceful shutdown and model sleep flush live states regardless of this loss threshold, including generated tokens. Every snapshot still contains the full native state. The native save format is unchanged; a restored slot conservatively treats its tokens as input until normal prompt processing establishes the new request's input boundary. Prompts shorter than `--cache-disk-min-reuse` are not saved. Requests with `cache_prompt: false` do not restore or retain their own state.
+
+Matching uses the rendered tokens and media identities. No model-specific template rules or chat IDs are needed. A template change that changes an early token can reduce the reusable prefix. SWA and recurrent models reuse only what their retained context and checkpoints allow. Snapshot selection compares this usable prefix against the live slot; ties keep the live state.
+
+Snapshots use the native slot format, including context checkpoints and draft state. The manual `/slots/{id}?action=save`, `restore`, and `erase` endpoints remain available with their existing `--slot-save-path` setting. Unchanged snapshots are not rewritten. Extended snapshots replace older ones only when they can still resume the older prefix; divergent branches remain separate entries.
+
+Reads and writes are synchronous on the inference thread. Large snapshots can delay a new request or shutdown. The shared pool uses LRU eviction, reserves space for in-flight writes, and pins entries during restores. A new snapshot is published only after its files are complete and flushed to stable storage (`fsync`, `F_FULLFSYNC` on macOS), and superseded snapshots are removed only after that; interrupted writes are removed on a later pool scan. A snapshot whose state header is invalid is removed. A snapshot that fails to restore for any other reason (for example, a changed cache layout or lack of KV space) is kept, skipped until the server restarts, and rewritten if the same state is saved again. Saving requires room for the new snapshot while any existing snapshots remain on disk. Oversized entries or a pool occupied by pinned entries cause the save to be skipped. Disk failures are logged and inference continues; this is a disposable performance cache, not a conversation backup.
+
+Model/configuration fingerprints separate incompatible snapshots. They cover only what changes the stored KV values or the token sequence: model shards, adapters, control vectors, projector and image token limits, draft model, KV cache types (including the draft's), flash attention, RoPE/YaRN settings, KV overrides, and the native state version. Context size, batch sizes, slot count and the build revision are not part of it, so rebuilding or retuning the server keeps existing snapshots; the native loader still validates the cache layout, and a snapshot longer than the context is not loaded. File identity uses the file size and hashes of the first and last MiB, not the path or modification time, so moving or copying a model keeps its snapshots while a different quant or conversion does not. Treat the directory as private model state: snapshots contain prompt tokens and KV data, and the pool is shared across clients of these servers.
+
+Allow llama-swap's graceful-stop timeout to cover the snapshot writes. SIGKILL, crashes, and power loss cannot flush unsaved live state; only snapshots already written survive them.
+
+With llama-swap, a model swap waits `healthCheckTimeout` (default 120 s) after SIGTERM before SIGKILL, but a `ttl` unload waits only `unloadTimeout` (default 10 s). With `ttl` set, raise `unloadTimeout` to cover a full snapshot write (state size / SSD write speed, plus margin). If llama-swap runs under systemd, `TimeoutStopSec` must also cover it. Sending a second SIGINT/SIGTERM makes llama-server exit immediately without finishing the flush.
 
 ## Build
 

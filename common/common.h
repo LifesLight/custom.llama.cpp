@@ -644,6 +644,11 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
+    std::string cache_disk_path;
+    uint64_t cache_disk_bytes       = 0;    // adopt the pool limit, or create a 64 GiB pool
+    int32_t cache_disk_min_loss     = 8192;
+    int32_t cache_disk_min_reuse    = 1024;
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";
