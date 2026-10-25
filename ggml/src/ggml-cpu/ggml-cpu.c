@@ -1603,6 +1603,9 @@ static void ggml_compute_forward_mul_mat_id(
     int64_t * matrix_row_counts = // [n_as]
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
 
+    int32_t * active = // [1 + n_as] the number of experts with rows, then these experts in ascending order
+        incr_ptr_aligned(&wdata_cur, (n_as + 1)*sizeof(int32_t), sizeof(int64_t));
+
     struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
@@ -1653,8 +1656,18 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
-        // initialize matrix_row_counts
-        memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+        // only the selected experts are initialized and visited, so that the cost does not grow with n_as
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                if (i02 >= 0) {
+                    assert(i02 < n_as);
+                    matrix_row_counts[i02] = 0;
+                }
+            }
+        }
+
+        int32_t n_active = 0;
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -1668,26 +1681,38 @@ static void ggml_compute_forward_mul_mat_id(
                     continue;
                 }
 
+                if (matrix_row_counts[i02] == 0) {
+                    active[1 + n_active++] = i02;
+                }
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
             }
         }
-    }
 
-    // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = nth;
+        // ascending, the order in which the experts were computed when all of them were visited
+        for (int32_t i = 2; i <= n_active; ++i) {
+            const int32_t a = active[i];
+            int32_t j = i - 1;
+            while (j >= 1 && active[j] > a) {
+                active[j + 1] = active[j];
+                j--;
+            }
+            active[j + 1] = a;
+        }
+        active[0] = n_active;
+
+        // reset current_chunk
+        for (int32_t i = 1; i <= n_active; ++i) {
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + active[i]);
+            *current_chunk_ctr = nth;
+        }
     }
 
     ggml_barrier(params->threadpool);
 
-    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+    for (int32_t ia = 1; ia <= active[0]; ++ia) {
+        const int cur_a = active[ia];
         const int64_t cne1 = matrix_row_counts[cur_a];
-
-        if (cne1 == 0) {
-            continue;
-        }
 
         // tiled takes over if profitable for this expert (see tiled.h)
         if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
@@ -2923,6 +2948,8 @@ struct ggml_cplan ggml_graph_plan(
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
+                        // active
+                        cur += (n_as + 1) * sizeof(int32_t) + sizeof(int64_t);
                         // matrix_rows
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk

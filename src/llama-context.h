@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-stream.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -308,6 +309,7 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    llama_moe_stream_ptr moe_stream;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -377,11 +379,13 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        std::vector<int32_t> counts; // tokens per expert
 
         void reset() {
             ids = nullptr;
             ids_data.clear();
             used.clear();
+            counts.clear();
         }
     };
 

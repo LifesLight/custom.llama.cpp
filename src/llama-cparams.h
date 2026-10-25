@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
@@ -58,6 +59,13 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+
+    int32_t moe_stream_threads;
+    size_t  moe_stream_resident;
+    size_t  moe_stream_reserve;
+    enum llama_moe_stream_policy moe_stream_policy;
+    std::string moe_stream_state;
+    float   moe_stream_pool;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -599,6 +599,13 @@ struct common_params {
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
 
+    int32_t moe_stream_threads  = 0;        // IO threads streaming the CPU MoE experts to the GPU with O_DIRECT, 0 = disabled
+    size_t  moe_stream_resident = SIZE_MAX; // bytes of the streamed experts kept locked in RAM, SIZE_MAX = from the available RAM
+    size_t  moe_stream_reserve  = 8ull*1024*1024*1024; // RAM left available when sizing the resident experts automatically
+    enum llama_moe_stream_policy moe_stream_policy = LLAMA_MOE_STREAM_POLICY_LRU;
+    std::string moe_stream_state; // file to save the cached experts to, empty = next to the model, "none" = disabled
+    float   moe_stream_pool = -1.0f;  // >= 0: shared cache slots per expert layout, min fraction of the uniform share per layer
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
@@ -641,6 +648,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool    checkpoint_user_split = true; // split the prompt at the last user message to checkpoint it
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 

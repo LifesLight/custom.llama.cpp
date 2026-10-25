@@ -913,6 +913,9 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // path of the model file and offset in it of the data of a tensor that is memory mapped from the file
+    bool get_mapped_location(const ggml_tensor * t, std::string & path, size_t & offs) const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 
