@@ -547,6 +547,8 @@ mtmd_context_params mtmd_context_params_default() {
         /* batch_max_tokens  */ 1024,
         /* progress_callback */ nullptr,
         /* progress_callback_user_data */ nullptr,
+        /* video_image_min_tokens */ -1,
+        /* video_image_max_tokens */ -1,
     };
     return params;
 }
@@ -597,6 +599,7 @@ struct mtmd_context {
 
     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
+    std::unique_ptr<mtmd_image_preprocessor> video_image_preproc;
 
     // batching
     int32_t batch_max_tokens;
@@ -698,10 +701,17 @@ struct mtmd_context {
         }
         if (ctx_v) {
             init_vision();
+            video_image_preproc->set_image_token_limits(ctx_params.video_image_min_tokens, ctx_params.video_image_max_tokens);
         }
         if (ctx_a) {
             init_audio();
         }
+    }
+
+    template<typename T>
+    std::unique_ptr<T> make_image_preproc() {
+        video_image_preproc = std::make_unique<T>(ctx_v);
+        return std::make_unique<T>(ctx_v);
     }
 
     void init_vision() {
@@ -721,9 +731,9 @@ struct mtmd_context {
                 {
                     bool has_pinpoints = !clip_get_hparams(ctx_v)->image_res_candidates.empty();
                     if (has_pinpoints) {
-                        image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
+                        image_preproc = make_image_preproc<mtmd_image_preprocessor_llava_uhd>();
                     } else {
-                        image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                        image_preproc = make_image_preproc<mtmd_image_preprocessor_fixed_size>();
                     }
                 } break;
             case PROJECTOR_TYPE_MINICPMV:
@@ -757,7 +767,7 @@ struct mtmd_context {
                     } else if (minicpmv_version != 0) {
                         throw std::runtime_error(string_format("unsupported minicpmv version: %d\n", minicpmv_version));
                     }
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_llava_uhd>();
                 } break;
             case PROJECTOR_TYPE_MINICPMV4_6:
             case PROJECTOR_TYPE_MINICPMV4_7:
@@ -773,9 +783,9 @@ struct mtmd_context {
                     ov_img_first      = true;
                     use_image_id      = true;
                     if (clip_get_projector_type(ctx_v) == PROJECTOR_TYPE_MINICPM_OCR_1_0) {
-                        image_preproc = std::make_unique<mtmd_image_preprocessor_minicpm_ocr_1_0>(ctx_v);
+                        image_preproc = make_image_preproc<mtmd_image_preprocessor_minicpm_ocr_1_0>();
                     } else {
-                        image_preproc = std::make_unique<mtmd_image_preprocessor_minicpmv>(ctx_v);
+                        image_preproc = make_image_preproc<mtmd_image_preprocessor_minicpmv>();
                     }
                 } break;
             case PROJECTOR_TYPE_QWEN2VL:
@@ -787,26 +797,26 @@ struct mtmd_context {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
                     img_beg = "<|vision_start|>";
                     img_end = "<|vision_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_MINIMAX_M3:
                 {
                     // ]<]start of image[>[ ... (image embeddings) ... ]<]end of image[>[
                     img_beg = "]<]start of image[>[";
                     img_end = "]<]end of image[>[";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_SENSENOVA_U1:
                 {
                     img_beg = "<img>";
                     img_end = "</img>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_MUSE_GLIMMER:
                 {
                     img_beg = "<|image_start|>";
                     img_end = "<|image_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_muse_glimmer>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_muse_glimmer>();
                 } break;
             case PROJECTOR_TYPE_LFM3VL:
                 {
@@ -815,14 +825,14 @@ struct mtmd_context {
                     img_end = "<|vision_end|>";
                     vid_beg = img_beg;
                     vid_end = img_end;
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_lfm3vl>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_lfm3vl>();
                 } break;
             case PROJECTOR_TYPE_YOUTUVL:
                 {
                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
                     img_beg = "<|vision_start|>";
                     img_end = "<|vision_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_youtuvl>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_youtuvl>();
                 } break;
             case PROJECTOR_TYPE_YASA2:
                 {
@@ -835,7 +845,7 @@ struct mtmd_context {
                     // images. This will be implemented in a future PR (dispatch on has_pinpoints
                     // - see LDP/COGVLM branch above) and emit image_grid_pinpoints in the conversion
                     // script.
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_fixed_size>();
                 } break;
             case PROJECTOR_TYPE_GEMMA3:
             case PROJECTOR_TYPE_GEMMA3NV:
@@ -843,7 +853,7 @@ struct mtmd_context {
                     // <start_of_image> ... (image embeddings) ... <end_of_image>
                     img_beg = "<start_of_image>";
                     img_end = "<end_of_image>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_fixed_size>();
                 } break;
             case PROJECTOR_TYPE_IDEFICS3:
                 {
@@ -853,22 +863,22 @@ struct mtmd_context {
                     tok_ov_img_end     = {lookup_token("<fake_token_around_image>")};
                     tok_row_end        = {lookup_token("\n")};
                     sli_img_start_tmpl = "<fake_token_around_image><row_%d_col_%d>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_idefics3>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_idefics3>();
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
                     // https://github.com/huggingface/transformers/blob/1cd110c6cb6a6237614130c470e9a902dbc1a4bd/docs/source/en/model_doc/pixtral.md
                     img_end = "[IMG_END]";
                     if (clip_get_hparams(ctx_v)->image_longest_edge > 0) {
-                        image_preproc = std::make_unique<mtmd_image_preprocessor_longest_edge>(ctx_v);
+                        image_preproc = make_image_preproc<mtmd_image_preprocessor_longest_edge>();
                     } else {
-                        image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                        image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                     }
                 } break;
             case PROJECTOR_TYPE_PHI4:
                 {
                     // Phi-4 uses media marker insertion only. Keep image boundary text empty.
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_LLAMA4:
                 {
@@ -877,7 +887,7 @@ struct mtmd_context {
                     img_end = "<|image_end|>";
                     LOG_WRN("%s: llama 4 vision is known to have degraded quality:\n"
                             "    https://github.com/ggml-org/llama.cpp/pull/13282\n", __func__);
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_llava_uhd>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_llava_uhd>();
                     ov_img_first = false;
                 } break;
             case PROJECTOR_TYPE_STEP3VL:
@@ -894,14 +904,14 @@ struct mtmd_context {
                     tok_row_end       = {lookup_token("<patch_newline>")};
                     tok_row_end_trail = false;
                     ov_img_first      = false; // patches first, overview last
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_step3vl>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_step3vl>();
                 } break;
             case PROJECTOR_TYPE_INTERNVL:
                 {
                     // <img> ... (image embeddings) ... </img>
                     img_beg = "<img>";
                     img_end = "</img>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_internvl>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_internvl>();
                     ov_img_first = false;
                 } break;
             case PROJECTOR_TYPE_COHERE2V:
@@ -912,14 +922,14 @@ struct mtmd_context {
                     tok_sli_img_end = {lookup_token("<|IMG_LINE_BREAK|>")};
                     tok_ov_img_end  = tok_sli_img_end;
                     ov_img_first = false;
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_cohere2v>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_cohere2v>();
                 } break;
             case PROJECTOR_TYPE_KIMIVL:
                 {
                     // <|media_start|> ... (image embeddings) ... <|media_end|>
                     img_beg = "<|media_start|>";
                     img_end = "<|media_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_KIMIK25:
                 {
@@ -934,24 +944,24 @@ struct mtmd_context {
                         img_beg = "<|media_begin|>";
                         img_end = "<|media_end|>";
                     }
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_LIGHTONOCR:
                 {
                     // <|im_start|> ... (image embeddings) ... <|im_end|>
                     img_beg = "<|im_start|>";
                     img_end = "<|im_end|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_longest_edge>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_longest_edge>();
                 } break;
             case PROJECTOR_TYPE_DEEPSEEK4V:
                 {
                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_deepseek4v>();
                 } break;
             case PROJECTOR_TYPE_DEEPSEEK41V:
                 {
                     // as deepseek4v: markers come from the encoder, the block is decoded causally
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek41v>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_deepseek41v>();
                 } break;
             case PROJECTOR_TYPE_DOTS_OCR:
             case PROJECTOR_TYPE_DOTS3NOTE_V:
@@ -959,17 +969,17 @@ struct mtmd_context {
                     // <|img|> ... (image embeddings) ... <|endofimg|>
                     img_beg = "<|img|>";
                     img_end = "<|endofimg|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_NEMOTRON_V2_VL:
                 {
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_fixed_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_fixed_size>();
                 } break;
             case PROJECTOR_TYPE_NEMOTRON_OMNI:
                 {
                     img_beg = "<img>";
                     img_end = "</img>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_LFM2:
                 {
@@ -986,33 +996,33 @@ struct mtmd_context {
                     sli_img_start_tmpl = "<|img_row_%d_col_%d|>";
                     tok_ov_img_start   = {lookup_token("<|img_thumbnail|>")};
                     ov_img_first       = false;
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_lfm2>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_lfm2>();
                 } break;
             case PROJECTOR_TYPE_D1OMNI_V:
                 {
                     // same tiles and thumbnail as lfm2, without separator tokens
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_lfm2>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_lfm2>();
                 } break;
             case PROJECTOR_TYPE_GLM4V:
                 {
                     // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
                     img_beg = "<|begin_of_image|>";
                     img_end = "<|end_of_image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_GLM5V:
                 {
                     // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
                     img_beg = "<|begin_of_image|>";
                     img_end = "<|end_of_image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_glm5v>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_glm5v>();
                 } break;
             case PROJECTOR_TYPE_PADDLEOCR:
                 {
                     // <|IMAGE_START|> ... (image embeddings) ... <|IMAGE_END|>
                     img_beg = "<|IMAGE_START|>";
                     img_end = "<|IMAGE_END|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_GEMMA4V:
             case PROJECTOR_TYPE_GEMMA4UV:
@@ -1020,13 +1030,13 @@ struct mtmd_context {
                     // <|image> ... (image embeddings) ... <image|>
                     img_beg = "<|image>";
                     img_end = "<image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_DEEPSEEKOCR:
             case PROJECTOR_TYPE_DEEPSEEKOCR2:
                 {
                     img_end = "\n"; // prevent empty batch on llama-server
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseekocr>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_deepseekocr>();
                     ov_img_first = false;
                 } break;
             case PROJECTOR_TYPE_HUNYUANVL:
@@ -1034,21 +1044,21 @@ struct mtmd_context {
                     // note: these use fullwidth ｜ (U+FF5C) and ▁ (U+2581) to match the tokenizer vocabulary
                     img_beg = "<｜hy_place▁holder▁no▁100｜>";
                     img_end = "<｜hy_place▁holder▁no▁101｜>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_EXAONE4_5:
                 {
                     // <vision> ... (image embeddings) ... </vision>
                     img_beg = "<vision>";
                     img_end = "</vision>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_dyn_size>();
                 } break;
             case PROJECTOR_TYPE_GRANITE4_VISION:
                 {
                     // ... (image embeddings) \n ...
                     img_beg = "";
                     img_end = "\n";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_granite>(ctx_v);
+                    image_preproc = make_image_preproc<mtmd_image_preprocessor_granite>();
                 } break;
             default:
                 throw std::runtime_error(string_format("%s: unexpected vision projector type %d\n", __func__, proj));
@@ -1571,9 +1581,10 @@ struct mtmd_tokenizer {
                 img_u8.cpy_buf(bmp->get_ro_buf());
 
                 // preprocess image
+                const auto & preproc = bmp->mergeable ? ctx->video_image_preproc : ctx->image_preproc;
                 mtmd_image_preproc_out tmp_preproc_out = bmp->is_video_frame()
-                    ? ctx->image_preproc->preprocess_video_frame(img_u8)
-                    : ctx->image_preproc->preprocess(img_u8);
+                    ? preproc->preprocess_video_frame(img_u8)
+                    : preproc->preprocess(img_u8);
 
                 // move entries and grid dimensions to the "global" preproc_out
                 for (auto & entry : tmp_preproc_out.entries) {
@@ -3366,6 +3377,11 @@ mtmd_memory_usage mtmd_get_memory_usage(const char * mmproj_fname,
         res.backend_mem_usage = std::move(total_mem);
         res.image_max_tokens  = ctx->ctx_v ? clip_get_image_max_tokens(ctx->ctx_v) : -1;
         res.use_non_causal    = ctx->ctx_v ? mtmd_decode_use_non_causal(ctx.get(), nullptr) : false;
+        if (ctx->video_image_preproc) {
+            const auto & hp = ctx->video_image_preproc->hparams;
+            res.video_image_max_tokens = ctx->proj_type_v() == PROJECTOR_TYPE_DEEPSEEK4V ? hp.dsv4_max_n_token
+                : hp.image_max_pixels > 0 ? hp.image_max_pixels / (hp.patch_size * hp.patch_size * hp.n_merge * hp.n_merge) : -1;
+        }
         return res;
     } catch (const std::exception & e) {
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback

@@ -677,6 +677,9 @@ extern "C" {
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
 
+    // Returns true if a default context of this model accepts batches that mix token and embedding entries
+    LLAMA_API bool llama_model_supports_mixed_batch(const struct llama_model * model);
+
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(
             const char * fname_inp,

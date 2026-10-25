@@ -132,6 +132,10 @@ struct mtmd_context_params {
     // If it returns false, model loading is immediately aborted.
     mtmd_progress_callback progress_callback;
     void * progress_callback_user_data;
+
+    // video frame token limits (default: use the corresponding image limit)
+    int video_image_min_tokens;
+    int video_image_max_tokens;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -559,6 +563,7 @@ struct mtmd_memory_usage {
     // for models that use non-causal attention, max_tokens must not exceed n_ubatch of llama_context
     int image_max_tokens;
     bool use_non_causal;
+    int video_image_max_tokens = -1;
 };
 MTMD_API struct mtmd_memory_usage mtmd_get_memory_usage(
     const char * mmproj_fname,
