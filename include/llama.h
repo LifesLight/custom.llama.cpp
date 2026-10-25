@@ -216,6 +216,13 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
+    // which experts the MoE stream evicts from its expert cache
+    enum llama_moe_stream_policy {
+        LLAMA_MOE_STREAM_POLICY_LRU  = 1, // the least recently used
+        LLAMA_MOE_STREAM_POLICY_SLRU = 2, // segmented LRU: experts used again are protected in one half
+        LLAMA_MOE_STREAM_POLICY_LFU  = 3, // the least used, with decaying counts; rarely used experts do not evict
+    };
+
     enum llama_lazy_mode {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
@@ -352,6 +359,7 @@ extern "C" {
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
+        bool no_prefetch;     // do not prefetch the memory mapped model files while loading
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
     };
@@ -397,6 +405,16 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+
+        // keep the experts in host memory in an expert cache filled with O_DIRECT reads, and stream the others
+        // to the GPU during prompt processing [EXPERIMENTAL]
+        int32_t      moe_stream_threads;  // number of IO threads, 0 = disabled
+        size_t       moe_stream_resident; // size of the expert cache in bytes, SIZE_MAX = from the available RAM
+        size_t       moe_stream_reserve;  // with moe_stream_resident = SIZE_MAX: RAM left available
+        enum llama_moe_stream_policy moe_stream_policy;
+        const char * moe_stream_state;    // file to save the cached experts to, nullptr = next to the model, "none" = disabled
+        float        moe_stream_pool;     // >= 0: the layers with the same expert layout share their cache slots, each keeping
+                                          // at least this fraction of its uniform share, < 0 = disabled (fixed per-layer caches)
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
