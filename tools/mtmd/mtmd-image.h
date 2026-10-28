@@ -59,6 +59,10 @@ struct mtmd_image_preprocessor {
             }
             hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
         }
+        // only the max was given: the min inherited from the model/image settings must not exceed it
+        if (min_tokens <= 0 && hparams.image_max_pixels > 0 && hparams.image_min_pixels > hparams.image_max_pixels) {
+            hparams.image_min_pixels = hparams.image_max_pixels;
+        }
         if (hparams.image_max_pixels > 0 && hparams.image_max_pixels < hparams.image_min_pixels) {
             throw std::runtime_error("video image max tokens is less than min tokens");
         }
