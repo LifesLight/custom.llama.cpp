@@ -95,6 +95,19 @@ MAKE_TEST(test_video_image_token_limits) {
         t.assert_equal("image max unchanged", 1024, image.preprocess(large).entries[0].nx());
         t.assert_equal("image min unchanged", 256, image.preprocess(small).entries[0].nx());
     }
+
+    // a video max below the inherited min (64 tokens) must clamp the min, not throw
+    mtmd_image_preprocessor_dyn_size low_max(hparams);
+    bool threw = false;
+    try {
+        low_max.set_image_token_limits(-1, 16);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    t.assert_equal("low video max does not throw", false, threw);
+    t.assert_equal("low video max", 128, low_max.preprocess(large).entries[0].nx());
+    t.assert_equal("low video max clamps min", 128, low_max.preprocess(small).entries[0].nx());
+    t.assert_equal("image min unchanged by low video max", 256, image.preprocess(small).entries[0].nx());
 }
 
 MAKE_TEST(test_image_preprocessor_dyn_size) {

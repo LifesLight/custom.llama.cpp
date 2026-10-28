@@ -1738,16 +1738,23 @@ struct clip_model_loader {
                         hparams.rope_theta = 10000.0f;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
 
+                        // model defaults first (2..4096 tokens), then the optional GGUF limits,
+                        // then the custom CLI values (--image-min/max-tokens), which take precedence
+                        hparams.set_limit_image_tokens(2, 4096);
                         int min_pixels = 0, max_pixels = 0;
                         get_u32(KEY_IMAGE_MIN_PIXELS, min_pixels, false);
                         get_u32(KEY_IMAGE_MAX_PIXELS, max_pixels, false);
                         if (min_pixels > 0 && max_pixels > 0) {
-                            hparams.image_min_pixels = min_pixels;
-                            hparams.image_max_pixels = max_pixels;
-                            hparams.warmup_image_size = static_cast<int>(std::sqrt(max_pixels));
-                        } else {
-                            hparams.set_limit_image_tokens(2, 4096);
+                            if (hparams.custom_image_min_tokens <= 0) {
+                                hparams.image_min_pixels = min_pixels;
+                            }
+                            if (hparams.custom_image_max_tokens <= 0) {
+                                hparams.image_max_pixels = max_pixels;
+                            }
                         }
+                        // a custom max below the model's min would make the resize impossible
+                        hparams.image_min_pixels  = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+                        hparams.warmup_image_size = static_cast<int>(std::sqrt(hparams.image_max_pixels));
                     } break;
                 case PROJECTOR_TYPE_DEEPSEEK4V:
                     {
