@@ -61,6 +61,10 @@ public:
     // [:, :, 0] -1 except for the experts that were read, [:, :, 1] all the slots. nullptr if not overlapping
     bool overlap() const;
 
+    // LLAMA_MOE_STREAM_PROFILE=1: an op computed right after the expert matmuls of layer il on the CPU (cur is their
+    // result) that times them, for the profile of the decode logged with the decode stats. nullptr if not profiling
+    ggml_tensor * build_profile_mark(ggml_context * ctx, ggml_tensor * cur, int il) const;
+
     // true if a batch of n_tokens of layer il is computed on the CPU from the cache (see build_slots)
     bool cpu_path(int il, int64_t n_tokens) const;
     ggml_tensor * build_wait(ggml_context * ctx, ggml_tensor * slots, const std::vector<ggml_tensor *> & deps, int il) const;

@@ -2615,6 +2615,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
+        // the end of the expert matmuls of a layer computed on the CPU from the MoE stream cache, for its profile
+        if (slots != nullptr && moe_cache == nullptr && moe_stream != nullptr) {
+            if (ggml_tensor * mark = moe_stream->build_profile_mark(ctx0, experts, il)) {
+                ggml_backend_sched_set_tensor_backend(sched, mark, backend_cpu);
+                ggml_build_forward_expand(gf, mark);
+            }
+        }
+
         if (amax_src1.scale_s) {
             experts = ggml_mul(ctx0, experts, amax_src1.scale_s);
         }
