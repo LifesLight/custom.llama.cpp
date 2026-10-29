@@ -3144,14 +3144,19 @@ private:
             (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL);
         const auto key = eligible ? server_cache_adapter_key(disk_model_key, adapters) : "";
         size_t n_reusable = 0;
+        // A snapshot has no resume point between n_reusable and the divergence: n_reusable already is the
+        // slot's highest one below it. Only cached input past the divergence is lost by not saving.
+        size_t n_common = 0;
         if (eligible && key == slot.disk_cache_key) {
             n_reusable = server_cache_reusable(slot.prompt, task.tokens,
                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), n_swa);
+            n_common = slot.prompt.tokens.get_common_prefix(task.tokens);
             if (task.n_tokens_shared > 0) {
                 n_reusable = std::min(n_reusable, (size_t) task.n_tokens_shared);
+                n_common   = std::min(n_common,   (size_t) task.n_tokens_shared);
             }
         }
-        if (server_cache_should_save(slot.n_tokens_input_cached(), n_reusable,
+        if (server_cache_should_save(slot.n_tokens_input_cached(), std::max(n_reusable, n_common),
                 params_base.cache_disk_min_loss)) {
             save_disk_slot(slot);
         }
