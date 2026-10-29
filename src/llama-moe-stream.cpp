@@ -369,6 +369,11 @@ struct llama_moe_stream::impl {
     std::vector<ggml_backend_buffer_t> pf_bufs;
     std::deque<job>                    pf_jobs;     // guarded by mtx
     int                                pf_inflight = 0; // guarded by mtx
+    // time with at least one read in progress (guarded by mtx), for the profile
+    int    io_active   = 0;
+    double io_t0       = 0.0;
+    double io_busy     = 0.0;
+    double rep_io_busy = 0.0;
     std::vector<std::pair<int, int32_t>> busy_list;  // (pool, slot) of the busy slots
     std::vector<std::pair<int, int32_t>> pf_pending; // (pool, slot) of the selected experts whose prefetch is not done
     std::vector<int32_t>               pf_cnt;      // [max n_expert]
@@ -562,6 +567,10 @@ struct llama_moe_stream::impl {
         }
         rep_read   = bytes_read;
         rep_direct = bytes_direct;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            rep_io_busy = io_busy;
+        }
 
         setup_prefetch(model, params.n_threads);
 
@@ -2677,6 +2686,11 @@ struct llama_moe_stream::impl {
             {
                 std::unique_lock<std::mutex> lk(mtx);
                 cv_jobs.wait(lk, [this] { return stop || !jobs.empty() || (!pf_jobs.empty() && pf_inflight < pf_max_inflight) || !spec.empty(); });
+                if (!jobs.empty() || (!stop && !pf_jobs.empty() && pf_inflight < pf_max_inflight) || !spec.empty()) {
+                    if (io_active++ == 0) {
+                        io_t0 = t_now();
+                    }
+                }
                 if (!jobs.empty()) {
                     j = jobs.front();
                     jobs.pop_front();
@@ -2703,6 +2717,9 @@ struct llama_moe_stream::impl {
                 j.wg->error = j.wg->error || !ok;
                 if (--j.wg->pending == 0) {
                     cv_done.notify_all();
+                }
+                if (--io_active == 0) {
+                    io_busy += t_now() - io_t0;
                 }
                 if (j.prefetch) {
                     pf_inflight--;
@@ -3449,6 +3466,15 @@ struct llama_moe_stream::impl {
                             " the rest reading %.1f GB/s of expert weights) + %.1f between the layers (GPU, transfers) + %.1f before the first"
                             " and after the last MoE layer (incl. sampling)\n",
                             1e3*total, 1e3*cpu, 1e3*waited, prof_bytes/nb/compute/1e9, 1e3*between, 1e3*outside);
+                    double busy;
+                    {
+                        std::lock_guard<std::mutex> lk(mtx);
+                        busy = io_busy + (io_active > 0 ? t_now() - io_t0 : 0.0);
+                    }
+                    const double dbusy = std::max(busy - rep_io_busy, 1e-9);
+                    rep_io_busy = busy;
+                    LLAMA_LOG_INFO("moe_stream: profile: the SSD was reading %.0f%% of the time, at %.2f GB/s while reading (%.2f GB/s on average)\n",
+                            100.0*std::min(dbusy/(nb*total), 1.0), rd/dbusy/1e9, rd/(nb*total)/1e9);
                     prof_graph_w0 -= prof_cpu + prof_between; // keeps the work of the current graph
                     prof_outside = prof_cpu = prof_between = prof_bytes = 0.0;
                     prof_n_outside = 0;
