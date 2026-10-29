@@ -82,6 +82,9 @@ public:
     // after `after` (the slots of layer il) so that the reads of layer il go first
     ggml_tensor * build_prefetch(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * after, int il) const;
 
+    // with overlap: the cached experts also go through down before the wait (LLAMA_MOE_STREAM_OVERLAP_DOWN=1, default off)
+    bool overlap_down() const;
+
     // true if a batch of n_tokens of layer il is computed on the CPU from the cache (see build_slots)
     bool cpu_path(int il, int64_t n_tokens) const;
     ggml_tensor * build_wait(ggml_context * ctx, ggml_tensor * slots, const std::vector<ggml_tensor *> & deps, int il) const;
