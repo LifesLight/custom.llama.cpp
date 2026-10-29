@@ -253,6 +253,18 @@ struct llama_moe_stream::impl {
     // compute the cached experts while the missing ones are read (LLAMA_MOE_STREAM_OVERLAP)
     bool overlap_mode = false;
 
+    // profile of the batches computed on the CPU (LLAMA_MOE_STREAM_PROFILE): where the time of a token goes
+    bool   prof          = false;
+    double prof_layer_t0 = 0.0;  // the start of the experts of the current layer (its slots op)
+    double prof_last_end = -1.0; // the end of the expert matmuls of the previous layer of the graph
+    double prof_graph_t0 = -1.0; // the start of the previous graph
+    // since the last report
+    double  prof_total   = 0.0;  // between the starts of consecutive graphs computed on the CPU
+    int64_t prof_n_total = 0;
+    double  prof_cpu     = 0.0;  // from the slots op of a layer to the end of its expert matmuls
+    double  prof_between = 0.0;  // from the end of the expert matmuls of a layer to the slots op of the next one
+    double  prof_bytes   = 0.0;  // bytes of the experts computed
+
     // the layers with the same experts layout share their cache slots, keeping at least that fraction of their
     // uniform share each (--moe-stream-pool), < 0 = per-layer caches
     double pool_min = -1.0;
@@ -430,6 +442,9 @@ struct llama_moe_stream::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_STREAM_OVERLAP")) {
             overlap_mode = atoi(env) != 0;
+        }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_PROFILE")) {
+            prof = atoi(env) != 0;
         }
         if (const char * env = getenv("LLAMA_MOE_STREAM_ALLOC_MIN")) {
             alloc_min = std::clamp(atof(env), 0.0, 1.0);
@@ -1549,6 +1564,13 @@ struct llama_moe_stream::impl {
         const double t_ensure = t_now();
         double t_waited = 0.0;
 
+        if (prof) {
+            if (prof_last_end >= 0.0) {
+                prof_between += t_ensure - prof_last_end;
+            }
+            prof_layer_t0 = t_ensure;
+        }
+
         // the experts of the other layers of the pool can be evicted when no layer of the graph is streamed:
         // then nothing uploads from the cache while it changes. the eviction order of the pool is kept for that
         const bool steal = shared(l) && order.empty();
@@ -1586,6 +1608,10 @@ struct llama_moe_stream::impl {
                 }
                 cnt[e]++;
             }
+        }
+
+        if (prof) {
+            prof_bytes += (double) needed.size() * (double) expert_bytes(l);
         }
 
         const double w = weight();
@@ -1839,6 +1865,26 @@ struct llama_moe_stream::impl {
         }
         auto * c = (op_ctx *) userdata;
         c->self->ensure(c->li, dst->src[0], dst);
+    }
+
+    static void mark_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(dst);
+        GGML_UNUSED(nth);
+        if (ith != 0) {
+            return;
+        }
+        auto * c = (op_ctx *) userdata;
+        const double t = t_now();
+        c->self->prof_cpu     += t - c->self->prof_layer_t0;
+        c->self->prof_last_end = t;
+    }
+
+    ggml_tensor * build_profile_mark(ggml_context * ctx, ggml_tensor * cur, int il) const {
+        if (!prof || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+            return nullptr;
+        }
+        ggml_tensor * args[] = { cur };
+        return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, mark_op, 1, const_cast<op_ctx *>(&op_ctxs[layer_of_il[il]]));
     }
 
     bool cpu_path(int il, int64_t n) const {
@@ -2436,6 +2482,17 @@ struct llama_moe_stream::impl {
     //
 
     void begin_graph(ggml_backend_sched_t sched, ggml_cgraph * gf, int64_t n_tok, bool more) {
+        if (prof) {
+            // graph_cached is still the one of the previous graph
+            const double t = t_now();
+            if (graph_cached && prof_graph_t0 >= 0.0) {
+                prof_total += t - prof_graph_t0;
+                prof_n_total++;
+            }
+            prof_graph_t0 = t;
+            prof_last_end = -1.0;
+        }
+
         order.clear();
         order_pos.assign(tensors.size(), -1);
 
@@ -2734,6 +2791,21 @@ struct llama_moe_stream::impl {
                         cpu_bytes/GiB, 100.0*dr/std::max<size_t>(rd, 1), overlap_mode ? "waited" : "read time", cpu_t_read,
                         1e3*cpu_t_policy/std::max<int64_t>(cpu_tokens, 1), spread.c_str());
 
+                if (prof && cpu_batches > 0) {
+                    const double nb      = (double) cpu_batches;
+                    const double total   = prof_n_total > 0 ? prof_total/prof_n_total : 0.0;
+                    const double cpu     = prof_cpu/nb;
+                    const double between = prof_between/nb;
+                    const double waited  = cpu_t_read/nb;
+                    const double compute = std::max(cpu - waited, 1e-9);
+                    LLAMA_LOG_INFO("moe_stream: profile: %.1f ms/batch = %.1f expert matmuls on the CPU (%.1f of them waiting for reads,"
+                            " the rest reading %.1f GB/s of expert weights) + %.1f between the layers (GPU, transfers) + %.1f before the first"
+                            " and after the last MoE layer (incl. sampling)\n",
+                            1e3*total, 1e3*cpu, 1e3*waited, prof_bytes/nb/compute/1e9, 1e3*between, 1e3*(total - cpu - between));
+                    prof_total = prof_cpu = prof_between = prof_bytes = 0.0;
+                    prof_n_total = 0;
+                }
+
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
                 cpu_pred_evicted[0] = cpu_pred_evicted[1] = 0;
                 cpu_tokens  = 0;
@@ -2808,6 +2880,17 @@ bool llama_moe_stream::active() const {
 
 bool llama_moe_stream::overlap() const {
     return pimpl->is_active && pimpl->overlap_mode;
+}
+
+ggml_tensor * llama_moe_stream::build_profile_mark(ggml_context * ctx, ggml_tensor * cur, int il) const {
+#ifdef __linux__
+    return pimpl->is_active ? pimpl->build_profile_mark(ctx, cur, il) : nullptr;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(cur);
+    GGML_UNUSED(il);
+    return nullptr;
+#endif
 }
 
 bool llama_moe_stream::cpu_path(int il, int64_t n_tokens) const {
