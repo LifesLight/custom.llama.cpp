@@ -133,6 +133,10 @@ struct llama_moe_stream::impl {
         uint64_t st_hits   = 0;
         uint64_t st_window = 0;
 
+        // prefetch: the slots prefetched for the next batch of this layer, and the experts predicted for it
+        std::vector<int32_t> pf_slots;
+        std::vector<int32_t> pf_pred;
+
         bool streamed() const { return n_uniform < n_expert; }
     };
 
@@ -150,6 +154,12 @@ struct llama_moe_stream::impl {
             if (stamp != o.stamp) { return stamp < o.stamp; }
             return slot < o.slot;
         }
+    };
+
+    // a set of reads to wait for
+    struct wait_group {
+        int  pending = 0;     // guarded by mtx
+        bool error   = false; // guarded by mtx
     };
 
     // the cache slots of layers with the same experts layout (all of a layer without a shared pool)
@@ -173,12 +183,16 @@ struct llama_moe_stream::impl {
 
         std::vector<ggml_tensor *> bank;      // [n_roles]
         std::vector<uint8_t *>     bank_data; // [n_roles]
-    };
 
-    // a set of reads to wait for
-    struct wait_group {
-        int  pending = 0;     // guarded by mtx
-        bool error   = false; // guarded by mtx
+        // prefetch, per slot
+        std::vector<wait_group> slot_wg;     // the reads of a prefetch into the slot
+        std::vector<uint8_t>    busy;        // reads into the slot may be in progress, it cannot be evicted
+        std::vector<uint8_t>    pf;          // prefetched for the next batch of its layer, not consumed yet
+        std::vector<uint8_t>    pf_started;  // a read of the prefetch was started (guarded by mtx)
+        std::vector<int32_t>    pf_vl;       // the expert the prefetch replaced, given its slot back if no read started
+        std::vector<int32_t>    pf_ve;
+        std::vector<uint8_t>    pf_vprot;
+        std::vector<uint64_t>   pf_vevicted;
     };
 
     enum expert_state : uint8_t {
@@ -214,6 +228,9 @@ struct llama_moe_stream::impl {
         bool         aligned; // offs, len and dst are aligned: read directly, otherwise through a bounce buffer
         int          slot   = -1; // the staging buffer and the expert, for the reads that can be cancelled
         int          expert = -1;
+        bool         prefetch = false; // a prefetch into the cache slot pslot of pool
+        int          pool     = -1;
+        int32_t      pslot    = -1;
     };
 
     // speculative reads, by rank of the expert in the usage order of its layer, then by submission
@@ -223,6 +240,7 @@ struct llama_moe_stream::impl {
     struct op_ctx {
         impl * self;
         int    li;
+        int    src_li = -1; // prefetch: the layer whose input predicts the experts of li
     };
 
     bool is_active = false;
@@ -330,6 +348,41 @@ struct llama_moe_stream::impl {
     // usage scores: an expert selected by a token gets 2^(tclock/halflife - sbase)
     double tclock = 0.0;
     double sbase  = 0.0;
+
+    // cross-layer prefetch (LLAMA_MOE_STREAM_PREFETCH=K): while a layer computed on the CPU from the cache is
+    // computed, the K experts the router of the next layer selects for its input (with the norm weights of the next
+    // layer, LLAMA_MOE_STREAM_PREFETCH_NORM) are read into the cache, at a lower priority than the reads needed now
+    int  pf_k            = 0;
+    int  pf_max_inflight = 1; // prefetch reads in progress at most (LLAMA_MOE_STREAM_PREFETCH_INFLIGHT)
+    bool pf_norm         = true;
+
+    struct pf_target {
+        int           next_li     = -1;
+        ggml_tensor * gate_inp    = nullptr;
+        ggml_tensor * gate_inp_b  = nullptr;
+        ggml_tensor * exp_probs_b = nullptr;
+        ggml_tensor * ratio       = nullptr;
+    };
+    std::vector<pf_target>             pf_targets; // [layers.size()]
+    std::vector<op_ctx>                pf_op_ctxs; // [layers.size()]
+    std::vector<ggml_context *>        pf_ctxs;
+    std::vector<ggml_backend_buffer_t> pf_bufs;
+    std::deque<job>                    pf_jobs;     // guarded by mtx
+    int                                pf_inflight = 0; // guarded by mtx
+    std::vector<std::pair<int, int32_t>> busy_list;  // (pool, slot) of the busy slots
+    std::vector<std::pair<int, int32_t>> pf_pending; // (pool, slot) of the selected experts whose prefetch is not done
+    std::vector<int32_t>               pf_cnt;      // [max n_expert]
+    std::vector<int32_t>               pf_order;
+
+    // prefetch statistics, since the last report
+    int64_t pf_issued    = 0; // experts
+    int64_t pf_used      = 0; // selected by the next batch of their layer
+    int64_t pf_ready     = 0; // of which the reads were done
+    int64_t pf_cancelled = 0; // not selected, no read started: the replaced expert got its slot back
+    int64_t pf_wasted    = 0; // not selected, read (partly)
+    int64_t pf_noroom    = 0; // predicted, not cached, but no slot could be given
+    int64_t pf_pred_sel  = 0; // selected experts that were predicted
+    int64_t pf_sel       = 0; // selected experts of the layers with a prediction
 
     std::vector<int32_t> needed;
     std::vector<int32_t> missing;
@@ -447,6 +500,12 @@ struct llama_moe_stream::impl {
         if (const char * env = getenv("LLAMA_MOE_STREAM_PROFILE")) {
             prof = atoi(env) != 0;
         }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH")) {
+            pf_k = std::max(0, atoi(env));
+        }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH_NORM")) {
+            pf_norm = atoi(env) != 0;
+        }
         if (const char * env = getenv("LLAMA_MOE_STREAM_ALLOC_MIN")) {
             alloc_min = std::clamp(atof(env), 0.0, 1.0);
         }
@@ -504,6 +563,8 @@ struct llama_moe_stream::impl {
         rep_read   = bytes_read;
         rep_direct = bytes_direct;
 
+        setup_prefetch(model, params.n_threads);
+
         check_offload();
 
         is_active = true;
@@ -542,6 +603,12 @@ struct llama_moe_stream::impl {
         }
         if (bank_ctx) {
             ggml_free(bank_ctx);
+        }
+        for (auto * b : pf_bufs) {
+            ggml_backend_buffer_free(b);
+        }
+        for (auto * c : pf_ctxs) {
+            ggml_free(c);
         }
         if (bank_buf) {
             ggml_backend_buffer_free(bank_buf);
@@ -897,6 +964,14 @@ struct llama_moe_stream::impl {
         for (auto & p : pools) {
             p.slot_layer .assign(p.n_slots, -1);
             p.slot_expert.assign(p.n_slots, -1);
+            p.slot_wg     = std::vector<wait_group>(p.n_slots);
+            p.busy       .assign(p.n_slots, 0);
+            p.pf         .assign(p.n_slots, 0);
+            p.pf_started .assign(p.n_slots, 0);
+            p.pf_vl      .assign(p.n_slots, -1);
+            p.pf_ve      .assign(p.n_slots, -1);
+            p.pf_vprot   .assign(p.n_slots, 0);
+            p.pf_vevicted.assign(p.n_slots, 0);
         }
 
         LLAMA_LOG_INFO("moe_stream: %zu layers, %.2f GiB of experts, %.2f GiB cached (%" PRId64 "/%" PRId64 " per layer), %s policy\n",
@@ -1475,6 +1550,9 @@ struct llama_moe_stream::impl {
     // a slot of the pool of layer li that a missing expert of li can take: an expert of li that the batch did not
     // select, or, if steal, an expert of another layer that has more than its least slots
     bool can_evict(const pool & p, int li, int32_t s, bool steal) const {
+        if (p.busy[s] || p.pf[s]) {
+            return false; // reads into it may be in progress
+        }
         const int lo = p.slot_layer[s];
         if (lo == li) {
             return layers[li].mark[p.slot_expert[s]] != layers[li].mark_gen;
@@ -1518,7 +1596,7 @@ struct llama_moe_stream::impl {
         cand.clear();
         const auto & l = layers[li];
         for (int64_t e = 0; e < l.n_expert; ++e) {
-            if (l.slot_of[e] >= 0 && l.mark[e] != l.mark_gen) {
+            if (l.slot_of[e] >= 0 && l.mark[e] != l.mark_gen && !p.busy[l.slot_of[e]] && !p.pf[l.slot_of[e]]) {
                 cand.push_back(l.slot_of[e]);
             }
         }
@@ -1551,6 +1629,520 @@ struct llama_moe_stream::impl {
                 rekey(p, d);
             }
         }
+    }
+
+    //
+    // cross-layer prefetch
+    //
+
+    // the routers of the next layers, and the ratios of the norm weights that turn the input of the router of a
+    // layer into an estimate of the input of the next one
+    void setup_prefetch(const llama_model & model, int n_threads) {
+        if (pf_k <= 0) {
+            return;
+        }
+        if (memfd < 0) {
+            LLAMA_LOG_WARN("moe_stream: prefetch needs the overflow windows (memfd), disabled\n");
+            pf_k = 0;
+            return;
+        }
+
+        pf_max_inflight = std::max(1, n_threads/2);
+        if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH_INFLIGHT")) {
+            pf_max_inflight = std::max(1, atoi(env));
+        }
+
+        pf_cnt.assign(max_n_expert, 0);
+        pf_targets.assign(layers.size(), pf_target());
+        pf_op_ctxs.resize(layers.size());
+
+        const int n_layer = (int) model.hparams.n_layer(); // without the MTP layers, which the graph does not compute
+
+        std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_of;
+        std::vector<std::pair<ggml_tensor *, std::vector<float>>> ratios;
+        int n_targets = 0;
+        int n_ratios  = 0;
+
+        for (size_t li = 0; li < layers.size(); ++li) {
+            const int il = layers[li].il;
+            pf_op_ctxs[li] = { this, -1, (int) li };
+            if (il + 1 >= n_layer || il + 1 >= (int) layer_of_il.size() || layer_of_il[il + 1] < 0) {
+                continue;
+            }
+            const int next = layer_of_il[il + 1];
+            const auto & cl = model.layers[il];
+            const auto & nl = model.layers[il + 1];
+            if (!nl.ffn_gate_inp || nl.ffn_gate_inp->ne[1] != layers[next].n_expert) {
+                continue;
+            }
+            auto & t = pf_targets[li];
+            t.next_li     = next;
+            t.gate_inp    = nl.ffn_gate_inp;
+            t.gate_inp_b  = nl.ffn_gate_inp_b;
+            t.exp_probs_b = nl.ffn_exp_probs_b;
+            pf_op_ctxs[li].li = next;
+            n_targets++;
+
+            const int64_t ne = nl.ffn_gate_inp->ne[0];
+            if (!pf_norm || !cl.ffn_norm || !nl.ffn_norm || cl.ffn_norm->type != GGML_TYPE_F32 || nl.ffn_norm->type != GGML_TYPE_F32 ||
+                    ggml_nelements(cl.ffn_norm) != ne || ggml_nelements(nl.ffn_norm) != ne) {
+                continue;
+            }
+            std::vector<float> wc(ne);
+            std::vector<float> wn(ne);
+            ggml_backend_tensor_get(cl.ffn_norm, wc.data(), 0, ne*sizeof(float));
+            ggml_backend_tensor_get(nl.ffn_norm, wn.data(), 0, ne*sizeof(float));
+            float amax = 0.0f;
+            for (float v : wc) {
+                amax = std::max(amax, std::fabs(v));
+            }
+            std::vector<float> r(ne);
+            for (int64_t c = 0; c < ne; ++c) {
+                r[c] = std::fabs(wc[c]) > 1e-6f*amax ? wn[c]/wc[c] : 0.0f;
+            }
+
+            // next to the input of the router, on the device of the layer
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+            ggml_context *& ctx = ctx_of[buft];
+            if (!ctx) {
+                ggml_init_params ip = {
+                    /*.mem_size   =*/ ggml_tensor_overhead()*(layers.size() + 1),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ctx = ggml_init(ip);
+            }
+            t.ratio = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+            ggml_format_name(t.ratio, "blk.%d.moe_prefetch_norm", il);
+            ratios.emplace_back(t.ratio, std::move(r));
+            n_ratios++;
+        }
+
+        for (auto & [buft, ctx] : ctx_of) {
+            pf_ctxs.push_back(ctx);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+            if (!buf) {
+                LLAMA_LOG_WARN("moe_stream: failed to allocate the prefetch norm ratios in %s, no norm correction there\n", ggml_backend_buft_name(buft));
+                continue;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            pf_bufs.push_back(buf);
+        }
+        for (auto & [t, r] : ratios) {
+            if (t->buffer) {
+                ggml_backend_tensor_set(t, r.data(), 0, r.size()*sizeof(float));
+            }
+        }
+        for (auto & t : pf_targets) {
+            if (t.ratio && !t.ratio->buffer) {
+                t.ratio = nullptr;
+                n_ratios--;
+            }
+        }
+
+        LLAMA_LOG_INFO("moe_stream: prefetch: the %d most likely experts of the next layer for %d layers (%d with norm correction), up to %d reads in flight\n",
+                pf_k, n_targets, n_ratios, pf_max_inflight);
+    }
+
+    // clear the busy flag of the slots whose reads are done
+    void refresh_busy() {
+        if (busy_list.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mtx);
+        size_t w = 0;
+        for (size_t i = 0; i < busy_list.size(); ++i) {
+            const auto [pi, s] = busy_list[i];
+            auto & p = pools[pi];
+            if (p.slot_wg[s].pending == 0) {
+                if (p.slot_wg[s].error) {
+                    GGML_ABORT("moe_stream: failed to prefetch an expert of layer %d", layers[p.slot_layer[s]].il);
+                }
+                p.busy[s] = 0;
+            } else {
+                busy_list[w++] = busy_list[i];
+            }
+        }
+        busy_list.resize(w);
+    }
+
+    // move the queued prefetch reads of a slot to out, as reads needed now
+    // call with mtx locked
+    void take_pf_jobs(const wait_group * wg, std::vector<job> & out) {
+        std::deque<job> kept;
+        for (auto & j : pf_jobs) {
+            if (j.wg == wg) {
+                j.prefetch = false;
+                out.push_back(j);
+            } else {
+                kept.push_back(j);
+            }
+        }
+        pf_jobs.swap(kept);
+    }
+
+    // a prefetch that was not used and whose reads did not start: the expert it replaced gets its slot back
+    void pf_restore(pool & p, int32_t s) {
+        const int     li = p.slot_layer[s];
+        const int32_t e  = p.slot_expert[s];
+        const int     vl = p.pf_vl[s];
+        const int32_t v  = p.pf_ve[s];
+        auto & l  = layers[li];
+        auto & lv = layers[vl];
+        GGML_ASSERT(lv.slot_of[v] < 0 && "the expert replaced by a prefetch was cached again");
+
+        l.slot_of[e]     = -1;
+        lv.slot_of[v]    = s;
+        p.slot_layer [s] = vl;
+        p.slot_expert[s] = v;
+        lv.evicted_at[v] = p.pf_vevicted[s];
+        if (vl != li) {
+            l.n_cached--;
+            lv.n_cached++;
+        }
+        if (p.pf_vprot[s]) {
+            lv.prot[v] = 1;
+            p.prot.emplace(lv.stamp[v], s);
+        }
+        p.busy[s] = 0;
+        rekey(p, s);
+    }
+
+    // the prefetches of layer li are no longer pending: the selected ones (marked) are used, the others are cancelled
+    // if none of their reads started, otherwise they stay in the cache (busy until their reads are done)
+    void consume_prefetch(int li, bool count) {
+        auto & l = layers[li];
+        auto & p = pools[l.pool];
+
+        if (count && !l.pf_pred.empty()) {
+            for (int32_t e : l.pf_pred) {
+                pf_pred_sel += l.mark[e] == l.mark_gen;
+            }
+            pf_sel += (int64_t) needed.size();
+        }
+        l.pf_pred.clear();
+
+        if (l.pf_slots.empty()) {
+            return;
+        }
+
+        std::vector<int32_t> restore;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            for (int32_t s : l.pf_slots) {
+                p.pf[s] = 0;
+                GGML_ASSERT(p.slot_layer[s] == li);
+                const int32_t e = p.slot_expert[s];
+                if (count && l.mark[e] == l.mark_gen) {
+                    pf_used++;
+                    pf_ready += p.slot_wg[s].pending == 0;
+                } else if (!p.pf_started[s]) {
+                    std::vector<job> dropped;
+                    take_pf_jobs(&p.slot_wg[s], dropped);
+                    p.slot_wg[s].pending -= (int) dropped.size();
+                    GGML_ASSERT(p.slot_wg[s].pending == 0);
+                    restore.push_back(s);
+                    pf_cancelled++;
+                } else {
+                    pf_wasted++;
+                }
+            }
+        }
+        for (int32_t s : restore) {
+            pf_restore(p, s);
+        }
+        l.pf_slots.clear();
+    }
+
+    // the selected experts of a batch of layer li whose reads (prefetched) are not done yet: their queued reads
+    // become reads needed now, and the batch waits for them
+    void promote_busy(int li) {
+        pf_pending.clear();
+        if (busy_list.empty()) {
+            return;
+        }
+        auto & l = layers[li];
+        auto & p = pools[l.pool];
+        std::vector<job> urgent;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            for (int32_t e : needed) {
+                const int32_t s = l.slot_of[e];
+                if (s < 0 || !p.busy[s] || p.slot_wg[s].pending == 0) {
+                    continue;
+                }
+                take_pf_jobs(&p.slot_wg[s], urgent);
+                pf_pending.emplace_back(l.pool, s);
+            }
+            jobs.insert(jobs.begin(), urgent.begin(), urgent.end());
+        }
+        if (!urgent.empty()) {
+            cv_jobs.notify_all();
+        }
+    }
+
+    void wait_pf_pending() {
+        for (const auto & [pi, s] : pf_pending) {
+            if (!wait(pools[pi].slot_wg[s])) {
+                GGML_ABORT("moe_stream: failed to prefetch an expert of layer %d", layers[pools[pi].slot_layer[s]].il);
+            }
+        }
+        pf_pending.clear();
+    }
+
+    // all the prefetches are consumed: unused ones cancelled when possible. with wait_all, also wait for all the
+    // reads into the cache, before the cache is uploaded from or changed by something else
+    void drain_prefetch(bool wait_all) {
+        if (pf_k <= 0) {
+            return;
+        }
+        for (size_t li = 0; li < layers.size(); ++li) {
+            if (!layers[li].pf_slots.empty() || !layers[li].pf_pred.empty()) {
+                consume_prefetch((int) li, false);
+            }
+        }
+        if (wait_all) {
+            for (const auto & [pi, s] : busy_list) {
+                if (!wait(pools[pi].slot_wg[s])) {
+                    GGML_ABORT("moe_stream: failed to prefetch an expert");
+                }
+                pools[pi].busy[s] = 0;
+            }
+            busy_list.clear();
+        }
+    }
+
+    // a slot that a prefetch of layer li can take while layer src_li is computed: not busy, not an expert that
+    // src_li is computing, and if it is of another layer, one that has more than its least slots
+    bool pf_can_evict(const pool & p, int li, int src_li, int32_t s) const {
+        if (p.busy[s] || p.pf[s]) {
+            return false;
+        }
+        const int lo = p.slot_layer[s];
+        const auto & lv = layers[lo];
+        if (lo == src_li && lv.mark[p.slot_expert[s]] == lv.mark_gen) {
+            return false;
+        }
+        if (lo == li) {
+            return !pf_cnt[p.slot_expert[s]]; // not a predicted expert
+        }
+        return lv.n_cached > lv.n_min;
+    }
+
+    // read the experts of layer li predicted by ids into the cache, at a low priority
+    void prefetch(int li, int src_li, const ggml_tensor * ids) {
+        auto & l = layers[li];
+        auto & p = pools[l.pool];
+
+        // the predicted experts, the most selected first (for one token, in the order of the router)
+        const int64_t k = ids->ne[0];
+        const int64_t n = ids->ne[1];
+        pf_order.clear();
+        for (int64_t i1 = 0; i1 < n; ++i1) {
+            for (int64_t i0 = 0; i0 < k; ++i0) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
+                if (e < 0 || e >= l.n_expert) {
+                    continue;
+                }
+                if (pf_cnt[e]++ == 0) {
+                    pf_order.push_back(e);
+                }
+            }
+        }
+        std::stable_sort(pf_order.begin(), pf_order.end(), [&](int32_t a, int32_t b) { return pf_cnt[a] > pf_cnt[b]; });
+        for (int32_t e : pf_order) {
+            pf_cnt[e] = 0;
+        }
+        if ((int) pf_order.size() > pf_k) {
+            pf_order.resize(pf_k);
+        }
+        // the predicted experts are not victims of the others (pf_cnt as a flag until the end)
+        for (int32_t e : pf_order) {
+            pf_cnt[e] = 1;
+        }
+        struct clear_flags {
+            std::vector<int32_t> & cnt;
+            const std::vector<int32_t> & es;
+            ~clear_flags() {
+                for (int32_t e : es) {
+                    cnt[e] = 0;
+                }
+            }
+        } clear { pf_cnt, pf_order };
+
+        // leftovers of an earlier prediction of this layer (normally consumed by its batch)
+        if (!l.pf_slots.empty() || !l.pf_pred.empty()) {
+            consume_prefetch(li, false);
+        }
+        l.pf_pred = pf_order;
+
+        refresh_busy();
+
+        // the victims, in the eviction order of the pool when the layers share it, or of the layer
+        const bool steal = shared(l) && order.empty();
+        if (steal && !p.order_valid) {
+            build_order(p);
+        }
+        size_t n_want = 0;
+        for (int32_t e : pf_order) {
+            n_want += l.slot_of[e] < 0;
+        }
+        if (n_want == 0) {
+            return;
+        }
+        if (!steal) {
+            // the cached experts of the layer that its last batch did not select, the least valuable first
+            cand.clear();
+            for (int64_t e = 0; e < l.n_expert; ++e) {
+                const int32_t s = l.slot_of[e];
+                if (s >= 0 && l.mark[e] != l.mark_gen && pf_can_evict(p, li, src_li, s)) {
+                    cand.push_back(s);
+                }
+            }
+            auto less = [&](int32_t a, int32_t b) { return evict_before(p, a, b); };
+            if (cand.size() > n_want) {
+                std::nth_element(cand.begin(), cand.begin() + n_want, cand.end(), less);
+                cand.resize(n_want);
+            }
+            std::sort(cand.begin(), cand.end(), less);
+        }
+        auto it = p.order.begin();
+        size_t ci = 0;
+
+        for (int32_t e : pf_order) {
+            if (l.slot_of[e] >= 0) {
+                continue;
+            }
+            int32_t s = -1;
+            if (steal) {
+                while (it != p.order.end() && !pf_can_evict(p, li, src_li, it->slot)) {
+                    ++it;
+                }
+                s = it != p.order.end() ? it->slot : -1;
+            } else {
+                while (ci < cand.size() && !pf_can_evict(p, li, src_li, cand[ci])) {
+                    ci++;
+                }
+                s = ci < cand.size() ? cand[ci] : -1;
+            }
+            if (s < 0) {
+                pf_noroom++;
+                break;
+            }
+            const int lo = p.slot_layer[s];
+            auto & lv = layers[lo];
+            const int32_t v = p.slot_expert[s];
+            // no lfu admission test: the prediction is likely right, and an expert used less than the one it replaces
+            // is the next to be evicted (with lfu as with lru, since its stamp is 0 until its batch selects it)
+            if (steal) {
+                ++it; // the key of s changes below, before the current position (stamp 0)
+            } else {
+                ci++;
+            }
+
+            // remember the replaced expert, for a cancellation
+            p.pf_vl[s]       = lo;
+            p.pf_ve[s]       = v;
+            p.pf_vprot[s]    = lv.prot[v];
+            p.pf_vevicted[s] = lv.evicted_at[v];
+
+            if (lv.prot[v]) {
+                lv.prot[v] = 0;
+                p.prot.erase({ lv.stamp[v], s });
+            }
+            lv.slot_of[v]    = -1;
+            lv.evicted_at[v] = ++lv.n_evict;
+            if (lo != li) {
+                lv.n_cached--;
+                l.n_cached++;
+                lv.dirty = true;
+            }
+            l.slot_of[e]     = s;
+            p.slot_layer [s] = li;
+            p.slot_expert[s] = e;
+            // the first to be evicted, unless the batch selects it
+            l.stamp[e] = 0;
+            l.prot[e]  = 0;
+            rekey(p, s);
+            l.dirty     = true;
+            state_dirty = true;
+
+            p.pf[s]   = 1;
+            p.busy[s] = 1;
+            busy_list.emplace_back(l.pool, s);
+            l.pf_slots.push_back(s);
+            submit_prefetch(l, e, s);
+            pf_issued++;
+        }
+    }
+
+    // queue the reads of expert e of layer l into slot s, at a low priority
+    void submit_prefetch(const layer & l, int64_t e, int32_t s) {
+        auto & p = pools[l.pool];
+        std::lock_guard<std::mutex> lk(mtx);
+        p.pf_started[s] = 0;
+        for (int idx : l.tensors) {
+            const auto & ti = tensors[idx];
+            const size_t offs = ti.file_offs + e*ti.expert_size;
+            uint8_t *    dst  = ti.bank_data + s*ti.expert_size;
+            for (size_t o = 0; o < ti.expert_size; o += BOUNCE_CHUNK) {
+                job j;
+                j.file     = ti.file;
+                j.offs     = offs + o;
+                j.len      = std::min(BOUNCE_CHUNK, ti.expert_size - o);
+                j.dst      = dst + o;
+                j.wg       = &p.slot_wg[s];
+                j.aligned  = false;
+                j.prefetch = true;
+                j.pool     = l.pool;
+                j.pslot    = s;
+                pf_jobs.push_back(j);
+                p.slot_wg[s].pending++;
+            }
+        }
+        cv_jobs.notify_all();
+    }
+
+    static void prefetch_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(nth);
+        if (ith != 0) {
+            return;
+        }
+        auto * c = (op_ctx *) userdata;
+        c->self->prefetch(c->li, c->src_li, dst->src[0]);
+    }
+
+    bool prefetch_info(int il, int64_t n, llama_moe_stream_prefetch & out) const {
+        if (pf_k <= 0 || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+            return false;
+        }
+        const auto & t = pf_targets[layer_of_il[il]];
+        if (t.next_li < 0 || !cpu_path(il, n) || !cpu_path(layers[t.next_li].il, n)) {
+            return false;
+        }
+        // all its experts are cached, or the busy slots could leave a batch without room (no overflow window)
+        if (!layers[t.next_li].streamed() || !layers[t.next_li].window) {
+            return false;
+        }
+        out.gate_inp    = t.gate_inp;
+        out.gate_inp_b  = t.gate_inp_b;
+        out.exp_probs_b = t.exp_probs_b;
+        out.norm        = t.ratio;
+        out.k           = (int) std::min<int64_t>(pf_k, layers[t.next_li].n_expert);
+        return true;
+    }
+
+    ggml_tensor * build_prefetch(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * after, int il) const {
+        if (pf_k <= 0 || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+            return nullptr;
+        }
+        const int li = layer_of_il[il];
+        if (pf_targets[li].next_li < 0) {
+            return nullptr;
+        }
+        ggml_tensor * args[] = { ids, after };
+        return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 2, prefetch_op, 1, const_cast<op_ctx *>(&pf_op_ctxs[li]));
     }
 
     // make the experts selected by a batch computed on the CPU available and write their slots:
@@ -1614,6 +2206,14 @@ struct llama_moe_stream::impl {
         if (prof) {
             prof_bytes += (double) needed.size() * (double) expert_bytes(l);
         }
+
+        // the experts prefetched for this batch: the selected ones are hits, the others are cancelled when possible.
+        // the selected experts whose prefetch reads are not done are waited for like the missing ones
+        refresh_busy();
+        if (!l.pf_slots.empty() || !l.pf_pred.empty()) {
+            consume_prefetch(li, true);
+        }
+        promote_busy(li);
 
         const double w = weight();
         missing.clear();
@@ -1779,9 +2379,20 @@ struct llama_moe_stream::impl {
             }
         }
 
-        // the experts read for this batch: the missing ones, now in a cache slot or in the window
+        if (!overlap_mode && !pf_pending.empty()) {
+            const double tw = t_now();
+            wait_pf_pending();
+            cpu_t_read += t_now() - tw;
+            t_waited   += t_now() - tw;
+        }
+
+        // the experts read for this batch: the missing ones, now in a cache slot or in the window, and the prefetched
+        // ones whose reads are not done
         for (int32_t e : missing) {
             being_read[e] = 1;
+        }
+        for (const auto & [pi, s] : pf_pending) {
+            being_read[p.slot_expert[s]] = 1;
         }
 
         int32_t * dst = (int32_t *) out->data;
@@ -1800,6 +2411,9 @@ struct llama_moe_stream::impl {
 
         for (int32_t e : missing) {
             being_read[e] = 0;
+        }
+        for (const auto & [pi, s] : pf_pending) {
+            being_read[p.slot_expert[s]] = 0;
         }
         for (int32_t e : overflow) {
             ov_index[e] = -1;
@@ -1822,6 +2436,7 @@ struct llama_moe_stream::impl {
         if (!wait(pend_wg)) {
             GGML_ABORT("moe_stream: failed to read the experts of layer %d", layers[li].il);
         }
+        wait_pf_pending();
         cpu_t_read += t_now() - t0;
         cpu_bytes  += bytes_read - pend_read_start;
 
@@ -2061,10 +2676,17 @@ struct llama_moe_stream::impl {
             job j;
             {
                 std::unique_lock<std::mutex> lk(mtx);
-                cv_jobs.wait(lk, [this] { return stop || !jobs.empty() || !spec.empty(); });
+                cv_jobs.wait(lk, [this] { return stop || !jobs.empty() || (!pf_jobs.empty() && pf_inflight < pf_max_inflight) || !spec.empty(); });
                 if (!jobs.empty()) {
                     j = jobs.front();
                     jobs.pop_front();
+                } else if (!stop && !pf_jobs.empty() && pf_inflight < pf_max_inflight) {
+                    // prefetch reads only when no read is needed now, and only some at a time, so that the reads
+                    // needed by the next batch do not wait long behind them
+                    j = pf_jobs.front();
+                    pf_jobs.pop_front();
+                    pf_inflight++;
+                    pools[j.pool].pf_started[j.pslot] = 1;
                 } else if (!spec.empty()) {
                     j = spec.begin()->second;
                     spec.erase(spec.begin());
@@ -2075,12 +2697,20 @@ struct llama_moe_stream::impl {
 
             const bool ok = bounce && read_job(j, (uint8_t *) bounce);
 
+            bool pf_done = false;
             {
                 std::lock_guard<std::mutex> lk(mtx);
                 j.wg->error = j.wg->error || !ok;
                 if (--j.wg->pending == 0) {
                     cv_done.notify_all();
                 }
+                if (j.prefetch) {
+                    pf_inflight--;
+                    pf_done = !pf_jobs.empty();
+                }
+            }
+            if (pf_done) {
+                cv_jobs.notify_one();
             }
         }
 
@@ -2535,6 +3165,9 @@ struct llama_moe_stream::impl {
         }
 
         if (!order.empty()) {
+            // the uploads read the cache: the prefetch reads into it must be done
+            drain_prefetch(true);
+
             // the cached experts may have changed since the staging buffers were filled
             for (size_t li = 0; li < layers.size(); ++li) {
                 auto & l = layers[li];
@@ -2757,6 +3390,11 @@ struct llama_moe_stream::impl {
     }
 
     void end_graph() {
+        // the prefetches of layers that the graph did not compute (e.g. the last layer of a batch without outputs)
+        if (graph_cached) {
+            drain_prefetch(false);
+        }
+
         if (graph_cached && !last_streamed) {
             cpu_tokens   += n_tokens;
             cpu_batches  += 1;
@@ -2814,6 +3452,18 @@ struct llama_moe_stream::impl {
                     prof_graph_w0 -= prof_cpu + prof_between; // keeps the work of the current graph
                     prof_outside = prof_cpu = prof_between = prof_bytes = 0.0;
                     prof_n_outside = 0;
+                }
+
+                if (pf_k > 0) {
+                    const int64_t misses = cpu_access - cpu_hits;
+                    LLAMA_LOG_INFO("moe_stream: prefetch: %.2f experts/token, %.0f%% used (%.0f%% of them in time), %.0f%% cancelled, %.0f%% read in vain,"
+                            " %.0f%% of the misses avoided, prediction recall %.0f%%, %.2f/token without a slot\n",
+                            (double) pf_issued/std::max<int64_t>(cpu_tokens, 1),
+                            100.0*pf_used/std::max<int64_t>(pf_issued, 1), 100.0*pf_ready/std::max<int64_t>(pf_used, 1),
+                            100.0*pf_cancelled/std::max<int64_t>(pf_issued, 1), 100.0*pf_wasted/std::max<int64_t>(pf_issued, 1),
+                            100.0*pf_used/std::max<int64_t>(pf_used + misses, 1), 100.0*pf_pred_sel/std::max<int64_t>(pf_sel, 1),
+                            (double) pf_noroom/std::max<int64_t>(cpu_tokens, 1));
+                    pf_issued = pf_used = pf_ready = pf_cancelled = pf_wasted = pf_noroom = pf_pred_sel = pf_sel = 0;
                 }
 
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
@@ -2898,6 +3548,29 @@ ggml_tensor * llama_moe_stream::build_profile_mark(ggml_context * ctx, ggml_tens
 #else
     GGML_UNUSED(ctx);
     GGML_UNUSED(cur);
+    GGML_UNUSED(il);
+    return nullptr;
+#endif
+}
+
+bool llama_moe_stream::prefetch_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const {
+#ifdef __linux__
+    return pimpl->is_active && pimpl->prefetch_info(il, n_tokens, out);
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(n_tokens);
+    GGML_UNUSED(out);
+    return false;
+#endif
+}
+
+ggml_tensor * llama_moe_stream::build_prefetch(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * after, int il) const {
+#ifdef __linux__
+    return pimpl->is_active ? pimpl->build_prefetch(ctx, ids, after, il) : nullptr;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(after);
     GGML_UNUSED(il);
     return nullptr;
 #endif

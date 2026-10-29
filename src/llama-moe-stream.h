@@ -33,6 +33,15 @@ struct llama_moe_stream_params {
 //   with O_DIRECT by a pool of IO threads into a ring of pinned staging buffers, one tensor per buffer, most used
 //   first while the previous tensors are computed; once the router selected the experts, only the missing selected
 //   ones are read. the cache does not change during prompt processing
+// the router of the next layer, to predict its experts from the input of the router of a layer (cross-layer prefetch)
+struct llama_moe_stream_prefetch {
+    ggml_tensor * gate_inp    = nullptr;
+    ggml_tensor * gate_inp_b  = nullptr;
+    ggml_tensor * exp_probs_b = nullptr;
+    ggml_tensor * norm        = nullptr; // [n_embd] multiplies the input: norm weights of the next layer / of this layer
+    int           k           = 0;       // number of experts to predict
+};
+
 class llama_moe_stream {
 public:
     // backends are the backends of the context, the first GPU is the one the experts are offloaded to
@@ -64,6 +73,14 @@ public:
     // LLAMA_MOE_STREAM_PROFILE=1: an op computed right after the expert matmuls of layer il on the CPU (cur is their
     // result) that times them, for the profile of the decode logged with the decode stats. nullptr if not profiling
     ggml_tensor * build_profile_mark(ggml_context * ctx, ggml_tensor * cur, int il) const;
+
+    // cross-layer prefetch (LLAMA_MOE_STREAM_PREFETCH=K): for a batch of n_tokens of layer il computed on the CPU from
+    // the cache, the router of the next layer, false if its experts are not prefetched
+    bool prefetch_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const;
+
+    // the op that reads the experts predicted by ids (top-k of the router of the next layer) into the cache, computed
+    // after `after` (the slots of layer il) so that the reads of layer il go first
+    ggml_tensor * build_prefetch(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * after, int il) const;
 
     // true if a batch of n_tokens of layer il is computed on the CPU from the cache (see build_slots)
     bool cpu_path(int il, int64_t n_tokens) const;

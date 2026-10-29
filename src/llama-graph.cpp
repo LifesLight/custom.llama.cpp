@@ -2422,8 +2422,45 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // cross-layer prefetch: the router of the next layer applied to the input of this one predicts the experts of
+    // the next layer, which the MoE stream starts reading while this layer is computed. with the router (before the
+    // slots), so that it is computed with it
+    ggml_tensor * pf_ids = nullptr;
+    llama_moe_stream_prefetch pf;
+    if (moe_stream != nullptr && moe_cache == nullptr && moe_stream->prefetch_info(il, n_tokens, pf)) {
+        ggml_tensor * x = cur; // [n_embd, n_tokens]
+        if (pf.norm) {
+            x = ggml_mul(ctx0, x, pf.norm);
+        }
+        ggml_tensor * pf_logits = build_lora_mm(pf.gate_inp, x); // [n_expert, n_tokens]
+        if (pf.gate_inp_b) {
+            pf_logits = ggml_add(ctx0, pf_logits, pf.gate_inp_b);
+        }
+        ggml_tensor * pf_probs = pf_logits;
+        switch (gating_op) {
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:       pf_probs = ggml_soft_max(ctx0, pf_logits); break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:       pf_probs = ggml_sigmoid(ctx0, pf_logits);  break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: pf_probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, pf_logits)); break;
+            default: break;
+        }
+        if (pf.exp_probs_b) {
+            pf_probs = ggml_add(ctx0, pf_probs, pf.exp_probs_b);
+        }
+        pf_ids = ggml_argsort_top_k(ctx0, pf_probs, pf.k); // [k, n_tokens]
+        cb(pf_ids, "ffn_moe_prefetch_topk", il);
+        ggml_build_forward_expand(gf, pf_ids);
+    }
+
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+
+    if (pf_ids != nullptr && slots != nullptr) {
+        if (ggml_tensor * op = moe_stream->build_prefetch(ctx0, pf_ids, slots, il)) {
+            ggml_backend_sched_set_tensor_backend(sched, op, backend_cpu);
+            cb(op, "ffn_moe_prefetch", il);
+            ggml_build_forward_expand(gf, op);
+        }
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
