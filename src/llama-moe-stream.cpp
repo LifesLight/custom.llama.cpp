@@ -258,9 +258,10 @@ struct llama_moe_stream::impl {
     double prof_layer_t0 = 0.0;  // the start of the experts of the current layer (its slots op)
     double prof_last_end = -1.0; // the end of the expert matmuls of the previous layer of the graph
     double prof_graph_t0 = -1.0; // the start of the previous graph
+    double prof_graph_w0 = 0.0;  // prof_cpu + prof_between at the start of the previous graph
     // since the last report
-    double  prof_total   = 0.0;  // between the starts of consecutive graphs computed on the CPU
-    int64_t prof_n_total = 0;
+    double  prof_outside = 0.0;  // the time of a graph computed on the CPU outside its expert matmuls and between its layers
+    int64_t prof_n_outside = 0;
     double  prof_cpu     = 0.0;  // from the slots op of a layer to the end of its expert matmuls
     double  prof_between = 0.0;  // from the end of the expert matmuls of a layer to the slots op of the next one
     double  prof_bytes   = 0.0;  // bytes of the experts computed
@@ -2486,10 +2487,17 @@ struct llama_moe_stream::impl {
             // graph_cached is still the one of the previous graph
             const double t = t_now();
             if (graph_cached && prof_graph_t0 >= 0.0) {
-                prof_total += t - prof_graph_t0;
-                prof_n_total++;
+                // a batch takes little more than its expert matmuls and the work between its layers,
+                // a longer gap is the server waiting for a request (after the warmup, between requests)
+                const double gap  = t - prof_graph_t0;
+                const double work = prof_cpu + prof_between - prof_graph_w0;
+                if (gap < 2.0*work + 0.1) {
+                    prof_outside += std::max(gap - work, 0.0);
+                    prof_n_outside++;
+                }
             }
             prof_graph_t0 = t;
+            prof_graph_w0 = prof_cpu + prof_between;
             prof_last_end = -1.0;
         }
 
@@ -2793,17 +2801,19 @@ struct llama_moe_stream::impl {
 
                 if (prof && cpu_batches > 0) {
                     const double nb      = (double) cpu_batches;
-                    const double total   = prof_n_total > 0 ? prof_total/prof_n_total : 0.0;
                     const double cpu     = prof_cpu/nb;
                     const double between = prof_between/nb;
+                    const double outside = prof_n_outside > 0 ? prof_outside/prof_n_outside : 0.0;
+                    const double total   = cpu + between + outside;
                     const double waited  = cpu_t_read/nb;
                     const double compute = std::max(cpu - waited, 1e-9);
                     LLAMA_LOG_INFO("moe_stream: profile: %.1f ms/batch = %.1f expert matmuls on the CPU (%.1f of them waiting for reads,"
                             " the rest reading %.1f GB/s of expert weights) + %.1f between the layers (GPU, transfers) + %.1f before the first"
                             " and after the last MoE layer (incl. sampling)\n",
-                            1e3*total, 1e3*cpu, 1e3*waited, prof_bytes/nb/compute/1e9, 1e3*between, 1e3*(total - cpu - between));
-                    prof_total = prof_cpu = prof_between = prof_bytes = 0.0;
-                    prof_n_total = 0;
+                            1e3*total, 1e3*cpu, 1e3*waited, prof_bytes/nb/compute/1e9, 1e3*between, 1e3*outside);
+                    prof_graph_w0 -= prof_cpu + prof_between; // keeps the work of the current graph
+                    prof_outside = prof_cpu = prof_between = prof_bytes = 0.0;
+                    prof_n_outside = 0;
                 }
 
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
