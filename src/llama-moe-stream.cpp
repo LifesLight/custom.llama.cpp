@@ -70,6 +70,10 @@ struct llama_moe_stream::impl {
         int    fd_direct   = -1; // O_DIRECT, -1 if not supported by the file system
         int    fd_buffered = -1; // fallback and fadvise
         size_t size        = 0;
+
+        // O_DIRECT alignment of the file offsets and lengths, and of the memory (statx STATX_DIOALIGN)
+        size_t dio_off = STREAM_ALIGN;
+        size_t dio_mem = STREAM_ALIGN;
     };
 
     struct tensor {
@@ -325,7 +329,10 @@ struct llama_moe_stream::impl {
     std::vector<uint8_t> zeros = std::vector<uint8_t>(512, 0); // padding of experts that are not read
 
     // stats of the current graph
-    std::atomic<size_t> bytes_read { 0 }; // updated by the IO threads
+    std::atomic<size_t> bytes_read   { 0 }; // updated by the IO threads
+    std::atomic<size_t> bytes_direct { 0 }; // of which read in place into the cache, without a copy
+    size_t rep_read   = 0; // bytes_read and bytes_direct at the last decode report
+    size_t rep_direct = 0;
     size_t bytes_read_start = 0;
     size_t bytes_up_slot    = 0;
     size_t bytes_up_res     = 0;
@@ -478,6 +485,8 @@ struct llama_moe_stream::impl {
         if (!alloc_staging() || !alloc_cache() || !fill_cache()) {
             return;
         }
+        rep_read   = bytes_read;
+        rep_direct = bytes_direct;
 
         check_offload();
 
@@ -563,6 +572,21 @@ struct llama_moe_stream::impl {
         f.fd_direct = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (f.fd_direct < 0) {
             LLAMA_LOG_WARN("moe_stream: O_DIRECT is not supported for %s (%s), using buffered reads\n", path.c_str(), strerror(errno));
+        }
+#ifdef STATX_DIOALIGN
+        // the real alignment requirements: usually much less than a page for the memory (4 bytes on NVMe), so that
+        // the experts can be read in place into the cache, without a copy through a bounce buffer
+        if (f.fd_direct >= 0) {
+            struct statx stx;
+            if (statx(f.fd_direct, "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) == 0 && (stx.stx_mask & STATX_DIOALIGN) &&
+                    stx.stx_dio_offset_align > 0 && stx.stx_dio_offset_align <= STREAM_ALIGN && stx.stx_dio_mem_align <= STREAM_ALIGN) {
+                f.dio_off = stx.stx_dio_offset_align;
+                f.dio_mem = std::max<size_t>(1, stx.stx_dio_mem_align);
+            }
+        }
+#endif
+        if (f.fd_direct >= 0) {
+            LLAMA_LOG_INFO("moe_stream: %s: O_DIRECT alignment %zu bytes (file), %zu bytes (memory)\n", path.c_str(), f.dio_off, f.dio_mem);
         }
         struct stat st;
         if (fstat(f.fd_buffered, &st) == 0) {
@@ -1159,7 +1183,8 @@ struct llama_moe_stream::impl {
         const int n_loaded = load_state(saved, has_saved);
 
         const double t_start = t_now();
-        const size_t read_start = bytes_read;
+        const size_t read_start   = bytes_read;
+        const size_t direct_start = bytes_direct;
 
         wait_group wg;
         std::vector<int64_t> want;
@@ -1217,8 +1242,8 @@ struct llama_moe_stream::impl {
 
         const double t    = std::max(t_now() - t_start, 1e-6);
         const size_t read = bytes_read - read_start;
-        LLAMA_LOG_INFO("moe_stream: cache: filled %.2f GiB in %.1f s (%.2f GiB/s), %s\n",
-                read/GiB, t, read/GiB/t, n_loaded > 0 ? ("experts of " + std::to_string(n_loaded) + " layers from " + state_path).c_str() : "first experts");
+        LLAMA_LOG_INFO("moe_stream: cache: filled %.2f GiB in %.1f s (%.2f GiB/s, %.0f%% in place), %s\n",
+                read/GiB, t, read/GiB/t, 100.0*(bytes_direct - direct_start)/std::max<size_t>(read, 1), n_loaded > 0 ? ("experts of " + std::to_string(n_loaded) + " layers from " + state_path).c_str() : "first experts");
 
         return true;
     }
@@ -1849,18 +1874,27 @@ struct llama_moe_stream::impl {
     //
 
     // read any range of a file into any buffer, through the bounce buffers of the IO threads
+    // the reads are split at aligned file offsets, so that only the first and the last read of the range have an
+    // unaligned end (see read_job)
     void submit_bounce(int fi, size_t offs, size_t len, uint8_t * dst, wait_group & wg) {
+        const size_t a   = files[fi].dio_off;
+        const size_t end = offs + len;
         std::lock_guard<std::mutex> lk(mtx);
-        for (size_t o = 0; o < len; o += BOUNCE_CHUNK) {
+        for (size_t o = offs; o < end; ) {
+            size_t e = std::min(end, o + BOUNCE_CHUNK);
+            if (e < end && align_down(e, a) > o) {
+                e = align_down(e, a);
+            }
             job j;
             j.file    = fi;
-            j.offs    = offs + o;
-            j.len     = std::min(BOUNCE_CHUNK, len - o);
-            j.dst     = dst + o;
+            j.offs    = o;
+            j.len     = e - o;
+            j.dst     = dst + (o - offs);
             j.wg      = &wg;
             j.aligned = false;
             jobs.push_back(j);
             wg.pending++;
+            o = e;
         }
         cv_jobs.notify_all();
     }
@@ -1903,17 +1937,52 @@ struct llama_moe_stream::impl {
             if (j.aligned) {
                 r = pread_full(f.fd_direct, j.dst, j.len, j.offs);
                 if (r >= 0 && (size_t) r >= need) {
-                    bytes_read += need;
+                    bytes_read   += need;
+                    bytes_direct += need;
                     return true;
                 }
             } else {
-                const size_t a0 = align_down(j.offs, STREAM_ALIGN);
-                const size_t a1 = align_up(j.offs + j.len, STREAM_ALIGN);
-                r = pread_full(f.fd_direct, bounce, a1 - a0, a0);
-                if (r >= 0 && a0 + (size_t) r >= j.offs + need) {
-                    memcpy(j.dst, bounce + (j.offs - a0), need);
-                    bytes_read += need;
-                    return true;
+                // the aligned middle of the range is read in place, the blocks at its ends through the bounce buffer
+                const size_t a   = f.dio_off;
+                const size_t end = j.offs + need;
+                const size_t i0  = align_up  (j.offs, a);
+                const size_t i1  = align_down(end,    a);
+                uint8_t *    d0  = j.dst + (i0 - j.offs);
+                if (i1 > i0 && (uintptr_t) d0 % f.dio_mem == 0) {
+                    r = 0;
+                    bool ok = true;
+                    if (i0 > j.offs) {
+                        r  = pread_full(f.fd_direct, bounce, a, i0 - a);
+                        ok = r == (ssize_t) a;
+                        if (ok) {
+                            memcpy(j.dst, bounce + (j.offs - (i0 - a)), i0 - j.offs);
+                        }
+                    }
+                    if (ok) {
+                        r  = pread_full(f.fd_direct, d0, i1 - i0, i0);
+                        ok = r == (ssize_t) (i1 - i0);
+                    }
+                    if (ok && end > i1) {
+                        r  = pread_full(f.fd_direct, bounce, a, i1);
+                        ok = r >= (ssize_t) (end - i1);
+                        if (ok) {
+                            memcpy(d0 + (i1 - i0), bounce, end - i1);
+                        }
+                    }
+                    if (ok) {
+                        bytes_read   += need;
+                        bytes_direct += i1 - i0;
+                        return true;
+                    }
+                } else {
+                    const size_t a0 = align_down(j.offs, a);
+                    const size_t a1 = align_up(end, a);
+                    r = pread_full(f.fd_direct, bounce, a1 - a0, a0);
+                    if (r >= 0 && a0 + (size_t) r >= end) {
+                        memcpy(j.dst, bounce + (j.offs - a0), need);
+                        bytes_read += need;
+                        return true;
+                    }
                 }
             }
             if (r < 0 && errno != EINVAL) {
@@ -2656,9 +2725,14 @@ struct llama_moe_stream::impl {
                         spread = ", layers at " + std::to_string(lo) + "-" + std::to_string(hi) + "% of their share";
                     }
                 }
-                LLAMA_LOG_INFO("moe_stream: decode: %" PRId64 " tokens, %.1f%% hits, %.2f misses/token, read %.2f GiB, %s %.1f s, cache policy %.2f ms/token%s\n",
+                const size_t rd = bytes_read   - rep_read;
+                const size_t dr = bytes_direct - rep_direct;
+                rep_read   = bytes_read;
+                rep_direct = bytes_direct;
+                LLAMA_LOG_INFO("moe_stream: decode: %" PRId64 " tokens, %.1f%% hits, %.2f misses/token, read %.2f GiB (%.0f%% in place), %s %.1f s, cache policy %.2f ms/token%s\n",
                         cpu_tokens, 100.0*cpu_hits/cpu_access, (double) (cpu_access - cpu_hits)/std::max<int64_t>(cpu_tokens, 1),
-                        cpu_bytes/GiB, overlap_mode ? "waited" : "read time", cpu_t_read, 1e3*cpu_t_policy/std::max<int64_t>(cpu_tokens, 1), spread.c_str());
+                        cpu_bytes/GiB, 100.0*dr/std::max<size_t>(rd, 1), overlap_mode ? "waited" : "read time", cpu_t_read,
+                        1e3*cpu_t_policy/std::max<int64_t>(cpu_tokens, 1), spread.c_str());
 
                 cpu_pred_used[0] = cpu_pred_used[1] = 0;
                 cpu_pred_evicted[0] = cpu_pred_evicted[1] = 0;
