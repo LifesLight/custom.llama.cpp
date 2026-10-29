@@ -284,6 +284,10 @@ struct llama_moe_stream::impl {
     double  prof_between = 0.0;  // from the end of the expert matmuls of a layer to the slots op of the next one
     double  prof_bytes   = 0.0;  // bytes of the experts computed
 
+    // with overlap_mode: compute the down projection of the cached experts before the wait too
+    // (LLAMA_MOE_STREAM_OVERLAP_DOWN=1, default off)
+    bool overlap_down_mode = false;
+
     // the layers with the same experts layout share their cache slots, keeping at least that fraction of their
     // uniform share each (--moe-stream-pool), < 0 = per-layer caches
     double pool_min = -1.0;
@@ -510,6 +514,9 @@ struct llama_moe_stream::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH_NORM")) {
             pf_norm = atoi(env) != 0;
+        }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_OVERLAP_DOWN")) {
+            overlap_down_mode = atoi(env) != 0;
         }
         if (const char * env = getenv("LLAMA_MOE_STREAM_ALLOC_MIN")) {
             alloc_min = std::clamp(atof(env), 0.0, 1.0);
@@ -1364,7 +1371,7 @@ struct llama_moe_stream::impl {
             lim = std::min(lim, cpu_limit(l));
         }
         LLAMA_LOG_INFO("moe_stream: batches of up to %" PRId64 " tokens on the CPU from the cache%s, larger ones on %s\n",
-                lim, overlap_mode ? " (reads overlapped)" : "", ggml_backend_name(target_backend));
+                lim, overlap_mode ? (overlap_down_mode ? " (reads overlapped with gate, up and down)" : " (reads overlapped with gate and up)") : "", ggml_backend_name(target_backend));
         if (lim < cpu_max) {
             LLAMA_LOG_WARN("moe_stream: without overflow windows, batches on the CPU are limited to %" PRId64 " tokens\n", lim);
         }
@@ -3600,6 +3607,10 @@ ggml_tensor * llama_moe_stream::build_prefetch(ggml_context * ctx, ggml_tensor *
     GGML_UNUSED(il);
     return nullptr;
 #endif
+}
+
+bool llama_moe_stream::overlap_down() const {
+    return pimpl->is_active && pimpl->overlap_mode && pimpl->overlap_down_mode;
 }
 
 bool llama_moe_stream::cpu_path(int il, int64_t n_tokens) const {
