@@ -2427,8 +2427,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // slots), so that it is computed with it
     ggml_tensor * pf_ids = nullptr;
     llama_moe_stream_prefetch pf;
-    if (moe_stream != nullptr && moe_cache == nullptr && moe_stream->prefetch_info(il, n_tokens, pf)) {
-        ggml_tensor * x = cur; // [n_embd, n_tokens]
+    // the input of the router: cur, unless the experts run in a latent space (Muse Spark, Nemotron-H, ...) and the
+    // router logits were computed from the full stream by the caller, which then is the src of the logits
+    ggml_tensor * pf_inp = cur;
+    if (probs_in != nullptr && probs_in->op == GGML_OP_MUL_MAT && probs_in->src[0] == gate_inp &&
+            (!hdmd || hdmd->rot.find(gate_inp) == hdmd->rot.end())) { // a Hadamard-folded router reads a rotated input
+        pf_inp = probs_in->src[1];
+    }
+    if (moe_stream != nullptr && moe_cache == nullptr && moe_stream->prefetch_info(il, n_tokens, pf) &&
+            pf_inp->ne[0] == pf.gate_inp->ne[0] && ggml_nrows(pf_inp) == n_tokens &&
+            (pf.norm == nullptr || ggml_nelements(pf.norm) == pf_inp->ne[0])) {
+        ggml_tensor * x = pf_inp; // [n_embd, n_tokens]
         if (pf.norm) {
             x = ggml_mul(ctx0, x, pf.norm);
         }
