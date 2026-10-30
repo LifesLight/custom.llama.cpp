@@ -124,6 +124,11 @@ struct ggml_dyn_tallocr {
     struct tallocr_chunk * chunks[GGML_VBUFFER_MAX_CHUNKS];
     int n_chunks;
 
+    // tensors of at least big_min bytes (e.g. op-offloaded weight copies) get a chunk of their own, so that the small
+    // tensors of a freshly planned graph cannot fragment the space they reuse (0 = disabled, GGML_ALLOC_BIG_MIB)
+    size_t big_min;
+    int    big_chunk; // -1 until the first big tensor
+
 #ifdef GGML_ALLOCATOR_DEBUG
     struct {
         const struct ggml_tensor * tensor;
@@ -208,8 +213,18 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     int best_fit_block = -1;
     size_t max_avail = 0;
 
+    // big tensors only go to the big chunk, the others never do
+    const bool is_big = alloc->big_min > 0 && size >= alloc->big_min;
+    if (is_big && alloc->big_chunk < 0) {
+        alloc->big_chunk = ggml_dyn_tallocr_new_chunk(alloc, size);
+    }
+    #define GGML_DYN_SKIP_CHUNK(c) (alloc->big_chunk >= 0 && (is_big ? (c) != alloc->big_chunk : (c) == alloc->big_chunk))
+
     // find the best fitting free block besides the last block, within any chunk
     for (int c = 0; c < alloc->n_chunks; ++c) {
+        if (GGML_DYN_SKIP_CHUNK(c)) {
+            continue;
+        }
         struct tallocr_chunk * chunk = alloc->chunks[c];
         size_t best_fit_size = SIZE_MAX;
         for (int i = 0; i < chunk->n_free_blocks - 1; i++) {
@@ -227,6 +242,9 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
         // no suitable block found, try the last block (this may grow a chunks size)
         int64_t best_reuse = INT64_MIN;
         for (int c = 0; c < alloc->n_chunks; ++c) {
+            if (GGML_DYN_SKIP_CHUNK(c)) {
+                continue;
+            }
             struct tallocr_chunk * chunk = alloc->chunks[c];
             if (chunk->n_free_blocks > 0) {
                 struct free_block * block = &chunk->free_blocks[chunk->n_free_blocks - 1];
@@ -246,8 +264,11 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
         }
     }
 
+    #undef GGML_DYN_SKIP_CHUNK
+
     if (best_fit_block == -1) {
         // none of the existing chunks have enough space left
+        // (the big chunk is created with a virtually unlimited last block, so a big tensor never gets here)
         best_fit_chunk = ggml_dyn_tallocr_new_chunk(alloc, size);
         best_fit_block = 0;
     }
@@ -350,6 +371,7 @@ static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct 
 }
 
 static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
+    alloc->big_chunk = -1;
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; i++) {
         free(alloc->chunks[i]);
         alloc->chunks[i] = NULL;
@@ -371,10 +393,19 @@ static struct ggml_dyn_tallocr * ggml_dyn_tallocr_new(size_t alignment, size_t m
         /*.max_chunk_size = */ MIN(max_buffer_size, SIZE_MAX/2), // clamp to avoid overflows
         /*.chunks         = */ {NULL},
         /*.n_chunks       = */ 0,
+        /*.big_min        = */ 0,
+        /*.big_chunk      = */ -1,
 #ifdef GGML_ALLOCATOR_DEBUG
         /*.allocated_tensors = */ {{0}},
 #endif
     };
+
+    {
+        // default 1 GiB; GGML_ALLOC_BIG_MIB=0 disables the separate chunk
+        const char * e = getenv("GGML_ALLOC_BIG_MIB");
+        const long long mib = e ? atoll(e) : 1024;
+        alloc->big_min = mib > 0 ? (size_t) mib*1024*1024 : 0;
+    }
 
     ggml_dyn_tallocr_reset(alloc);
 
