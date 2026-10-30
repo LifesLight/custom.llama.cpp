@@ -2010,6 +2010,10 @@ struct clip_model_loader {
                         hparams.wa_pattern_mode.assign(pat.begin(), pat.end());
                         get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
                         get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                        // custom CLI values (--image-min/max-tokens) take precedence over the GGUF limits
+                        hparams.set_limit_image_tokens();
+                        // a custom max below the model's min would make the resize impossible
+                        hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_STEP3VL:
