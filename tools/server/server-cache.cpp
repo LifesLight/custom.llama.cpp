@@ -226,6 +226,15 @@ void cache_touch(const fs::path & entry) {
     fs::last_write_time(entry / "meta.json", fs::file_time_type::clock::now());
 }
 
+// A single-sequence state save leaves out the SWA-masked cells (llama_kv_cache::state_write), so a restored
+// state starts n_swa positions before its last one, not at the pos_min the live slot had when it was saved.
+llama_pos cache_restored_pos_min(const server_prompt & prompt, llama_pos pos_min, int32_t n_swa) {
+    if (n_swa <= 0 || pos_min < 0) {
+        return pos_min;
+    }
+    return std::max(pos_min, prompt.tokens.pos_next() - n_swa);
+}
+
 server_prompt cache_read_prompt(const fs::path & entry, const json & meta, size_t n_ctx, bool has_mtmd, size_t n_checkpoints) {
     const auto n_tokens = meta.at("n_tokens").get<uint64_t>();
     const fs::path path = entry / "prompt.bin";
@@ -574,7 +583,7 @@ bool server_disk_cache::save(const std::string & cache_key, const server_prompt 
                     }
                     const auto previous = cache_read_prompt(older, meta, prompt.tokens.size(), prompt.tokens.has_mtmd, 0);
                     if (prompt.tokens.get_common_prefix(previous.tokens) != previous.tokens.size() ||
-                            server_cache_reusable(prompt, previous.tokens, pos_min, n_swa) + 1 < previous.tokens.size()) {
+                            server_cache_reusable(prompt, previous.tokens, cache_restored_pos_min(prompt, pos_min, n_swa), n_swa) + 1 < previous.tokens.size()) {
                         continue;
                     }
                     cache_lock older_lock(older / ".lock", false);
@@ -642,7 +651,8 @@ bool server_disk_cache::load(const std::string & cache_key, const server_tokens 
                         continue;
                     }
                     const auto prompt = cache_read_prompt(entry, meta, n_ctx, has_mtmd, n_checkpoints);
-                    const size_t reuse = server_cache_reusable(prompt, input, meta.at("pos_min").get<llama_pos>(), n_swa);
+                    const size_t reuse = server_cache_reusable(prompt, input,
+                        cache_restored_pos_min(prompt, meta.at("pos_min").get<llama_pos>(), n_swa), n_swa);
                     if (reuse > n_reusable && reuse >= min_reuse) {
                         best = entry;
                         n_reusable = reuse;
