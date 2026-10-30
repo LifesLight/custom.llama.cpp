@@ -78,6 +78,14 @@ public:
     // the cache, the router of the next layer, false if its experts are not prefetched
     bool prefetch_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const;
 
+    // prefill forecast (LLAMA_MOE_STREAM_FORECAST=1): for a batch of n_tokens of layer il computed on the GPU, the
+    // router of the next layer (to apply to the router input of layer il), false if the next layer is not forecast
+    bool forecast_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const;
+
+    // the op (on the CPU) that gives the forecast ids (top-k of the router of the next layer) to the stream, which
+    // reads ahead the predicted experts of the next layer first
+    ggml_tensor * build_forecast(ggml_context * ctx, ggml_tensor * ids, int il) const;
+
     // the op that reads the experts predicted by ids (top-k of the router of the next layer) into the cache, computed
     // after `after` (the slots of layer il) so that the reads of layer il go first
     ggml_tensor * build_prefetch(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * after, int il) const;

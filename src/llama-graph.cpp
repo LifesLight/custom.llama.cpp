@@ -2425,6 +2425,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // cross-layer prefetch: the router of the next layer applied to the input of this one predicts the experts of
     // the next layer, which the MoE stream starts reading while this layer is computed. with the router (before the
     // slots), so that it is computed with it
+    // for the batches computed on the GPU (prefill), the same prediction is a forecast that orders the reads ahead
     ggml_tensor * pf_ids = nullptr;
     llama_moe_stream_prefetch pf;
     // the input of the router: cur, unless the experts run in a latent space (Muse Spark, Nemotron-H, ...) and the
@@ -2434,9 +2435,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             (!hdmd || hdmd->rot.find(gate_inp) == hdmd->rot.end())) { // a Hadamard-folded router reads a rotated input
         pf_inp = probs_in->src[1];
     }
-    if (moe_stream != nullptr && moe_cache == nullptr && moe_stream->prefetch_info(il, n_tokens, pf) &&
-            pf_inp->ne[0] == pf.gate_inp->ne[0] && ggml_nrows(pf_inp) == n_tokens &&
-            (pf.norm == nullptr || ggml_nelements(pf.norm) == pf_inp->ne[0])) {
+    bool pf_cpu = false;
+    bool pf_gpu = false;
+    if (moe_stream != nullptr && moe_cache == nullptr) {
+        pf_cpu = moe_stream->prefetch_info(il, n_tokens, pf);
+        pf_gpu = !pf_cpu && moe_stream->forecast_info(il, n_tokens, pf);
+        if ((pf_cpu || pf_gpu) && !(pf_inp->ne[0] == pf.gate_inp->ne[0] && ggml_nrows(pf_inp) == n_tokens &&
+                (pf.norm == nullptr || ggml_nelements(pf.norm) == pf_inp->ne[0]))) {
+            pf_cpu = pf_gpu = false;
+        }
+    }
+    if (pf_cpu || pf_gpu) {
         ggml_tensor * x = pf_inp; // [n_embd, n_tokens]
         if (pf.norm) {
             x = ggml_mul(ctx0, x, pf.norm);
@@ -2458,6 +2467,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         pf_ids = ggml_argsort_top_k(ctx0, pf_probs, pf.k); // [k, n_tokens]
         cb(pf_ids, "ffn_moe_prefetch_topk", il);
         ggml_build_forward_expand(gf, pf_ids);
+
+        if (pf_gpu) {
+            if (ggml_tensor * op = moe_stream->build_forecast(ctx0, pf_ids, il)) {
+                ggml_backend_sched_set_tensor_backend(sched, op, backend_cpu);
+                cb(op, "ffn_moe_forecast", il);
+                ggml_build_forward_expand(gf, op);
+            }
+            pf_ids = nullptr;
+        }
     }
 
     // the experts of host-resident layers may be read from the MoE cache

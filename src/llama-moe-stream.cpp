@@ -137,6 +137,11 @@ struct llama_moe_stream::impl {
         std::vector<int32_t> pf_slots;
         std::vector<int32_t> pf_pred;
 
+        // prefill forecast: how many tokens of the batch the router of this layer is predicted to send to each
+        // expert (the router of this layer applied to the input of the previous one), valid when fc_gen == graph_gen
+        std::vector<int32_t> fc_counts;
+        uint32_t             fc_gen = 0;
+
         bool streamed() const { return n_uniform < n_expert; }
     };
 
@@ -358,6 +363,9 @@ struct llama_moe_stream::impl {
     // computed, the K experts the router of the next layer selects for its input (with the norm weights of the next
     // layer, LLAMA_MOE_STREAM_PREFETCH_NORM) are read into the cache, at a lower priority than the reads needed now
     int  pf_k            = 0;
+    // prefill forecast (LLAMA_MOE_STREAM_FORECAST=1): for the batches computed on the GPU, the experts of the next
+    // layer that its router is predicted to select are read ahead first, instead of the most used ones
+    bool fc_on           = false;
     int  pf_max_inflight = 1; // prefetch reads in progress at most (LLAMA_MOE_STREAM_PREFETCH_INFLIGHT)
     bool pf_norm         = true;
 
@@ -420,6 +428,9 @@ struct llama_moe_stream::impl {
     int64_t pf_done  = 0; // of which the reads were done when the router selected them
     int64_t pf_queue = 0; // of which the reads were queued or in progress
     size_t  bytes_vain = 0; // read ahead for experts that the router did not select (guarded by mtx)
+    int64_t fc_sel   = 0; // forecast: selected experts that were not cached, of the layers with a forecast
+    int64_t fc_pred  = 0; // predicted experts that were not cached
+    int64_t fc_tp    = 0; // both
 
     // stats of the batches computed on the CPU, since the last report
     int64_t cpu_tokens  = 0;
@@ -447,6 +458,7 @@ struct llama_moe_stream::impl {
         int64_t cpu_pred_used[2] = { 0, 0 }, cpu_pred_evicted[2] = { 0, 0 };
         int64_t gpu_graphs = 0, gpu_tokens = 0, gpu_misses = 0, gpu_wasted = 0;
         int64_t gpu_pf_need = 0, gpu_pf_done = 0, gpu_pf_queue = 0;
+        int64_t gpu_fc_sel = 0, gpu_fc_pred = 0, gpu_fc_tp = 0;
         size_t  gpu_read = 0, gpu_up_slot = 0, gpu_up_res = 0, gpu_vain = 0;
         double  gpu_time = 0.0, gpu_stalled = 0.0;
     };
@@ -516,6 +528,9 @@ struct llama_moe_stream::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH_NORM")) {
             pf_norm = atoi(env) != 0;
+        }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_FORECAST")) {
+            fc_on = atoi(env) != 0;
         }
         if (const char * env = getenv("LLAMA_MOE_STREAM_OVERLAP_DOWN")) {
             overlap_down_mode = atoi(env) != 0;
@@ -1531,13 +1546,23 @@ struct llama_moe_stream::impl {
         }
     }
 
-    // the order in which the experts of a layer that are not cached are read: most used first
+    // the order in which the experts of a layer that are not cached are read: most used first, or with a forecast
+    // of this batch, the most predicted first, then the others most used first
     void ranked(const layer & l, std::vector<int32_t> & out) const {
         out.clear();
         for (int64_t e = 0; e < l.n_expert; ++e) {
             if (l.slot_of[e] < 0) {
                 out.push_back((int32_t) e);
             }
+        }
+        if (l.fc_gen == graph_gen && (int64_t) l.fc_counts.size() == l.n_expert) {
+            std::stable_sort(out.begin(), out.end(), [&](int32_t a, int32_t b) {
+                if (l.fc_counts[a] != l.fc_counts[b]) {
+                    return l.fc_counts[a] > l.fc_counts[b];
+                }
+                return l.score[a] > l.score[b];
+            });
+            return;
         }
         std::stable_sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
     }
@@ -1656,12 +1681,11 @@ struct llama_moe_stream::impl {
     // the routers of the next layers, and the ratios of the norm weights that turn the input of the router of a
     // layer into an estimate of the input of the next one
     void setup_prefetch(const llama_model & model, int n_threads) {
-        if (pf_k <= 0) {
-            return;
-        }
-        if (memfd < 0) {
+        if (pf_k > 0 && memfd < 0) {
             LLAMA_LOG_WARN("moe_stream: prefetch needs the overflow windows (memfd), disabled\n");
             pf_k = 0;
+        }
+        if (pf_k <= 0 && !fc_on) {
             return;
         }
 
@@ -1759,8 +1783,14 @@ struct llama_moe_stream::impl {
             }
         }
 
-        LLAMA_LOG_INFO("moe_stream: prefetch: the %d most likely experts of the next layer for %d layers (%d with norm correction), up to %d reads in flight\n",
-                pf_k, n_targets, n_ratios, pf_max_inflight);
+        if (pf_k > 0) {
+            LLAMA_LOG_INFO("moe_stream: prefetch: the %d most likely experts of the next layer for %d layers (%d with norm correction), up to %d reads in flight\n",
+                    pf_k, n_targets, n_ratios, pf_max_inflight);
+        }
+        if (fc_on) {
+            LLAMA_LOG_INFO("moe_stream: forecast: the batches on the GPU read ahead the experts that the router of the next layer is predicted to select, for %d layers\n",
+                    n_targets);
+        }
     }
 
     // clear the busy flag of the slots whose reads are done
@@ -2129,6 +2159,94 @@ struct llama_moe_stream::impl {
         }
         auto * c = (op_ctx *) userdata;
         c->self->prefetch(c->li, c->src_li, dst->src[0]);
+    }
+
+    // the forecast of layer li (the next one) for this batch: the experts its router is predicted to select
+    void forecast(int li, const ggml_tensor * ids) {
+        auto & l = layers[li];
+        l.fc_counts.assign(l.n_expert, 0);
+        const int64_t k = ids->ne[0];
+        const int64_t n = ids->ne[1];
+        for (int64_t i1 = 0; i1 < n; ++i1) {
+            for (int64_t i0 = 0; i0 < k; ++i0) {
+                const int32_t e = *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
+                if (e >= 0 && e < l.n_expert) {
+                    l.fc_counts[e]++;
+                }
+            }
+        }
+        l.fc_gen = graph_gen;
+
+        // the staging buffers that already read ahead for this layer: their queued reads follow the forecast now
+        for (size_t s = 0; s < slots.size(); ++s) {
+            if (slots[s].tensor >= 0 && tensors[slots[s].tensor].layer == li && !slots[s].selected) {
+                respec((int) s);
+            }
+        }
+    }
+
+    // reorder the queued speculative reads of a staging buffer by the current ranking of its layer, without
+    // cancelling them (the reads in flight, and the chunks already read, stay as they are)
+    void respec(int s) {
+        auto & sl = slots[s];
+        const auto & l = layers[tensors[sl.tensor].layer];
+        ranked(l, rank);
+        std::vector<int32_t> pos(l.n_expert, (int32_t) rank.size());
+        for (size_t r = 0; r < rank.size(); ++r) {
+            pos[rank[r]] = (int32_t) r;
+        }
+        std::lock_guard<std::mutex> lk(mtx);
+        std::vector<job> mine;
+        for (auto it = spec.begin(); it != spec.end(); ) {
+            if (it->second.slot == s) {
+                mine.push_back(it->second);
+                it = spec.erase(it);
+                continue;
+            }
+            ++it;
+        }
+        for (const auto & j : mine) {
+            spec.emplace(spec_key(pos[j.expert], spec_seq++), j);
+        }
+    }
+
+    static void forecast_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+        GGML_UNUSED(nth);
+        if (ith != 0) {
+            return;
+        }
+        auto * c = (op_ctx *) userdata;
+        c->self->forecast(c->li, dst->src[0]);
+    }
+
+    // for a batch of n tokens of layer il computed on the GPU: the router of the next layer, false if its experts are
+    // not forecast
+    bool forecast_info(int il, int64_t n, llama_moe_stream_prefetch & out) const {
+        if (!fc_on || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+            return false;
+        }
+        const auto & t = pf_targets[layer_of_il[il]];
+        if (t.next_li < 0 || cpu_path(il, n) || cpu_path(layers[t.next_li].il, n) || !layers[t.next_li].streamed()) {
+            return false;
+        }
+        out.gate_inp    = t.gate_inp;
+        out.gate_inp_b  = t.gate_inp_b;
+        out.exp_probs_b = t.exp_probs_b;
+        out.norm        = t.ratio;
+        out.k           = (int) std::min<int64_t>(std::max<int64_t>(n_expert_used, 1), layers[t.next_li].n_expert);
+        return true;
+    }
+
+    ggml_tensor * build_forecast(ggml_context * ctx, ggml_tensor * ids, int il) const {
+        if (!fc_on || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+            return nullptr;
+        }
+        const int li = layer_of_il[il];
+        if (pf_targets[li].next_li < 0) {
+            return nullptr;
+        }
+        ggml_tensor * args[] = { ids };
+        return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, forecast_op, 1, const_cast<op_ctx *>(&pf_op_ctxs[li]));
     }
 
     bool prefetch_info(int il, int64_t n, llama_moe_stream_prefetch & out) const {
@@ -3021,6 +3139,17 @@ struct llama_moe_stream::impl {
 
         // the router selected the experts of this layer: record their usage, once per graph
         if (counts && l.counts_gen != graph_gen) {
+            if (l.fc_gen == graph_gen && (int64_t) l.fc_counts.size() == l.n_expert) {
+                for (int64_t e = 0; e < l.n_expert; ++e) {
+                    if (l.slot_of[e] < 0) {
+                        const bool sel  = (*counts)[e] > 0;
+                        const bool pred = l.fc_counts[e] > 0;
+                        fc_sel  += sel;
+                        fc_pred += pred;
+                        fc_tp   += sel && pred;
+                    }
+                }
+            }
             l.counts_gen = graph_gen;
             l.counts     = *counts;
             const double w = weight();
@@ -3247,6 +3376,9 @@ struct llama_moe_stream::impl {
         pf_need       = 0;
         pf_done       = 0;
         pf_queue      = 0;
+        fc_sel        = 0;
+        fc_pred       = 0;
+        fc_tp         = 0;
         {
             std::lock_guard<std::mutex> lk(mtx);
             bytes_vain = 0;
@@ -3568,6 +3700,9 @@ struct llama_moe_stream::impl {
             a->gpu_misses   += n_misses;
             a->gpu_wasted   += n_wasted;
             a->gpu_vain     += vain;
+            a->gpu_fc_sel   += fc_sel;
+            a->gpu_fc_pred  += fc_pred;
+            a->gpu_fc_tp    += fc_tp;
         }
 
         t_first = -1.0;
@@ -3588,6 +3723,10 @@ struct llama_moe_stream::impl {
                 agg.gpu_tokens, agg.gpu_graphs, t, agg.gpu_tokens/t, agg.gpu_read/GiB, agg.gpu_read/GiB/t, agg.gpu_vain/GiB, agg.gpu_stalled,
                 100.0*agg.gpu_pf_done/std::max<int64_t>(agg.gpu_pf_need, 1), 100.0*agg.gpu_pf_queue/std::max<int64_t>(agg.gpu_pf_need, 1),
                 agg.gpu_misses + agg.gpu_wasted > 0 ? (", " + std::to_string(agg.gpu_misses) + " misses, " + std::to_string(agg.gpu_wasted) + " wasted").c_str() : "");
+        if (agg.gpu_fc_sel > 0 || agg.gpu_fc_pred > 0) {
+            LLAMA_LOG_INFO("moe_stream: prompt: forecast: %.0f%% of the selected experts that were not cached predicted, %.0f%% of the predicted ones selected\n",
+                    100.0*agg.gpu_fc_tp/std::max<int64_t>(agg.gpu_fc_sel, 1), 100.0*agg.gpu_fc_tp/std::max<int64_t>(agg.gpu_fc_pred, 1));
+        }
         agg = totals();
     }
 #endif // __linux__
@@ -3612,6 +3751,28 @@ ggml_tensor * llama_moe_stream::build_profile_mark(ggml_context * ctx, ggml_tens
 #else
     GGML_UNUSED(ctx);
     GGML_UNUSED(cur);
+    GGML_UNUSED(il);
+    return nullptr;
+#endif
+}
+
+bool llama_moe_stream::forecast_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const {
+#ifdef __linux__
+    return pimpl->is_active && pimpl->forecast_info(il, n_tokens, out);
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(n_tokens);
+    GGML_UNUSED(out);
+    return false;
+#endif
+}
+
+ggml_tensor * llama_moe_stream::build_forecast(ggml_context * ctx, ggml_tensor * ids, int il) const {
+#ifdef __linux__
+    return pimpl->is_active ? pimpl->build_forecast(ctx, ids, il) : nullptr;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(ids);
     GGML_UNUSED(il);
     return nullptr;
 #endif
