@@ -2839,8 +2839,30 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     // the experts streamed from disk are always copied by the stream, all of them if the ids are not known
     llama_moe_stream * stream = lctx->moe_stream && lctx->moe_stream->is_streamed(src) ? lctx->moe_stream.get() : nullptr;
 
-    // the ids must be computed before the split starts, so only the first node of the split is considered
-    const ggml_tensor * node = ggml_graph_n_nodes(graph) > 0 ? ggml_graph_node(graph, 0) : nullptr;
+    // the ids must be computed before the split starts, so only the first node of the split is considered. for the
+    // MoE stream, also a later MUL_MAT_ID of the weight whose ids are not computed in the split: an op on another
+    // backend between the router and the experts (the prefill forecast) can start the split with other nodes, such
+    // as the Hadamard rotation of the input of the experts
+    const int n_split_nodes = ggml_graph_n_nodes(graph);
+    const ggml_tensor * node = n_split_nodes > 0 ? ggml_graph_node(graph, 0) : nullptr;
+    if (stream && node && (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst)) {
+        node = nullptr;
+        for (int i = 1; i < n_split_nodes; i++) {
+            const ggml_tensor * n = ggml_graph_node(graph, i);
+            if (n->op != GGML_OP_MUL_MAT_ID || n->src[0] != dst) {
+                continue;
+            }
+            const ggml_tensor * ids  = n->src[2];
+            const ggml_tensor * base = ids->view_src ? ids->view_src : ids;
+            bool inside = false;
+            for (int j = 0; j < i && !inside; j++) {
+                const ggml_tensor * m = ggml_graph_node(graph, j);
+                inside = m == ids || m == base;
+            }
+            node = inside ? nullptr : n;
+            break;
+        }
+    }
     if (!node || node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
         if (stream) {
             stream->copy(backend, src, dst, nullptr);

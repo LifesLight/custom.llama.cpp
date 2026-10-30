@@ -424,6 +424,7 @@ struct llama_moe_stream::impl {
     double t_stalled = 0.0;
     int    n_misses  = 0;
     int    n_wasted  = 0; // tensors in staging buffers reused before they were uploaded
+    int    n_noids   = 0; // tensors copied without the selection of the router: all their experts are read
     int64_t pf_need  = 0; // selected experts that were not cached
     int64_t pf_done  = 0; // of which the reads were done when the router selected them
     int64_t pf_queue = 0; // of which the reads were queued or in progress
@@ -456,7 +457,7 @@ struct llama_moe_stream::impl {
         double  cpu_t_read = 0.0;
         double  cpu_t_policy = 0.0;
         int64_t cpu_pred_used[2] = { 0, 0 }, cpu_pred_evicted[2] = { 0, 0 };
-        int64_t gpu_graphs = 0, gpu_tokens = 0, gpu_misses = 0, gpu_wasted = 0;
+        int64_t gpu_graphs = 0, gpu_tokens = 0, gpu_misses = 0, gpu_wasted = 0, gpu_noids = 0;
         int64_t gpu_pf_need = 0, gpu_pf_done = 0, gpu_pf_queue = 0;
         int64_t gpu_fc_sel = 0, gpu_fc_pred = 0, gpu_fc_tp = 0;
         size_t  gpu_read = 0, gpu_up_slot = 0, gpu_up_res = 0, gpu_vain = 0;
@@ -3197,6 +3198,7 @@ struct llama_moe_stream::impl {
                 }
             } else {
                 speculate(s, true); // all of them
+                n_noids++;
             }
 
             const double t0 = t_now();
@@ -3373,6 +3375,7 @@ struct llama_moe_stream::impl {
         t_stalled     = 0.0;
         n_misses      = 0;
         n_wasted      = 0;
+        n_noids       = 0;
         pf_need       = 0;
         pf_done       = 0;
         pf_queue      = 0;
@@ -3699,6 +3702,7 @@ struct llama_moe_stream::impl {
             a->gpu_pf_queue += pf_queue;
             a->gpu_misses   += n_misses;
             a->gpu_wasted   += n_wasted;
+            a->gpu_noids    += n_noids;
             a->gpu_vain     += vain;
             a->gpu_fc_sel   += fc_sel;
             a->gpu_fc_pred  += fc_pred;
@@ -3723,6 +3727,10 @@ struct llama_moe_stream::impl {
                 agg.gpu_tokens, agg.gpu_graphs, t, agg.gpu_tokens/t, agg.gpu_read/GiB, agg.gpu_read/GiB/t, agg.gpu_vain/GiB, agg.gpu_stalled,
                 100.0*agg.gpu_pf_done/std::max<int64_t>(agg.gpu_pf_need, 1), 100.0*agg.gpu_pf_queue/std::max<int64_t>(agg.gpu_pf_need, 1),
                 agg.gpu_misses + agg.gpu_wasted > 0 ? (", " + std::to_string(agg.gpu_misses) + " misses, " + std::to_string(agg.gpu_wasted) + " wasted").c_str() : "");
+        if (agg.gpu_noids > 0) {
+            LLAMA_LOG_WARN("moe_stream: prompt: %" PRId64 " expert tensors were read without the selection of the router (all their experts that are not cached)\n",
+                    agg.gpu_noids);
+        }
         if (agg.gpu_fc_sel > 0 || agg.gpu_fc_pred > 0) {
             LLAMA_LOG_INFO("moe_stream: prompt: forecast: %.0f%% of the selected experts that were not cached predicted, %.0f%% of the predicted ones selected\n",
                     100.0*agg.gpu_fc_tp/std::max<int64_t>(agg.gpu_fc_sel, 1), 100.0*agg.gpu_fc_tp/std::max<int64_t>(agg.gpu_fc_pred, 1));
