@@ -206,6 +206,7 @@ struct llama_moe_stream::impl {
 
         int    tensor   = -1;    // the tensor held by the staging buffer
         bool   consumed = false; // the tensor was uploaded since it was assigned
+        bool   selected = false; // the router selected the experts of the tensor since it was assigned
         size_t fill     = 0;     // bytes of the buffer that are used
 
         std::vector<size_t>     off;   // [max n_expert] offset of the expert in the buffer
@@ -418,6 +419,7 @@ struct llama_moe_stream::impl {
     int64_t pf_need  = 0; // selected experts that were not cached
     int64_t pf_done  = 0; // of which the reads were done when the router selected them
     int64_t pf_queue = 0; // of which the reads were queued or in progress
+    size_t  bytes_vain = 0; // read ahead for experts that the router did not select (guarded by mtx)
 
     // stats of the batches computed on the CPU, since the last report
     int64_t cpu_tokens  = 0;
@@ -445,7 +447,7 @@ struct llama_moe_stream::impl {
         int64_t cpu_pred_used[2] = { 0, 0 }, cpu_pred_evicted[2] = { 0, 0 };
         int64_t gpu_graphs = 0, gpu_tokens = 0, gpu_misses = 0, gpu_wasted = 0;
         int64_t gpu_pf_need = 0, gpu_pf_done = 0, gpu_pf_queue = 0;
-        size_t  gpu_read = 0, gpu_up_slot = 0, gpu_up_res = 0;
+        size_t  gpu_read = 0, gpu_up_slot = 0, gpu_up_res = 0, gpu_vain = 0;
         double  gpu_time = 0.0, gpu_stalled = 0.0;
     };
     totals tot;  // since the start
@@ -2750,13 +2752,15 @@ struct llama_moe_stream::impl {
     // cancel the queued reads of a staging buffer, of all its experts or only of those that keep[] rejects
     // call with mtx locked
     template <typename F>
-    void cancel_locked(int s, F && drop) {
+    size_t cancel_locked(int s, F && drop) {
         auto & sl = slots[s];
+        size_t dropped = 0;
         std::deque<job> kept;
         for (auto & j : jobs) {
             if (j.slot == s && drop(j.expert)) {
                 j.wg->pending--;
                 sl.state[j.expert] = EXP_CANCELLED;
+                dropped += j.len;
                 continue;
             }
             kept.push_back(j);
@@ -2767,12 +2771,14 @@ struct llama_moe_stream::impl {
             if (j.slot == s && drop(j.expert)) {
                 j.wg->pending--;
                 sl.state[j.expert] = EXP_CANCELLED;
+                dropped += j.len;
                 it = spec.erase(it);
                 continue;
             }
             ++it;
         }
         cv_done.notify_all();
+        return dropped;
     }
 
     // wait until a staging buffer can be overwritten
@@ -2806,6 +2812,7 @@ struct llama_moe_stream::impl {
         }
         sl.tensor   = t;
         sl.consumed = false;
+        sl.selected = false;
         sl.fill     = 0;
         std::fill(sl.off.begin(),   sl.off.end(),   SIZE_MAX);
         std::fill(sl.state.begin(), sl.state.end(), (uint8_t) EXP_NONE);
@@ -2885,7 +2892,21 @@ struct llama_moe_stream::impl {
 
         std::vector<job> head;
         std::lock_guard<std::mutex> lk(mtx);
-        cancel_locked(s, [&](int e) { return counts[e] == 0; });
+        // what was read ahead (or is being read) for the experts that the router did not select
+        size_t placed = 0;
+        if (!sl.selected) {
+            const size_t es = tensors[sl.tensor].expert_size;
+            for (int64_t e = 0; e < l.n_expert; ++e) {
+                if (counts[e] == 0 && sl.state[e] == EXP_PLACED) {
+                    placed += es;
+                }
+            }
+        }
+        const size_t dropped = cancel_locked(s, [&](int e) { return counts[e] == 0; });
+        if (!sl.selected) {
+            bytes_vain += placed > dropped ? placed - dropped : 0;
+            sl.selected = true;
+        }
         // the speculative reads left are of selected experts: they are needed now, most used first
         for (auto it = spec.begin(); it != spec.end(); ) {
             if (it->second.slot == s) {
@@ -3226,6 +3247,10 @@ struct llama_moe_stream::impl {
         pf_need       = 0;
         pf_done       = 0;
         pf_queue      = 0;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            bytes_vain = 0;
+        }
         bytes_up_slot = 0;
         bytes_up_res  = 0;
     }
@@ -3523,6 +3548,11 @@ struct llama_moe_stream::impl {
 
         const double t    = std::max(t_now() - t_first, 1e-6);
         const size_t read = bytes_read - bytes_read_start;
+        size_t vain;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            vain = bytes_vain;
+        }
 
         for (totals * a : { &tot, &agg }) {
             a->gpu_graphs++;
@@ -3537,6 +3567,7 @@ struct llama_moe_stream::impl {
             a->gpu_pf_queue += pf_queue;
             a->gpu_misses   += n_misses;
             a->gpu_wasted   += n_wasted;
+            a->gpu_vain     += vain;
         }
 
         t_first = -1.0;
@@ -3552,9 +3583,9 @@ struct llama_moe_stream::impl {
             return;
         }
         const double t = std::max(agg.gpu_time, 1e-6);
-        LLAMA_LOG_INFO("moe_stream: prompt: %" PRId64 " tokens in %" PRId64 " ubatches, %.1f s (%.1f t/s), read %.2f GiB (%.2f GiB/s), stalled %.1f s,"
+        LLAMA_LOG_INFO("moe_stream: prompt: %" PRId64 " tokens in %" PRId64 " ubatches, %.1f s (%.1f t/s), read %.2f GiB (%.2f GiB/s, %.2f GiB of it for experts not selected), stalled %.1f s,"
                 " read ahead %.0f%% (+%.0f%% in progress)%s\n",
-                agg.gpu_tokens, agg.gpu_graphs, t, agg.gpu_tokens/t, agg.gpu_read/GiB, agg.gpu_read/GiB/t, agg.gpu_stalled,
+                agg.gpu_tokens, agg.gpu_graphs, t, agg.gpu_tokens/t, agg.gpu_read/GiB, agg.gpu_read/GiB/t, agg.gpu_vain/GiB, agg.gpu_stalled,
                 100.0*agg.gpu_pf_done/std::max<int64_t>(agg.gpu_pf_need, 1), 100.0*agg.gpu_pf_queue/std::max<int64_t>(agg.gpu_pf_need, 1),
                 agg.gpu_misses + agg.gpu_wasted > 0 ? (", " + std::to_string(agg.gpu_misses) + " misses, " + std::to_string(agg.gpu_wasted) + " wasted").c_str() : "");
         agg = totals();
