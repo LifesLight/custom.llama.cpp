@@ -109,7 +109,10 @@ struct llama_moe_stream::impl {
         // replacement policy
         std::vector<uint64_t> stamp;    // [n_expert] last use
         std::vector<uint8_t>  prot;     // [n_expert] in the protected segment (slru)
-        std::vector<double>   score;    // [n_expert] usage, decayed
+        std::vector<double>   score;    // [n_expert] usage by the batches computed on the CPU (generation), decayed
+                                        // by their tokens: the eviction order of lfu
+        std::vector<double>   rscore;   // [n_expert] usage by all the batches (with the prompts), decayed by all
+                                        // the tokens: the order of the reads ahead
 
         std::vector<uint32_t> mark;     // [n_expert] selected by the current batch
         uint32_t              mark_gen = 0;
@@ -355,9 +358,12 @@ struct llama_moe_stream::impl {
     uint32_t graph_gen     = 0;
     uint64_t clock         = 0;
 
-    // usage scores: an expert selected by a token gets 2^(tclock/halflife - sbase)
+    // usage scores: an expert selected by a token gets 2^(tclock/halflife - sbase) in rscore, 2^(gclock/halflife - gbase)
+    // in score (only generation)
     double tclock = 0.0;
     double sbase  = 0.0;
+    double gclock = 0.0;
+    double gbase  = 0.0;
 
     // cross-layer prefetch (LLAMA_MOE_STREAM_PREFETCH=K): while a layer computed on the CPU from the cache is
     // computed, the K experts the router of the next layer selects for its input (with the norm weights of the next
@@ -982,6 +988,7 @@ struct llama_moe_stream::impl {
             l.stamp    .assign(l.n_expert, 0);
             l.prot     .assign(l.n_expert, 0);
             l.score    .assign(l.n_expert, 0.0);
+            l.rscore   .assign(l.n_expert, 0.0);
             l.mark     .assign(l.n_expert, 0);
             l.counts   .assign(l.n_expert, 0);
             l.evicted_at.assign(l.n_expert, 0);
@@ -1413,9 +1420,14 @@ struct llama_moe_stream::impl {
         }
 
         std::string line;
-        if (!std::getline(in, line) || (line != "moe-stream-state 1" && line != "moe-stream-state 2")) {
+        if (!std::getline(in, line) || (line != "moe-stream-state 1" && line != "moe-stream-state 2" && line != "moe-stream-state 3")) {
             LLAMA_LOG_WARN("moe_stream: %s is not a state file, ignored\n", state_path.c_str());
             return 0;
+        }
+        // before version 3 the scores also counted the prompts: only the cached experts are kept
+        const bool gen_scores = line == "moe-stream-state 3";
+        if (!gen_scores) {
+            LLAMA_LOG_INFO("moe_stream: %s is from an older version, its usage scores are not restored\n", state_path.c_str());
         }
 
         int n_loaded = 0;
@@ -1423,6 +1435,9 @@ struct llama_moe_stream::impl {
             std::istringstream ss(line);
             if (line.rfind("s ", 0) == 0) {
                 // scores
+                if (!gen_scores) {
+                    continue;
+                }
                 std::string tag;
                 int il = -1;
                 int64_t n_expert = 0;
@@ -1469,6 +1484,11 @@ struct llama_moe_stream::impl {
         }
         clock = 1ull << 20;
 
+        // the reads ahead start from the same usage (both clocks are at 0)
+        for (auto & l : layers) {
+            l.rscore = l.score;
+        }
+
         return n_loaded;
     }
 
@@ -1487,9 +1507,9 @@ struct llama_moe_stream::impl {
                 }
                 return;
             }
-            out << "moe-stream-state 2\n";
+            out << "moe-stream-state 3\n";
             out.precision(6);
-            const double w = weight();
+            const double w = gweight();
             std::vector<int32_t> es;
             for (const auto & l : layers) {
                 es.clear();
@@ -1527,6 +1547,7 @@ struct llama_moe_stream::impl {
     // the weights get large, so they never overflow
     //
 
+    // the weight of a selection in rscore: all the tokens advance its clock
     double weight() const {
         return std::exp2(tclock/halflife - sbase);
     }
@@ -1536,6 +1557,25 @@ struct llama_moe_stream::impl {
         if (tclock/halflife - sbase > SCORE_RESCALE) {
             const double f = std::exp2(-SCORE_RESCALE);
             for (auto & l : layers) {
+                for (auto & v : l.rscore) {
+                    v *= f;
+                }
+            }
+            sbase += SCORE_RESCALE;
+        }
+    }
+
+    // the weight of a selection in score: only the tokens of the batches computed on the CPU (generation) advance its
+    // clock, so that a long prompt does not erase what generation used
+    double gweight() const {
+        return std::exp2(gclock/halflife - gbase);
+    }
+
+    void gadvance(int64_t n) {
+        gclock += (double) n;
+        if (gclock/halflife - gbase > SCORE_RESCALE) {
+            const double f = std::exp2(-SCORE_RESCALE);
+            for (auto & l : layers) {
                 for (auto & v : l.score) {
                     v *= f;
                 }
@@ -1543,7 +1583,7 @@ struct llama_moe_stream::impl {
             for (auto & p : pools) {
                 p.order_valid = false;
             }
-            sbase += SCORE_RESCALE;
+            gbase += SCORE_RESCALE;
         }
     }
 
@@ -1561,11 +1601,11 @@ struct llama_moe_stream::impl {
                 if (l.fc_counts[a] != l.fc_counts[b]) {
                     return l.fc_counts[a] > l.fc_counts[b];
                 }
-                return l.score[a] > l.score[b];
+                return l.rscore[a] > l.rscore[b];
             });
             return;
         }
-        std::stable_sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.score[a] > l.score[b]; });
+        std::stable_sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return l.rscore[a] > l.rscore[b]; });
     }
 
     //
@@ -2352,7 +2392,8 @@ struct llama_moe_stream::impl {
         }
         promote_busy(li);
 
-        const double w = weight();
+        const double w  = gweight(); // the eviction order: generation only
+        const double rw = weight();  // the order of the reads ahead
         missing.clear();
         for (int32_t e : needed) {
             cpu_access++;
@@ -2384,8 +2425,9 @@ struct llama_moe_stream::impl {
                 p.prot.erase({ l.stamp[e], l.slot_of[e] });
                 p.prot.emplace(clock, l.slot_of[e]);
             }
-            l.stamp[e]  = clock;
-            l.score[e] += cnt[e]*w;
+            l.stamp[e]   = clock;
+            l.score[e]  += cnt[e]*w;
+            l.rscore[e] += cnt[e]*rw;
             if (l.slot_of[e] >= 0) {
                 rekey(p, l.slot_of[e]);
             }
@@ -3153,12 +3195,10 @@ struct llama_moe_stream::impl {
             }
             l.counts_gen = graph_gen;
             l.counts     = *counts;
+            // only the order of the reads ahead: the prompts do not change the eviction order of generation
             const double w = weight();
             for (int64_t e = 0; e < l.n_expert; ++e) {
-                l.score[e] += l.counts[e]*w;
-            }
-            if (policy == LLAMA_MOE_STREAM_POLICY_LFU) {
-                pools[l.pool].order_valid = false;
+                l.rscore[e] += l.counts[e]*w;
             }
         }
 
@@ -3580,6 +3620,7 @@ struct llama_moe_stream::impl {
         }
 
         if (graph_cached && !last_streamed) {
+            gadvance(n_tokens);
             cpu_tokens   += n_tokens;
             cpu_batches  += 1;
             state_tokens += n_tokens;
