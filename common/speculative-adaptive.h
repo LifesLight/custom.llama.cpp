@@ -7,15 +7,20 @@
 //    were accepted: binned, decayed, starting from acceptance = confidence and kept non-decreasing in the confidence
 //  - how long a step takes for a draft of L tokens: exponentially weighted least squares T(L) = a + b*L, plus a
 //    per-length correction for what a line does not capture (e.g. the checkpoint replay of drafts longer than n_rs_seq)
-// and drafts the length L that maximizes the expected tokens per second, (1 + P_1 + ... + P_L) / T(L), with P_i the
+// and keeps a draft token while it raises the expected tokens per second, (1 + P_1 + ... + P_L) / T(L), with P_i the
 // probability that the first i draft tokens are all accepted
+//
+// each token is kept or not from what is known before it is drafted: its confidence is the probability the drafter
+// gives to its most likely token (not to the token drafted), and the tokens after it are not looked at. so with
+// probabilistic drafting, whether a token is verified does not depend on the token itself, which keeps the
+// speculative sampling exact (the length is a stopping time of the draft)
 //
 // a step is measured from the start of a draft to the start of the next draft of the same sequence: its time, and from
 // the positions the number of tokens it produced, so the verification, rollbacks and replays are all included
 //
 // until it has measured enough steps (and steps of different lengths), it drafts while the tokens so far are all
-// accepted with at least p_warm (by the acceptance learned so far, the confidence until then) and submits them all;
-// the lengths then vary with the confidences, and only if they do not, some drafts are cut short at random
+// accepted with at least p_warm (by the acceptance learned so far, the confidence until then); the lengths then vary
+// with the confidences, and only if they do not, some drafts are cut short at random
 
 #include <algorithm>
 #include <cmath>
@@ -29,8 +34,7 @@ struct common_spec_adaptive {
     // parameters
     int32_t n_max     = 0;     // longest draft
     double  explore   = 0.05;  // probability of drafting one token more or less than the best length
-    double  p_floor   = 0.1;   // stop drafting when the probability that all the tokens so far are accepted gets lower
-    double  p_warm    = 0.5;   // the same while warming up, the whole draft is submitted
+    double  p_warm    = 0.5;   // warming up: draft while the tokens so far are all accepted with at least this
     int32_t n_warmup  = 32;    // steps measured before the learned rule is used
     double  lambda    = 0.97;  // forgetting of the step times, per step
     double  gamma     = 0.998; // forgetting of the acceptance statistics, per draft token observed
@@ -212,12 +216,34 @@ struct common_spec_adaptive {
         }
     }
 
+    // one draft, decided token by token
+    struct draft_run {
+        double p_all    = 1.0;     // the probability that the tokens kept so far are all accepted
+        double sum      = 0.0;     // the expected number of them that are accepted
+        int    n_keep   = 0;       // the tokens kept by the rule
+        int    cap      = 1 << 30; // the most tokens this draft may have
+    };
+
     // a draft of sequence s starts at position pos0 (of the last sampled token): the previous step ends here
-    void start(int s, int64_t pos0, int64_t t_us) {
+    // the shorter drafts are explored with a cap drawn now, before any token is drafted: "one token less than the
+    // rule keeps" would depend on the tokens (whether a token is the last one depends on the next one's confidence,
+    // which depends on the token)
+    draft_run start(int s, int64_t pos0, int64_t t_us) {
+        draft_run r;
         if (s < 0 || s >= (int) seqs.size()) {
-            return;
+            return r;
         }
+        std::uniform_real_distribution<double> u(0.0, 1.0);
         auto & q = seqs[s];
+        const int L_prev = (int) q.conf.size();
+        if (warm()) {
+            if (u(rng) < explore/2) {
+                r.cap = std::max(0, L_prev - 1); // one less than the last draft
+            }
+        } else if (n_steps >= n_warmup && n_max > 0 && u(rng) < 0.3) {
+            // the warmup steps are done, but the lengths did not vary enough to tell the cost of a token
+            r.cap = std::uniform_int_distribution<int>(0, n_max - 1)(rng);
+        }
         if (q.valid) {
             const int64_t tokens = pos0 - q.pos0;
             const int     L      = (int) q.conf.size();
@@ -243,46 +269,46 @@ struct common_spec_adaptive {
         q.t0    = t_us;
         q.pos0  = pos0;
         q.conf.clear();
+        return r;
     }
 
-    // keep drafting while the first tokens are all accepted with at least p_floor (learned, the length is chosen
-    // afterwards) or p_warm (warming up, the whole draft is submitted)
-    bool more(double p_all) const {
-        return p_all >= (warm() ? p_floor : p_warm);
-    }
+    enum next_t {
+        NEXT_STOP = 0, // do not keep the token, the draft ends before it
+        NEXT_KEEP = 1, // keep the token, continue drafting
+        NEXT_LAST = 2, // keep the token, the draft ends with it
+    };
 
-    // the length to submit, of a draft whose tokens have the confidences conf
-    // warm: the best length, sometimes one more or less. otherwise all of them, and once the warmup steps are done
-    // without the lengths varying enough to tell the cost of a token, sometimes fewer
-    int choose(const std::vector<float> & conf) {
-        const int n = std::min<int>((int) conf.size(), n_max);
-        std::uniform_real_distribution<double> u(0.0, 1.0);
+    // whether to keep the next draft token, of confidence c, which must not depend on the token itself (the
+    // probability of the most likely token, not of the token drafted)
+    next_t next(draft_run & r, double c) {
+        if (r.n_keep >= r.cap) {
+            return NEXT_STOP;
+        }
+        const double a = acc(c);
         if (!warm()) {
-            if (n > 0 && n_steps >= n_warmup && u(rng) < 0.3) {
-                return std::uniform_int_distribution<int>(0, n - 1)(rng);
+            if (r.p_all * a < p_warm) {
+                return NEXT_STOP;
             }
-            return n;
+            r.p_all *= a;
+            r.sum   += r.p_all;
+            r.n_keep++;
+            return NEXT_KEEP;
         }
-        int    best_L = 0;
-        double best   = 1.0 / cost(0);
-        double p_all  = 1.0;
-        double sum    = 0.0;
-        for (int i = 0; i < n; ++i) {
-            p_all *= acc(conf[i]);
-            sum   += p_all;
-            const double v = (1.0 + sum) / cost(i + 1);
-            if (v > best) {
-                best   = v;
-                best_L = i + 1;
-            }
+        // keep it if the expected tokens per second are higher with it
+        const double p       = r.p_all * a;
+        const double with    = (1.0 + r.sum + p) / cost(r.n_keep + 1);
+        const double without = (1.0 + r.sum)     / cost(r.n_keep);
+        if (with > without) {
+            r.p_all = p;
+            r.sum  += p;
+            r.n_keep++;
+            return NEXT_KEEP;
         }
-        const double r = u(rng);
-        if (r < explore/2 && best_L < n) {
-            best_L++;
-        } else if (r < explore && best_L > 0) {
-            best_L--;
+        // sometimes one more, to keep measuring the longer drafts (by chance, not by the token)
+        if (std::uniform_real_distribution<double>(0.0, 1.0)(rng) < explore/2) {
+            return NEXT_LAST;
         }
-        return best_L;
+        return NEXT_STOP;
     }
 
     // the draft of sequence s that is submitted for verification: its first L tokens
