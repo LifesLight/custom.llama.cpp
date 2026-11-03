@@ -13,7 +13,9 @@
 // a step is measured from the start of a draft to the start of the next draft of the same sequence: its time, and from
 // the positions the number of tokens it produced, so the verification, rollbacks and replays are all included
 //
-// until it has measured enough steps (and steps of different lengths), the caller drafts with its usual rule
+// until it has measured enough steps (and steps of different lengths), it drafts while the tokens so far are all
+// accepted with at least p_warm (by the acceptance learned so far, the confidence until then) and submits them all;
+// the lengths then vary with the confidences, and only if they do not, some drafts are cut short at random
 
 #include <algorithm>
 #include <cmath>
@@ -28,6 +30,7 @@ struct common_spec_adaptive {
     int32_t n_max     = 0;     // longest draft
     double  explore   = 0.05;  // probability of drafting one token more or less than the best length
     double  p_floor   = 0.1;   // stop drafting when the probability that all the tokens so far are accepted gets lower
+    double  p_warm    = 0.5;   // the same while warming up, the whole draft is submitted
     int32_t n_warmup  = 32;    // steps measured before the learned rule is used
     double  lambda    = 0.97;  // forgetting of the step times, per step
     double  gamma     = 0.998; // forgetting of the acceptance statistics, per draft token observed
@@ -242,19 +245,20 @@ struct common_spec_adaptive {
         q.conf.clear();
     }
 
-    // with the learned rule: keep drafting while the first tokens are all accepted with at least p_floor
+    // keep drafting while the first tokens are all accepted with at least p_floor (learned, the length is chosen
+    // afterwards) or p_warm (warming up, the whole draft is submitted)
     bool more(double p_all) const {
-        return p_all >= p_floor;
+        return p_all >= (warm() ? p_floor : p_warm);
     }
 
     // the length to submit, of a draft whose tokens have the confidences conf
-    // warm: the best length, sometimes one more or less. otherwise all of them, sometimes fewer, so that the
-    // lengths vary while the step time is learned
+    // warm: the best length, sometimes one more or less. otherwise all of them, and once the warmup steps are done
+    // without the lengths varying enough to tell the cost of a token, sometimes fewer
     int choose(const std::vector<float> & conf) {
         const int n = std::min<int>((int) conf.size(), n_max);
         std::uniform_real_distribution<double> u(0.0, 1.0);
         if (!warm()) {
-            if (n > 0 && u(rng) < 0.3) {
+            if (n > 0 && n_steps >= n_warmup && u(rng) < 0.3) {
                 return std::uniform_int_distribution<int>(0, n - 1)(rng);
             }
             return n;

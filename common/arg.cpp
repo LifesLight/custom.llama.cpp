@@ -4355,7 +4355,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-draft-adaptive"},
         {"--no-spec-draft-adaptive"},
         string_format("draft-mtp / draft-dspark: learn the draft length, up to --spec-draft-n-max, from how often draft tokens\n"
-                      "of each confidence are accepted and how long the steps take; --spec-draft-p-min is used until then (default: %s)",
+                      "of each confidence are accepted and how long the steps take; --spec-draft-p-min is not used (default: %s)",
                       params.speculative.draft.adaptive ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.speculative.draft.adaptive = value;

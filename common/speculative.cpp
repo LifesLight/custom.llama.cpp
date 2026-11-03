@@ -48,8 +48,9 @@ static void spec_adaptive_init(common_spec_adaptive & ad, uint32_t n_seq, int32_
     if (const char * env = getenv("LLAMA_SPEC_ADAPTIVE_LOG")) {
         ad.log_every = std::max(0, atoi(env));
     }
-    LOG_INF("%s: adaptive draft length: up to %d tokens, learned after %d steps (until then --spec-draft-p-min), "
-            "explore %.2f, stop drafting below %.2f\n", name, ad.n_max, ad.n_warmup, ad.explore, ad.p_floor);
+    LOG_INF("%s: adaptive draft length: up to %d tokens, learned after %d steps (until then drafting while all the "
+            "tokens are likely accepted with >= %.2f), explore %.2f, stop drafting below %.2f, --spec-draft-p-min not used\n",
+            name, ad.n_max, ad.n_warmup, ad.p_warm, ad.explore, ad.p_floor);
 }
 
 // the reports of the controller, after the steps that ended at the start of a draft
@@ -1122,7 +1123,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
-            if (!has_conf && this->params.p_min > 0.0f) {
+            if (!has_conf && this->params.p_min > 0.0f && !this->params.adaptive) {
                 throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
             }
         }
@@ -1484,8 +1485,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const bool learned = adaptive && ad.warm();
-                const float * conf = (params.p_min > 0.0f && !learned) || (adaptive && has_conf) ?
+                // with --spec-draft-adaptive, --spec-draft-p-min is not used
+                const float * conf = (!adaptive && params.p_min > 0.0f) || (adaptive && has_conf) ?
                     llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 double p_all = 1.0;
                 // bonus-anchor drafts read the mask positions only, like DFlash
@@ -1493,7 +1494,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (!learned && params.p_min > 0.0f && conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (!adaptive && conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
                         break;
                     }
 
@@ -1512,12 +1513,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (adaptive) {
                         // the confidence head, or without one the probability of the token
                         const float c = conf ? conf[(size_t) idx * n_embd_dec] : cur_p->data[0].p;
-                        if (learned) {
-                            // keep drafting while the tokens so far are likely enough to be all accepted
-                            p_all *= ad.acc(c);
-                            if (!ad.more(p_all)) {
-                                break;
-                            }
+                        // keep drafting while the tokens so far are likely enough to be all accepted
+                        p_all *= ad.acc(c);
+                        if (!ad.more(p_all)) {
+                            break;
                         }
                         ad_conf[seq_id].push_back(c);
                     }
@@ -1970,9 +1969,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 bool stop;
-                if (adaptive && ad.warm()) {
-                    // learned: keep drafting while the tokens so far are likely enough to be all accepted, the
-                    // length is chosen once the draft is done
+                if (adaptive) {
+                    // keep drafting while the tokens so far are likely enough to be all accepted, the length is
+                    // chosen once the draft is done (--spec-draft-p-min is not used)
                     ad_p_all[seq_id] *= ad.acc(conf);
                     stop = !ad.more(ad_p_all[seq_id]);
                 } else {
