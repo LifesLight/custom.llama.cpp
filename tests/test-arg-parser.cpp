@@ -241,6 +241,22 @@ static void test(void) {
 
     printf("test-arg-parser: test valid usage\n\n");
 
+    {
+        common_params disk;
+        argv = {"binary_name", "--cache-disk", "/tmp/kv-pool", "--cache-disk-size", "64G",
+                "--cache-disk-min-loss", "16384", "--cache-disk-min-reuse", "512"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), disk, LLAMA_EXAMPLE_SERVER));
+        assert(disk.cache_disk_path == "/tmp/kv-pool");
+        assert(disk.cache_disk_bytes == (64ull << 30));
+        assert(disk.cache_disk_min_loss == 16384);
+        assert(disk.cache_disk_min_reuse == 512);
+        for (const std::string size : {"0", "-1", "64GB", "1.5G", "18446744073709551615G"}) {
+            argv = {"binary_name", "--cache-disk-size", size};
+            assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), disk, LLAMA_EXAMPLE_SERVER));
+        }
+
+    }
+
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "model_file.gguf");
