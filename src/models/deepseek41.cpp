@@ -288,6 +288,7 @@ public:
 
     std::vector<ggml_tensor *> engram_ids;
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
+    ggml_tensor * router_bias_ids = nullptr;
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
 
@@ -330,6 +331,11 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             keep[i] = is_embd ? 0.0f : 1.0f;
         }
         ggml_backend_tensor_set(engram_keep, keep.data(), 0, keep.size()*sizeof(float));
+    }
+
+    if (router_bias_ids && router_bias_ids->buffer) {
+        std::vector<int32_t> ids(ubatch->type, ubatch->type + ubatch->n_tokens);
+        ggml_backend_tensor_set(router_bias_ids, ids.data(), 0, ggml_nbytes(router_bias_ids));
     }
 
     if (cand_pin && cand_pin->buffer) {
@@ -821,6 +827,13 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
             inp41->cand_pin = cand_pin;
         }
     }
+    ggml_tensor * router_bias_ids = nullptr;
+    if (ubatch.is_mixed()) {
+        router_bias_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(router_bias_ids);
+        ggml_set_name(router_bias_ids, "router_bias_ids");
+        inp41->router_bias_ids = router_bias_ids;
+    }
     res->add_input(std::move(inp41));
 
     const int64_t hc = hparams.dsv4_hc_mult;
@@ -880,9 +893,8 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         ggml_prec_set_acc(logits, GGML_PREC_F32);
         cb(logits, "ffn_moe_logits", il);
 
-        // image (embedding) tokens use the vision router bias, as DeepSeek-V4
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
+        if (!router_bias_ids && ubatch.embd && layer.ffn_exp_probs_b_vl) {
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
@@ -897,7 +909,7 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
                 LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il, logits);
+                il, logits, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1e-5f, router_bias_ids);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
