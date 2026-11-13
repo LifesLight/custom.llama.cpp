@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "speculative-adaptive.h"
 
 #include <algorithm>
 #include <cassert>
@@ -29,6 +30,36 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+// --spec-draft-adaptive: the controller of the draft length, with the LLAMA_SPEC_ADAPTIVE_* overrides
+static void spec_adaptive_init(common_spec_adaptive & ad, uint32_t n_seq, int32_t n_max, const char * name) {
+    ad.init((int32_t) n_seq, n_max);
+    if (const char * env = getenv("LLAMA_SPEC_ADAPTIVE_EXPLORE")) {
+        ad.explore = std::clamp(atof(env), 0.0, 1.0);
+    }
+    if (const char * env = getenv("LLAMA_SPEC_ADAPTIVE_WARM")) {
+        ad.p_warm = std::clamp(atof(env), 0.0, 1.0);
+    }
+    if (const char * env = getenv("LLAMA_SPEC_ADAPTIVE_WARMUP")) {
+        ad.n_warmup = std::max(2, atoi(env));
+    }
+    if (const char * env = getenv("LLAMA_SPEC_ADAPTIVE_LOG")) {
+        ad.log_every = std::max(0, atoi(env));
+    }
+    LOG_INF("%s: adaptive draft length: up to %d tokens, learned after %d steps (until then drafting while all the "
+            "tokens are likely accepted with >= %.2f), explore %.2f, --spec-draft-p-min not used\n",
+            name, ad.n_max, ad.n_warmup, ad.p_warm, ad.explore);
+}
+
+// the reports of the controller, after the steps that ended at the start of a draft
+static void spec_adaptive_report(common_spec_adaptive & ad) {
+    if (ad.just_warmed()) {
+        LOG_INF("spec adaptive: learned the step time and the acceptance, the draft length now follows them\n");
+    }
+    if (ad.should_log()) {
+        LOG_INF("spec %s\n", ad.summary().c_str());
+    }
+}
 
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
@@ -1019,6 +1050,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // dspark speculators
     bool sample_from_anchor = true;
 
+    // dspark: the draft scores each token with its confidence head
+    bool has_conf = false;
+
+    // --spec-draft-adaptive (dspark): the draft length is learned
+    bool                            adaptive = false;
+    common_spec_adaptive            ad;
+    std::vector<std::vector<float>> ad_conf; // [n_seq] the confidences of the tokens drafted
+    std::vector<common_spec_adaptive::draft_run> ad_run; // [n_seq] the decisions of the current draft
+
     // block-internal attention
     bool causal_attn = false;
 
@@ -1080,12 +1120,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        if (is_dspark && this->params.p_min > 0.0f) {
+        if (is_dspark) {
             char buf[16] = {};
-            const bool has_conf =
+            has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
-            if (!has_conf) {
+            if (!has_conf && this->params.p_min > 0.0f && !this->params.adaptive) {
                 throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
             }
         }
@@ -1105,6 +1145,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
+
+        adaptive = is_dspark && this->params.adaptive && this->params.n_max > 0;
+        if (adaptive) {
+            spec_adaptive_init(ad, n_seq, this->params.n_max, "draft-dspark");
+            ad_conf.assign(n_seq, {});
+            ad_run.assign(n_seq, {});
+            if (!has_conf) {
+                LOG_INF("%s: no confidence head, the adaptive draft length uses the draft probabilities\n", __func__);
+            }
+        }
 
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
@@ -1185,6 +1235,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // reseed per request rather than per round, or two identical requests differ
         dflash2_seed[seq_id] = -1;
+
+        if (adaptive) {
+            ad.reset(seq_id);
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1339,6 +1393,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
+            if (adaptive) {
+                ad_run[seq_id] = ad.start(seq_id, dp.pos0, ggml_time_us());
+                ad_conf[seq_id].clear();
+            }
+
             const int32_t n = (int32_t) dp.pos0;
 
             const int32_t n_draft = params.n_max;
@@ -1354,6 +1413,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch.set_embd_state(idx, { lilicorr_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
                 }
             }
+        }
+
+        if (adaptive) {
+            spec_adaptive_report(ad);
         }
 
         if (batch.size() == 0) {
@@ -1461,13 +1524,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // with --spec-draft-adaptive, --spec-draft-p-min is not used
+                const float * conf = (!adaptive && params.p_min > 0.0f) || (adaptive && has_conf) ?
+                    llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (!adaptive && conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
                         break;
                     }
 
@@ -1483,9 +1548,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
+                    // the confidence head, or without one the probability of the most likely token
+                    const float c = adaptive ? (conf ? conf[(size_t) idx * n_embd_dec] : cur_p->data[0].p) : 0.0f;
+                    const auto  next = adaptive ? ad.next(ad_run[seq_id], c) : common_spec_adaptive::NEXT_KEEP;
+                    if (next == common_spec_adaptive::NEXT_STOP) {
+                        break;
+                    }
+                    if (adaptive) {
+                        ad_conf[seq_id].push_back(c);
+                    }
+
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+
+                    if (next == common_spec_adaptive::NEXT_LAST) {
+                        break;
+                    }
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -1514,6 +1593,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
+            }
+
+            if (adaptive) {
+                ad.submitted(seq_id, ad_conf[seq_id], (int) result.size());
             }
         }
     }
@@ -1567,6 +1650,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    dev_rows    = false;
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+
+    // --spec-draft-adaptive: the draft length is learned
+    bool                            adaptive = false;
+    common_spec_adaptive            ad;
+    std::vector<std::vector<float>> ad_conf; // [n_seq] the confidences of the tokens drafted
+    std::vector<common_spec_adaptive::draft_run> ad_run; // [n_seq] the decisions of the current draft
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1634,6 +1723,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        adaptive = this->params.adaptive && this->params.n_max > 0;
+        if (adaptive) {
+            spec_adaptive_init(ad, n_seq, this->params.n_max, "draft-mtp");
+            ad_conf.assign(n_seq, {});
+            ad_run.assign(n_seq, {});
+        }
+
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
@@ -1678,6 +1774,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+
+        if (adaptive) {
+            ad.reset(seq_id);
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1884,6 +1984,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
             }
+
+            if (adaptive) {
+                ad_run[seq_id] = ad.start(seq_id, dp.pos0, ggml_time_us());
+                ad_conf[seq_id].clear();
+            }
+        }
+
+        if (adaptive) {
+            spec_adaptive_report(ad);
         }
 
         int i = 0;
@@ -1937,8 +2046,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                // the confidence of the drafter: the probability of its most likely token, also with sampling, so
+                // that keeping the token does not depend on the token drafted (exact rejection sampling)
+                const float conf = cur_p->data[0].p;
+
+                common_spec_adaptive::next_t next = common_spec_adaptive::NEXT_KEEP;
+                if (adaptive) {
+                    // keep the token while it raises the expected tokens per second (--spec-draft-p-min is not used)
+                    next = ad.next(ad_run[seq_id], conf);
+                } else if (cur_p->data[0].p < params.p_min) {
+                    // only collect very high-confidence draft tokens
+                    next = common_spec_adaptive::NEXT_STOP;
+                }
+                if (next == common_spec_adaptive::NEXT_STOP) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1952,11 +2072,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                if (adaptive) {
+                    ad_conf[seq_id].push_back(conf);
+                }
+
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() || next == common_spec_adaptive::NEXT_LAST) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2005,6 +2129,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.result_q) {
+                    dp.result_q->clear();
+                }
+            }
+
+            if (adaptive) {
+                ad.submitted(seq_id, ad_conf[seq_id], (int) dp.result->size());
             }
         }
     }
