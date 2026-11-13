@@ -2899,6 +2899,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_OP_MUL_MAT_FP8_BLOCK:
+            ggml_cuda_mul_mat_fp8_block(ctx, dst);
+            break;
+#endif
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
@@ -6261,6 +6266,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_OP_MUL_MAT_FP8_BLOCK:
+            return op->src[0]->ne[0] <= 8 * 1024 * 1024 &&
+                   op->src[0]->ne[1] <= INT_MAX / WARP_SIZE &&
+                   op->src[1]->ne[1] <= INT_MAX;
+#endif
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {

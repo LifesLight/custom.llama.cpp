@@ -1136,6 +1136,8 @@ struct llm_graph_context {
               ggml_tensor * w,
               ggml_tensor * cur) const;
 
+    ggml_tensor * build_weight_mm(ggml_tensor * w, ggml_tensor * cur) const;
+
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,

@@ -1682,15 +1682,31 @@ ggml_tensor * llm_graph_context::build_rope_indexer(ggml_tensor * cur, ggml_tens
     return rp.n_rot > 0 && rp.n_offs > 0 ? ggml_rope_set_offset(res, rp.n_offs) : res;
 }
 
+ggml_tensor * llm_graph_context::build_weight_mm(ggml_tensor * w, ggml_tensor * cur) const {
+    if (w->type == GGML_TYPE_F8_E4M3) {
+        const auto scale = model.fp8_block_scales.find(w);
+        if (scale != model.fp8_block_scales.end()) {
+            ggml_tensor * input = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+            if (ggml_is_matrix(cur)) {
+                return ggml_mul_mat_fp8_block(ctx0, w, input, scale->second);
+            }
+            input = ggml_reshape_2d(ctx0, input, cur->ne[0], ggml_nrows(cur));
+            ggml_tensor * out = ggml_mul_mat_fp8_block(ctx0, w, input, scale->second);
+            return ggml_reshape_4d(ctx0, out, w->ne[1], cur->ne[1], cur->ne[2], cur->ne[3]);
+        }
+    }
+    return ggml_mul_mat(ctx0, w, cur);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+    ggml_tensor * res = build_weight_mm(w, cur_mm);
 
-    if (prec_policy) {
+    if (prec_policy && res->op == GGML_OP_MUL_MAT) {
         prec_policy->apply(res);
     }
 

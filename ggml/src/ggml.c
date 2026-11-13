@@ -1112,9 +1112,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "MUL_MAT_FP8_BLOCK",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,9 +1226,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "fp8_block_matmul(a,b,scale)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3371,6 +3373,30 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_fp8_block(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * scale) {
+    GGML_ASSERT(a->type == GGML_TYPE_F8_E4M3);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_matrix(a) && ggml_is_matrix(b) && ggml_is_matrix(scale));
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(scale));
+    // Empty token batches produce an empty result, like ggml_mul_mat.
+    GGML_ASSERT(a->ne[0] > 0 && a->ne[1] > 0);
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->ne[0] % GGML_FP8_BLOCK_SIZE == 0 && a->ne[1] % GGML_FP8_BLOCK_SIZE == 0);
+    GGML_ASSERT(scale->ne[0] == a->ne[0] / GGML_FP8_BLOCK_SIZE);
+    GGML_ASSERT(scale->ne[1] == a->ne[1] / GGML_FP8_BLOCK_SIZE);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[1], b->ne[1]);
+    result->op = GGML_OP_MUL_MAT_FP8_BLOCK;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = scale;
     return result;
 }
 

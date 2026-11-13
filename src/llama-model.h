@@ -778,6 +778,7 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> fp8_block_scales;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
