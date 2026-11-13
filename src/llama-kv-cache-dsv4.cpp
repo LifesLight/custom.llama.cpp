@@ -1486,14 +1486,20 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             bool embd_all) {
     GGML_UNUSED(embd_all);
 
+    const auto & batch = balloc.get_batch();
+    const bool has_coupled = dsv4_batch_has_coupled(batch);
+    if (has_coupled && batch.token && batch.embd) {
+        LLAMA_LOG_ERROR("%s: DSV4 batches with both token IDs and embeddings cannot share rows across sequences\n", __func__);
+        return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
     if (hparams_raw.ple_n_heads > 0 &&
-        !dsv41_shared_history_ok(balloc.get_batch(), kv_raw->get_swa(), hparams_raw.ple_ngram_size - 1)) {
+        !dsv41_shared_history_ok(batch, kv_raw->get_swa(), hparams_raw.ple_ngram_size - 1)) {
         return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
     const bool raw_per_seq  = kv_raw->get_base()->get_n_stream() != 1;
     const bool comp_per_seq = csa_state->get_n_stream() > 1;
-    const bool has_coupled = dsv4_batch_has_coupled(balloc.get_batch());
 
     const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
         auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);

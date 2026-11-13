@@ -124,9 +124,10 @@ static void fill_resid_gate(std::vector<float> & dst, const char * name, const t
 }
 
 // a random router bias can tie within the noise between the backends, a ramp keeps the top-k selection the same
-static void fill_exp_probs_b(std::vector<float> & dst, const char *, const tensor_data_params &) {
+static void fill_exp_probs_b(std::vector<float> & dst, const char * name, const tensor_data_params &) {
+    const float step = strstr(name, "exp_probs_b_vl") ? -2.0f : 2.0f;
     for (size_t i = 0; i < dst.size(); i++) {
-        dst[i] = 2.0f*i;
+        dst[i] = step*i;
     }
 }
 
@@ -713,7 +714,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
         // with more experts than a ubatch uses, the copy of the used experts in host memory skips some of them
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : arch == LLM_ARCH_CLOVER_MOE ? 4 : 2));
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(host_experts_test(arch) ? 64 : (arch == LLM_ARCH_CLOVER_MOE || arch == LLM_ARCH_DEEPSEEK41) ? 4 : 2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
 

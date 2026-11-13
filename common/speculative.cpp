@@ -1258,13 +1258,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        // Target prefill may contain token IDs or multimodal embeddings. Both
-        // produce the target-layer features used to seed the draft KV cache, so
-        // embeddings are injected too, except the pinned ones skipped below.
-        // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
-        const bool has_tokens     = batch_in.has_token();
-        const bool has_embeddings = batch_in.has_embd();
-        if (has_tokens == has_embeddings) {
+        // DSpark consumes target features for every row of a mixed prefill.
+        if (!is_dspark && batch_in.has_token() == batch_in.has_embd()) {
             return true;
         }
 
@@ -1297,8 +1292,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
-            if (has_embeddings && n_rows > 1 && pos_pinned) {
+            const auto & first = batch_in.tokens[i_batch_beg[seq_id]];
+            const bool pos_pinned = first.pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
+            if (first.id == LLAMA_TOKEN_NULL && n_rows > 1 && pos_pinned) {
                 continue;
             }
 
@@ -1885,11 +1881,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
+                // the MTP context takes either token or embedding entries per call, never both:
+                // a target batch with media mixed into the text is decoded here as consecutive homogeneous runs
+                for (int32_t off = 0; off < batch.size() && ok; ) {
+                    const bool is_tok = batch.tokens[off].id != LLAMA_TOKEN_NULL;
+                    int32_t n = 1;
+                    while (off + n < batch.size() && (batch.tokens[off + n].id != LLAMA_TOKEN_NULL) == is_tok) {
+                        n++;
+                    }
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(off, n));
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[off].pos[0]);
+                        ok = false;
+                    }
+                    off += n;
+                }
+                if (!ok) {
                     break;
                 }
             }

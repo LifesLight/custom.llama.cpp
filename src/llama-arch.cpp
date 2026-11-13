@@ -1420,7 +1420,6 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_COGVLM:
         case LLM_ARCH_DEEPSEEK4:
-        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GRANITE_SWITCH:
         case LLM_ARCH_EAGLE3:
         case LLM_ARCH_DFLASH:

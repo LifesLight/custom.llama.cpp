@@ -2271,7 +2271,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * router_bias_ids) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2294,7 +2295,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        router_bias_ids
     );
 }
 
@@ -2324,7 +2326,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor * router_bias_ids) const {
     const llm_arch arch = model.arch;
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -2371,11 +2374,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(probs, "ffn_moe_probs", il);
 
+    const auto add_router_bias = [&](ggml_tensor * scores, ggml_tensor * bias, int layer) {
+        if (router_bias_ids) {
+            if (ggml_tensor * bias_vl = model.layers[layer].ffn_exp_probs_b_vl) {
+                // Indexed addition keeps only two bias rows and bypasses vector-bias top-k fusions.
+                auto * text = bias->type == GGML_TYPE_F32 ? bias : ggml_cast(ctx0, bias, GGML_TYPE_F32);
+                auto * image = bias_vl->type == GGML_TYPE_F32 ? bias_vl : ggml_cast(ctx0, bias_vl, GGML_TYPE_F32);
+                return ggml_add_id(ctx0, scores, ggml_concat(ctx0, text, image, 1), router_bias_ids);
+            }
+        }
+        return ggml_add(ctx0, scores, bias);
+    };
+
     // add experts selection bias - introduced in DeepSeek V3
     // leave probs unbiased as it's later used to get expert weights
     ggml_tensor * selection_probs = probs;
     if (exp_probs_b != nullptr) {
-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+        selection_probs = add_router_bias(probs, exp_probs_b, il);
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
@@ -2512,7 +2527,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             default: break;
         }
         if (pf.exp_probs_b) {
-            pf_probs = ggml_add(ctx0, pf_probs, pf.exp_probs_b);
+            pf_probs = add_router_bias(pf_probs, pf.exp_probs_b, il + 1);
         }
         pf_ids = ggml_argsort_top_k(ctx0, pf_probs, pf.k); // [k, n_tokens]
         cb(pf_ids, "ffn_moe_prefetch_topk", il);
