@@ -5,6 +5,7 @@
 
 #include <vector>
 #include <string>
+#include <stdexcept>
 
 #define MTMD_INTERNAL_HEADER
 
@@ -28,10 +29,44 @@ struct mtmd_image_preproc_out {
 
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
-    const mtmd_hparams & hparams;
+    mtmd_hparams hparams;
 
     mtmd_image_preprocessor(const mtmd_model * model): hparams(model->hparams) {}
     mtmd_image_preprocessor(const mtmd_hparams & hparams): hparams(hparams) {}
+
+    void set_image_token_limits(int min_tokens, int max_tokens) {
+        if ((min_tokens <= 0 && max_tokens <= 0) || (hparams.image_max_pixels <= 0 && hparams.image_longest_edge <= 0)) {
+            return;
+        }
+        if (hparams.dsv4_max_n_token > 0 && max_tokens > 0) {
+            max_tokens = std::max(max_tokens, 16);
+        }
+        const int64_t patch_side = int64_t(hparams.patch_size) * hparams.n_merge;
+        if (patch_side <= 0 || patch_side > 46340 || std::max(min_tokens, max_tokens) > INT32_MAX / (patch_side * patch_side)) {
+            throw std::runtime_error("video image token limit is too large");
+        }
+        if (min_tokens > 0) {
+            hparams.custom_image_min_tokens = min_tokens;
+            hparams.image_min_pixels = min_tokens * patch_side * patch_side;
+        }
+        if (max_tokens > 0) {
+            hparams.custom_image_max_tokens = max_tokens;
+            hparams.image_max_pixels = max_tokens * patch_side * patch_side;
+        }
+        if (hparams.dsv4_max_n_token > 0) {
+            if (max_tokens > 0) {
+                hparams.dsv4_max_n_token = max_tokens;
+            }
+            hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+        }
+        // only the max was given: the min inherited from the model/image settings must not exceed it
+        if (min_tokens <= 0 && hparams.image_max_pixels > 0 && hparams.image_min_pixels > hparams.image_max_pixels) {
+            hparams.image_min_pixels = hparams.image_max_pixels;
+        }
+        if (hparams.image_max_pixels > 0 && hparams.image_max_pixels < hparams.image_min_pixels) {
+            throw std::runtime_error("video image max tokens is less than min tokens");
+        }
+    }
 
     virtual ~mtmd_image_preprocessor() = default;
     virtual mtmd_image_preproc_out preprocess(const mtmd_image_u8 & img) const = 0;
