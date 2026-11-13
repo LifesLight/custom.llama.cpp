@@ -33,11 +33,15 @@ static void llama_verify_hadamard_graph(
         ggml_cgraph * gf,
         const llama_hadamard_rotations & rotations,
         const llama_hadamard_rotations & inverses,
-        const llama_moe_cache * moe_cache) {
+        const llama_moe_cache * moe_cache,
+        const llama_moe_stream * moe_stream) {
     // the MoE cache gives the matmul a copy of the expert weights, so the copy also needs the transform of its source
     llama_hadamard_rotations forward = rotations;
     for (const auto & [w, t] : rotations) {
         if (const ggml_tensor * cached = moe_cache ? moe_cache->get_experts(w) : nullptr) {
+            forward.emplace(cached, t);
+        }
+        if (const ggml_tensor * cached = moe_stream ? moe_stream->get_bank(w) : nullptr) {
             forward.emplace(cached, t);
         }
     }
@@ -378,6 +382,12 @@ llama_context::llama_context(
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size      = params.moe_cache_size;
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    cparams.moe_stream_threads  = params.moe_stream_threads;
+    cparams.moe_stream_resident = params.moe_stream_resident;
+    cparams.moe_stream_reserve  = params.moe_stream_reserve;
+    cparams.moe_stream_policy   = params.moe_stream_policy;
+    cparams.moe_stream_state    = params.moe_stream_state ? params.moe_stream_state : "";
+    cparams.moe_stream_pool     = params.moe_stream_pool;
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -609,6 +619,27 @@ llama_context::llama_context(
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
         }
+
+        if (cparams.moe_stream_threads > 0) {
+            if (moe_cache) {
+                LLAMA_LOG_WARN("%s: MoE streaming is not supported together with the MoE cache, disabled\n", __func__);
+            } else if (!cparams.op_offload) {
+                LLAMA_LOG_WARN("%s: MoE streaming requires op offload, disabled\n", __func__);
+            } else {
+                llama_moe_stream_params sparams;
+                sparams.n_threads = cparams.moe_stream_threads;
+                sparams.resident  = cparams.moe_stream_resident;
+                sparams.reserve   = cparams.moe_stream_reserve;
+                sparams.policy    = cparams.moe_stream_policy;
+                sparams.state     = cparams.moe_stream_state;
+                sparams.pool      = cparams.moe_stream_pool;
+                moe_stream = std::make_unique<llama_moe_stream>(model, backend_ptrs, sparams);
+                if (!moe_stream->active()) {
+                    moe_stream.reset();
+                }
+            }
+        }
+
 
         sched_reserve();
 
@@ -1877,7 +1908,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // a full ubatch is likely followed by another one, the stream prefetches its first layer
+    if (moe_stream) {
+        moe_stream->begin_graph(sched.get(), res->get_gf(), ubatch.n_tokens, ubatch.n_tokens >= cparams.n_ubatch);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (moe_stream) {
+        moe_stream->end_graph();
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2925,7 +2966,9 @@ uint32_t llama_context::graph_max_nodes() const {
         // so they cost ~8.6 nodes per tensor against ~5.9 for a plain DFlash draft
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
-        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        // 12x instead of 8x: moe-stream adds several ops per MoE layer (slots, wait, prefetch, profile) and quantized
+        // KV caches add conversions, which overflowed 8x on MiMo (ggml_new_object: not enough space)
+        res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
@@ -3047,7 +3090,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
-        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get());
+        llama_verify_hadamard_graph(gf, model.hdmd.rot, model.hdmd.inv, moe_cache.get(), moe_stream.get());
         hadamard_verified = true;
     }
 
@@ -3088,6 +3131,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_stream  =*/ moe_stream.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
@@ -3161,12 +3205,38 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     auto & st = lctx->copy_experts;
 
-    // the ids must be computed before the split starts, so only the first node of the split is considered
-    if (ggml_graph_n_nodes(graph) == 0) {
-        return false;
+    // the experts streamed from disk are always copied by the stream, all of them if the ids are not known
+    llama_moe_stream * stream = lctx->moe_stream && lctx->moe_stream->is_streamed(src) ? lctx->moe_stream.get() : nullptr;
+
+    // the ids must be computed before the split starts, so only the first node of the split is considered. for the
+    // MoE stream, also a later MUL_MAT_ID of the weight whose ids are not computed in the split: an op on another
+    // backend between the router and the experts (the prefill forecast) can start the split with other nodes, such
+    // as the Hadamard rotation of the input of the experts
+    const int n_split_nodes = ggml_graph_n_nodes(graph);
+    const ggml_tensor * node = n_split_nodes > 0 ? ggml_graph_node(graph, 0) : nullptr;
+    if (stream && node && (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst)) {
+        node = nullptr;
+        for (int i = 1; i < n_split_nodes; i++) {
+            const ggml_tensor * n = ggml_graph_node(graph, i);
+            if (n->op != GGML_OP_MUL_MAT_ID || n->src[0] != dst) {
+                continue;
+            }
+            const ggml_tensor * ids  = n->src[2];
+            const ggml_tensor * base = ids->view_src ? ids->view_src : ids;
+            bool inside = false;
+            for (int j = 0; j < i && !inside; j++) {
+                const ggml_tensor * m = ggml_graph_node(graph, j);
+                inside = m == ids || m == base;
+            }
+            node = inside ? nullptr : n;
+            break;
+        }
     }
-    const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+    if (!node || node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        if (stream) {
+            stream->copy(backend, src, dst, nullptr);
+            return true;
+        }
         return false;
     }
 
@@ -3184,15 +3254,22 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         ggml_backend_synchronize(backend);
 
         st.used.assign(n_expert, false);
+        st.counts.assign(n_expert, 0);
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
                 const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
                 GGML_ASSERT(id >= 0 && id < n_expert);
                 st.used[id] = true;
+                st.counts[id]++;
             }
         }
 
         st.ids = ids;
+    }
+
+    if (stream) {
+        stream->copy(backend, src, dst, &st.counts);
+        return true;
     }
 
     // group consecutive experts and copy them together
@@ -4441,6 +4518,12 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.moe_stream_threads          =*/ 0,
+        /*.moe_stream_resident         =*/ SIZE_MAX,
+        /*.moe_stream_reserve          =*/ 8ull*1024*1024*1024,
+        /*.moe_stream_policy           =*/ LLAMA_MOE_STREAM_POLICY_LRU,
+        /*.moe_stream_state            =*/ nullptr,
+        /*.moe_stream_pool             =*/ -1.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

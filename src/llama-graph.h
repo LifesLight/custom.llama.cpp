@@ -24,6 +24,16 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
+class llama_moe_stream;
+
+// the expert matmuls of a layer computed on the CPU from the MoE stream cache in two parts: the cached experts
+// while the missing ones are read (ids_a), then the missing ones (ids_b); down has all of them (ids_all)
+struct llm_moe_split {
+    ggml_tensor * ids_b   = nullptr;
+    ggml_tensor * ids_all = nullptr;
+    ggml_tensor * down    = nullptr;
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> first; // weight -> result of the first part
+};
 
 struct llama_memory_context_i;
 
@@ -804,6 +814,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_stream       * moe_stream;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1077,6 +1088,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_stream       * moe_stream;
 
     const llama_prec_policy * prec_policy;
 
@@ -1136,9 +1148,18 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s    = nullptr,
-              ggml_tensor * slots  = nullptr,
-                     bool   cached = true) const;
+              ggml_tensor * w_s   = nullptr,
+              ggml_tensor * slots = nullptr,
+                     bool   cached = true,
+      const llm_moe_split * split  = nullptr) const;
+
+    // the mul_mat_id of the experts as of w, on the backend it belongs to, with the precision of w
+    ggml_tensor * build_mm_id_experts(
+              ggml_tensor * w,
+              ggml_tensor * as,
+              ggml_tensor * cur,
+              ggml_tensor * ids,
+                     bool   cached) const;
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
@@ -1243,6 +1264,17 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
+
+    // the slots of the selected experts in the expert cache of the MoE stream, as an op computed on the CPU that makes
+    // them cached; nullptr if the experts of the layer are not computed from that cache (see llama_moe_stream::build_slots)
+    // pass the result as the slots of build_lora_mm_id() for each expert weight of the layer
+    ggml_tensor * build_moe_stream_slots(
+             ggml_tensor * selected_experts,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps,
+                     int   il) const;
 
     //
     // inputs

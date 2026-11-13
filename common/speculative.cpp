@@ -2797,6 +2797,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // the MoE cache is only used by the target context
     result.moe_cache_size = 0;
 
+    // so is the MoE stream: a stream of the draft/MTP context would manage the experts of the whole target model
+    // a second time (its own staging buffers and IO threads, a near-empty cache sized after the target took the
+    // RAM) and save over the state file of the target's stream
+    result.moe_stream_threads = 0;
+
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
