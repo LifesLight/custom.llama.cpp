@@ -684,6 +684,7 @@ llama_model_loader::llama_model_loader(
             }
 
             bool allow_override_tensor = false;
+            bool fp8_overlay = false;
             if (idx < n_backbone) {
                 const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
                 if (kid < 0) {
@@ -705,6 +706,47 @@ llama_model_loader::llama_model_loader(
             } else {
                 // an external PLE table replaces the one in the model, if any
                 allow_override_tensor = is_ple_only(ctx_gguf.get());
+                const int overlay_key = gguf_find_key(ctx_gguf.get(), "glm5-next.fp8_block_overlay");
+                if (overlay_key >= 0) {
+                    if (arch_name != "glm5-next" ||
+                        gguf_get_kv_type(ctx_gguf.get(), overlay_key) != GGUF_TYPE_BOOL ||
+                        !gguf_get_val_bool(ctx_gguf.get(), overlay_key)) {
+                        throw std::runtime_error("invalid GLM5-Next FP8 overlay metadata");
+                    }
+                    fp8_overlay = true;
+                    static const std::regex pattern(
+                            R"(blk\.\d+\.(attn_(kv_a_mqa|output|q_a|q_b)|ffn_(gate|up|down)(_shexp)?)\.(weight|fp8_block_scale))");
+                    size_t n_weights = 0;
+                    size_t n_scales = 0;
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                        const std::string name = t->name;
+                        if (!std::regex_match(name, pattern)) {
+                            throw std::runtime_error(format("invalid GLM5-Next FP8 overlay tensor '%s'", t->name));
+                        }
+                        const auto stem = name.substr(0, name.rfind('.'));
+                        if (name == stem + ".fp8_block_scale") {
+                            ++n_scales;
+                            continue;
+                        }
+
+                        const auto base = weights_map.find(name);
+                        const ggml_tensor * scale = ggml_get_tensor(ctx, (stem + ".fp8_block_scale").c_str());
+                        if (base == weights_map.end() || base->second.idx >= n_backbone_files ||
+                            !ggml_are_same_shape(t, base->second.tensor) ||
+                            t->type != GGML_TYPE_F8_E4M3 || !ggml_is_matrix(t) ||
+                            t->ne[0] % GGML_FP8_BLOCK_SIZE != 0 || t->ne[1] % GGML_FP8_BLOCK_SIZE != 0 ||
+                            !scale || scale->type != GGML_TYPE_F32 || !ggml_is_matrix(scale) ||
+                            scale->ne[0] != t->ne[0] / GGML_FP8_BLOCK_SIZE ||
+                            scale->ne[1] != t->ne[1] / GGML_FP8_BLOCK_SIZE ||
+                            weights_map.count(scale->name)) {
+                            throw std::runtime_error(format("invalid GLM5-Next FP8 overlay pair for '%s'", t->name));
+                        }
+                        ++n_weights;
+                    }
+                    if (!n_weights || n_weights != n_scales) {
+                        throw std::runtime_error("GLM5-Next FP8 overlay requires paired weights and block scales");
+                    }
+                }
                 const bool numbered = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str()) >= 0 ||
                     gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_SPLIT_COUNT).c_str()) >= 0 ||
                     gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str()) >= 0;
@@ -726,7 +768,7 @@ llama_model_loader::llama_model_loader(
                 auto it = weights_map.find(tensor_name);
                 if (it != weights_map.end()) {
                     // only override tensors of the model, not of another extra shard
-                    if (!allow_override_tensor || it->second.idx >= n_backbone_files) {
+                    if ((!allow_override_tensor && !fp8_overlay) || it->second.idx >= n_backbone_files) {
                         throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                     }
                     LLAMA_LOG_INFO("%s: tensor '%s' overridden by %s\n", __func__, tensor_name.c_str(), fname_split);

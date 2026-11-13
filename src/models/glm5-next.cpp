@@ -79,6 +79,26 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
         const bool is_nextn = i >= n_layer;
         const int flags = is_nextn ? mtp_flags : trunk_flags;
 
+        auto create_fp8_weight = [&](llm_tensor tid, int64_t k, int64_t n) {
+            ggml_tensor * w = create_tensor(tn(tid, "weight", i), {k, n}, flags);
+            const auto scale_name = tn(tid, "fp8_block_scale", i);
+            const ggml_tensor * meta = ml.get_tensor_meta(scale_name.str().c_str());
+            if (meta) {
+                if (split_mode() == LLAMA_SPLIT_MODE_ROW || split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                    throw std::runtime_error("GLM5-Next block-scaled FP8 supports none and layer split modes");
+                }
+                if ((w && w->type != GGML_TYPE_F8_E4M3) || meta->type != GGML_TYPE_F32 ||
+                    k % GGML_FP8_BLOCK_SIZE != 0 || n % GGML_FP8_BLOCK_SIZE != 0) {
+                    throw std::runtime_error("invalid GLM5-Next block-scaled FP8 tensor");
+                }
+                ggml_tensor * scale = create_tensor(scale_name, {k/GGML_FP8_BLOCK_SIZE, n/GGML_FP8_BLOCK_SIZE}, flags);
+                if (w && scale) {
+                    fp8_block_scales.emplace(w, scale);
+                }
+            }
+            return w;
+        };
+
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
 
@@ -116,7 +136,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ssm_g_a    = create_tensor(tn(LLM_TENSOR_SSM_G_A,  "weight", i), {n_embd, head_dim}, flags);
             layer.ssm_g_b    = create_tensor(tn(LLM_TENSOR_SSM_G_B,  "weight", i), {head_dim, d_inner}, flags);
             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, flags);
-            layer.wo         = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, flags);
+            layer.wo         = create_fp8_weight(LLM_TENSOR_ATTN_OUT, d_inner, n_embd);
         } else {
             const int64_t q_lora_rank      = hparams.n_lora_q;
             const int64_t kv_lora_rank     = hparams.n_lora_kv;
@@ -128,13 +148,13 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, flags);
             layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, flags);
 
-            layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), {n_embd, q_lora_rank}, flags);
-            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k}, flags);
+            layer.wq_a = create_fp8_weight(LLM_TENSOR_ATTN_Q_A, n_embd, q_lora_rank);
+            layer.wq_b = create_fp8_weight(LLM_TENSOR_ATTN_Q_B, q_lora_rank, n_head * n_embd_head_k);
 
-            layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, flags);
+            layer.wkv_a_mqa = create_fp8_weight(LLM_TENSOR_ATTN_KV_A_MQA, n_embd, kv_lora_rank + qk_rope_head_dim);
             layer.wk_b      = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head}, flags);
             layer.wv_b      = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v, n_head}, flags);
-            layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, flags);
+            layer.wo        = create_fp8_weight(LLM_TENSOR_ATTN_OUT, n_head * n_embd_head_v, n_embd);
 
             const int64_t n_indexer_head = hparams.indexer_n_head;
             const int64_t n_embd_indexer = hparams.indexer_head_size;
@@ -153,9 +173,9 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
         }
 
         if (i < (int) hparams.n_layer_dense_lead) {
-            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, flags);
-            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, flags);
-            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, flags);
+            layer.ffn_gate = create_fp8_weight(LLM_TENSOR_FFN_GATE, n_embd, n_ff);
+            layer.ffn_down = create_fp8_weight(LLM_TENSOR_FFN_DOWN, n_ff, n_embd);
+            layer.ffn_up   = create_fp8_weight(LLM_TENSOR_FFN_UP, n_embd, n_ff);
         } else {
             const int64_t n_ff_exp        = hparams.n_ff_exp(i);
             const int64_t n_expert_shared = hparams.n_expert_shared;
@@ -167,9 +187,9 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
 
-            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
-            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, flags);
-            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, flags);
+            layer.ffn_gate_shexp = create_fp8_weight(LLM_TENSOR_FFN_GATE_SHEXP, n_embd, n_ff_exp * n_expert_shared);
+            layer.ffn_down_shexp = create_fp8_weight(LLM_TENSOR_FFN_DOWN_SHEXP, n_ff_exp * n_expert_shared, n_embd);
+            layer.ffn_up_shexp   = create_fp8_weight(LLM_TENSOR_FFN_UP_SHEXP, n_embd, n_ff_exp * n_expert_shared);
         }
 
         if (i >= n_layer) {
@@ -859,7 +879,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
     gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
-    cur   = ggml_mul_mat(ctx0, layer.wo, gated);
+    cur   = build_weight_mm(layer.wo, gated);
     cb(cur, "kda_out", il);
 
     return cur;
@@ -1038,14 +1058,14 @@ llama_model_glm5_next::graph::build_dsa_layer(
 
     GGML_ASSERT(hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
 
-    ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    ggml_tensor * qr = build_weight_mm(layer.wq_a, cur);
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "q_resid", il);
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+    ggml_tensor * q = build_weight_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
 
-    ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_cmpr = build_weight_mm(layer.wkv_a_mqa, cur);
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     cb(kv_cmpr, "kv_cmpr", il);
@@ -1080,7 +1100,7 @@ llama_model_glm5_next::graph::build_dsa_layer(
     ggml_tensor * out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
     cb(out, "kqv_out", il);
 
-    out = ggml_mul_mat(ctx0, layer.wo, out);
+    out = build_weight_mm(layer.wo, out);
     cb(out, "attn_out", il);
 
     return { out, sel };

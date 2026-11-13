@@ -1,5 +1,92 @@
 #include "fp8.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+static __global__ void mul_mat_vec_fp8_block(
+        const uint8_t * weights, const float * inputs, const float * scales, float * out, int k, int n) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    const int token = blockIdx.y;
+    if (row >= n) {
+        return;
+    }
+
+    const int blocks_k = k / GGML_FP8_BLOCK_SIZE;
+    const uint8_t * w = weights + (int64_t) row*k;
+    const float * x = inputs + (int64_t) token*k;
+    const float * s = scales + row/GGML_FP8_BLOCK_SIZE*blocks_k;
+    float sum = 0.0f;
+    for (int block = 0; block < blocks_k; ++block) {
+        const float d = s[block];
+        const int start = block * GGML_FP8_BLOCK_SIZE;
+#pragma unroll
+        for (int offset = 0; offset < GGML_FP8_BLOCK_SIZE; offset += WARP_SIZE) {
+            const int col = start + offset + lane;
+            const float weight = __fmul_rn(ggml_cuda_f8_e4m3_to_fp32(w[col]), d);
+            sum = fmaf(weight, x[col], sum);
+        }
+    }
+    sum = warp_reduce_sum(sum);
+    if (lane == 0) {
+        out[(int64_t) token*n + row] = sum;
+    }
+}
+
+static __global__ void dequantize_fp8_block_rows(
+        const uint8_t * weights, const float * scales, float * out, int k, int rows, int row_start) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= k*rows) {
+        return;
+    }
+
+    const int row = row_start + i/k;
+    const int col = i % k;
+    const float d = scales[row/GGML_FP8_BLOCK_SIZE*(k/GGML_FP8_BLOCK_SIZE) + col/GGML_FP8_BLOCK_SIZE];
+    out[i] = ggml_cuda_f8_e4m3_to_fp32(weights[(int64_t) row*k + col]) * d;
+}
+
+void ggml_cuda_mul_mat_fp8_block(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * input = dst->src[1];
+    const ggml_tensor * scale = dst->src[2];
+    const auto * weights = static_cast<const uint8_t *>(weight->data);
+    const auto * inputs = static_cast<const float *>(input->data);
+    const auto * scales = static_cast<const float *>(scale->data);
+    auto * out = static_cast<float *>(dst->data);
+    const int k = weight->ne[0];
+    const int n = weight->ne[1];
+    const int tokens = input->ne[1];
+
+    if (tokens <= 8) {
+        constexpr int threads = 128;
+        const dim3 grid((n + threads/WARP_SIZE - 1)/(threads/WARP_SIZE), tokens);
+        mul_mat_vec_fp8_block<<<grid, threads, 0, ctx.stream()>>>(weights, inputs, scales, out, k, n);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // Dequantize at most 512 rows and 32 MiB at a time.
+    constexpr int max_rows = 512;
+    constexpr int threads = 256;
+    const int chunk = std::min({ n, max_rows, (8 * 1024 * 1024) / k });
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) k*chunk);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasHandle_t handle = ctx.cublas_handle();
+
+    for (int row = 0; row < n; row += chunk) {
+        const int rows = std::min(chunk, n - row);
+        dequantize_fp8_block_rows<<<(k*rows + threads - 1)/threads, threads, 0, ctx.stream()>>>(
+                weights, scales, scratch.ptr, k, rows, row);
+        CUDA_CHECK(cudaGetLastError());
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, k, &alpha,
+                scratch.ptr, CUDA_R_32F, k, inputs, CUDA_R_32F, k,
+                &beta, out + row, CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    }
+}
+
+#endif
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
 
 struct fp8_abs_src {

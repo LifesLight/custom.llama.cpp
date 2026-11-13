@@ -428,6 +428,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_MUL_MAT_FP8_BLOCK,
 
         GGML_OP_COUNT,
     };
@@ -1306,6 +1307,15 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+#define GGML_FP8_BLOCK_SIZE 128
+    // a: contiguous E4M3 [K, N], b: contiguous F32 [K, T].
+    // scale: contiguous F32 [K/128, N/128], in GGML dimension order.
+    GGML_API struct ggml_tensor * ggml_mul_mat_fp8_block(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * scale);
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(

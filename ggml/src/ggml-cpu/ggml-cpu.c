@@ -1261,6 +1261,45 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+static void ggml_compute_forward_mul_mat_fp8_block(
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * scale = dst->src[2];
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t tokens = input->ne[1];
+    const int64_t blocks_k = scale->ne[0];
+    const ggml_to_float_t to_float = ggml_get_type_traits(weight->type)->to_float;
+    const uint8_t * weights = weight->data;
+    const float * inputs = input->data;
+    const float * scales = scale->data;
+    float * out = dst->data;
+
+    for (int64_t row = params->ith; row < n; row += params->nth) {
+        for (int64_t t = 0; t < tokens; ++t) {
+            out[t*n + row] = 0.0f;
+        }
+        for (int64_t block = 0; block < blocks_k; ++block) {
+            const int64_t col = block * GGML_FP8_BLOCK_SIZE;
+            const float d = scales[row/GGML_FP8_BLOCK_SIZE*blocks_k + block];
+            float decoded[GGML_FP8_BLOCK_SIZE];
+            to_float(weights + row*k + col, decoded, GGML_FP8_BLOCK_SIZE);
+            for (int i = 0; i < GGML_FP8_BLOCK_SIZE; ++i) {
+                decoded[i] *= d;
+            }
+            for (int64_t t = 0; t < tokens; ++t) {
+                const float * x = inputs + t*k + col;
+                float sum = 0.0f;
+                for (int i = 0; i < GGML_FP8_BLOCK_SIZE; ++i) {
+                    sum += decoded[i] * x[i];
+                }
+                out[t*n + row] += sum;
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1907,6 +1946,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_FP8_BLOCK:
+            {
+                ggml_compute_forward_mul_mat_fp8_block(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
@@ -2394,6 +2437,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
+        case GGML_OP_MUL_MAT_FP8_BLOCK:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
