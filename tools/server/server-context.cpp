@@ -419,6 +419,23 @@ struct server_slot {
         return std::min(n_tokens_input, prompt.tokens.size());
     }
 
+    bool can_append_prompt(size_t n_prefix, size_t n_input) const {
+        if (n_prefix == 0 || n_prefix != prompt.tokens.size() || n_prefix >= n_input) {
+            return false;
+        }
+
+        // The recurrent state is a snapshot at the last decoded position. Its position can
+        // raise the hybrid cache's pos_min above the SWA threshold even on a clean append.
+        if (!llama_model_is_hybrid(llama_get_model(ctx_tgt))) {
+            return false;
+        }
+        const llama_pos last = prompt.tokens.pos_next() - 1;
+        const auto mem_tgt = llama_get_memory(ctx_tgt);
+        return llama_memory_seq_pos_min(mem_tgt, id) == last &&
+               llama_memory_seq_pos_max(mem_tgt, id) == last &&
+               (!ctx_dft || llama_memory_seq_pos_max(llama_get_memory(ctx_dft), id) == last);
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -3406,9 +3423,10 @@ private:
         // slot's highest one below it. Only cached input past the divergence is lost by not saving.
         size_t n_common = 0;
         if (eligible && key == slot.disk_cache_key) {
-            n_reusable = server_cache_reusable(slot.prompt, task.tokens,
-                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), n_swa);
             n_common = slot.prompt.tokens.get_common_prefix(task.tokens);
+            n_reusable = slot.can_append_prompt(n_common, task.tokens.size()) ? n_common :
+                server_cache_reusable(slot.prompt, task.tokens,
+                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id), n_swa);
             if (task.n_tokens_shared > 0) {
                 n_reusable = std::min(n_reusable, (size_t) task.n_tokens_shared);
                 n_common   = std::min(n_common,   (size_t) task.n_tokens_shared);
@@ -4698,7 +4716,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (pos_min >= pos_min_thold && !slot.can_append_prompt(n_past, slot.task->n_tokens())) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
