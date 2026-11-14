@@ -1272,7 +1272,30 @@ struct llm_graph_context {
 
     // the slots of the selected experts in the expert cache of the MoE stream, as an op computed on the CPU that makes
     // them cached; nullptr if the experts of the layer are not computed from that cache (see llama_moe_stream::build_slots)
-    // pass the result as the slots of build_lora_mm_id() for each expert weight of the layer
+    // with LLAMA_MOE_STREAM_OVERLAP the slots of the missing experts are -1 until they are read: use
+    // build_moe_stream_layer() outside of build_moe_ffn()
+    // the MoE stream for a layer that builds its experts with build_lora_mm_id() instead of build_moe_ffn(), with the
+    // same features: the cross-layer read-ahead (LLAMA_MOE_STREAM_PREFETCH for the batches on the CPU,
+    // LLAMA_MOE_STREAM_FORECAST for those on the GPU) and, with LLAMA_MOE_STREAM_OVERLAP, the up/gate matmuls of the
+    // cached experts computed while the missing ones are read
+    // - cur: the input of the experts, [n_embd, 1, n_tokens], as passed to build_lora_mm_id()
+    // - router_inp: the input of the router of this layer, [n_embd, n_tokens] (normed by its ffn_norm), for the
+    //   read-ahead with the router of the next layer (gating_op, plus its ffn_exp_probs_b); nullptr: no read-ahead
+    // returns the slots for build_lora_mm_id(w, cur, ids, w_s, slots, true, split) for each expert weight of the
+    // layer, with split set when the up/gate matmuls are split (pass &split_data's result to all three), or nullptr
+    ggml_tensor * build_moe_stream_layer(
+             ggml_tensor * cur,
+             ggml_tensor * router_inp,
+             ggml_tensor * selected_experts,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps,
+    llama_expert_gating_func_type gating_op,
+           llm_moe_split & split_data,
+     const llm_moe_split * & split,
+                     int   il) const;
+
     ggml_tensor * build_moe_stream_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,

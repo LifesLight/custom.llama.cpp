@@ -2942,6 +2942,114 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+ggml_tensor * llm_graph_context::build_moe_stream_layer(
+         ggml_tensor * cur,
+         ggml_tensor * router_inp,
+         ggml_tensor * selected_experts,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+         ggml_tensor * gate_up_exps,
+llama_expert_gating_func_type gating_op,
+       llm_moe_split & split_data,
+ const llm_moe_split * & split,
+                 int   il) const {
+    split = nullptr;
+    if (moe_stream == nullptr || moe_cache != nullptr) {
+        return nullptr;
+    }
+    const int64_t n_tokens = selected_experts->ne[1];
+
+    // the read-ahead, as in build_moe_ffn(): the router of the next layer applied to the input of this one
+    ggml_tensor * pf_ids = nullptr;
+    if (router_inp != nullptr) {
+        llama_moe_stream_prefetch pf;
+        bool pf_cpu = moe_stream->prefetch_info(il, n_tokens, pf);
+        bool pf_gpu = !pf_cpu && moe_stream->forecast_info(il, n_tokens, pf);
+        if ((pf_cpu || pf_gpu) && !(router_inp->ne[0] == pf.gate_inp->ne[0] && ggml_nrows(router_inp) == n_tokens &&
+                (pf.norm == nullptr || ggml_nelements(pf.norm) == router_inp->ne[0]))) {
+            pf_cpu = pf_gpu = false;
+        }
+        if (pf_cpu || pf_gpu) {
+            ggml_tensor * x = router_inp;
+            if (pf.norm) {
+                x = ggml_mul(ctx0, x, pf.norm);
+            }
+            ggml_tensor * pf_logits = build_lora_mm(pf.gate_inp, x);
+            if (pf.gate_inp_b) {
+                pf_logits = ggml_add(ctx0, pf_logits, pf.gate_inp_b);
+            }
+            ggml_tensor * pf_probs = pf_logits;
+            switch (gating_op) {
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:       pf_probs = ggml_soft_max(ctx0, pf_logits); break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:       pf_probs = ggml_sigmoid(ctx0, pf_logits);  break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: pf_probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, pf_logits)); break;
+                default: break;
+            }
+            if (pf.exp_probs_b) {
+                pf_probs = ggml_add(ctx0, pf_probs, pf.exp_probs_b);
+            }
+            pf_ids = ggml_argsort_top_k(ctx0, pf_probs, pf.k);
+            cb(pf_ids, "ffn_moe_prefetch_topk", il);
+            ggml_build_forward_expand(gf, pf_ids);
+            if (pf_gpu) {
+                if (ggml_tensor * op = moe_stream->build_forecast(ctx0, pf_ids, il)) {
+                    ggml_backend_sched_set_tensor_backend(sched, op, backend_cpu);
+                    cb(op, "ffn_moe_forecast", il);
+                    ggml_build_forward_expand(gf, op);
+                }
+                pf_ids = nullptr;
+            }
+        }
+    }
+
+    // compute the expert input before the slot lookup, as in build_moe_ffn()
+    ggml_build_forward_expand(gf, cur);
+
+    ggml_tensor * slots = build_moe_stream_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    if (slots == nullptr) {
+        return nullptr;
+    }
+
+    if (pf_ids != nullptr) {
+        if (ggml_tensor * op = moe_stream->build_prefetch(ctx0, pf_ids, slots, il)) {
+            ggml_backend_sched_set_tensor_backend(sched, op, backend_cpu);
+            cb(op, "ffn_moe_prefetch", il);
+            ggml_build_forward_expand(gf, op);
+        }
+    }
+
+    if (!moe_stream->overlap()) {
+        return slots;
+    }
+
+    // overlap: the slots of the missing experts are -1 until they are read. the up/gate matmuls of the cached
+    // experts are the first part (the rows of the missing ones are zero), the wait follows them, then
+    // build_lora_mm_id() adds the second part (the read experts) and computes down with all the slots
+    split_data = {};
+    std::vector<ggml_tensor *> firsts;
+    for (ggml_tensor * w : { gate_up_exps, up_exps, gate_exps }) {
+        if (w == nullptr) {
+            continue;
+        }
+        ggml_tensor * t = build_mm_id_experts(w, moe_stream->get_bank(w), build_hadamard_input(w, cur), slots, true);
+        cb(t, "ffn_moe_cached", il);
+        split_data.first.emplace_back(w, t);
+        firsts.push_back(t);
+    }
+    ggml_tensor * wait = moe_stream->build_wait(ctx0, slots, firsts, il);
+    GGML_ASSERT(wait != nullptr); // overlap() and a streamed layer (it has slots)
+    ggml_backend_sched_set_tensor_backend(sched, wait, backend_cpu);
+    cb(wait, "ffn_moe_slots_wait", il);
+    const int64_t k = slots->ne[0];
+    const int64_t n = slots->ne[1];
+    split_data.ids_b   = ggml_view_2d(ctx0, wait, k, n, wait->nb[1], 0);
+    split_data.ids_all = ggml_view_2d(ctx0, wait, k, n, wait->nb[1], wait->nb[2]);
+    split_data.down    = down_exps;
+    split = &split_data;
+    return slots;
+}
+
 ggml_tensor * llm_graph_context::build_moe_stream_slots(
          ggml_tensor * selected_experts,
          ggml_tensor * up_exps,

@@ -571,8 +571,15 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         cb(w, "ffn_moe_weights", il);
 
         ggml_tensor * xr   = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-        ggml_tensor * gate = build_lora_mm_id(layer.ffn_gate_exps, xr, selected);
-        ggml_tensor * up   = build_lora_mm_id(layer.ffn_up_exps,   xr, selected);
+        // with a MoE stream, the small batches are computed from its expert cache, with its read-ahead and overlap
+        // (see build_moe_stream_layer; the router is a sigmoid with ffn_exp_probs_b)
+        llm_moe_split         split_data;
+        const llm_moe_split * split = nullptr;
+        ggml_tensor * slots = build_moe_stream_layer(xr, cur, selected, layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+                nullptr, LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, split_data, split, il);
+
+        ggml_tensor * gate = build_lora_mm_id(layer.ffn_gate_exps, xr, selected, nullptr, slots, true, split);
+        ggml_tensor * up   = build_lora_mm_id(layer.ffn_up_exps,   xr, selected, nullptr, slots, true, split);
 
         // NVFP4 experts are unscaled (up to ~2.7e3): F32 accumulation avoids F16 overflow
         if (layer.ffn_gate_exps_s) {
@@ -585,7 +592,7 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
         }
         ggml_tensor * h = ggml_mul(ctx0, softcap_swiglu(gate, up), ggml_reshape_3d(ctx0, w, 1, n_expert_used, n_tokens));
 
-        ggml_tensor * experts = build_lora_mm_id(layer.ffn_down_exps, h, selected);
+        ggml_tensor * experts = build_lora_mm_id(layer.ffn_down_exps, h, selected, nullptr, slots, true, split);
         if (layer.ffn_down_exps_s) {
             ggml_prec_set_acc(experts, GGML_PREC_F32);
             experts = ggml_mul(ctx0, experts, expert_scale(layer.ffn_down_exps_s, selected));
