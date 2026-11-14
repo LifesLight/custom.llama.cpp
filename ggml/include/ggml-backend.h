@@ -254,6 +254,13 @@ extern "C" {
     GGML_API ggml_backend_reg_t ggml_backend_reg_get(size_t index);
     GGML_API ggml_backend_reg_t ggml_backend_reg_by_name(const char * name);
 
+    // Optional CUDA registry procedures for in-process buffer eviction.
+    typedef bool (*ggml_backend_cuda_suspend_configure_t)(const char * devices);
+    typedef bool (*ggml_backend_cuda_suspend_prepare_t)(void);
+    typedef bool (*ggml_backend_cuda_suspend_set_t)(bool suspend);
+    typedef bool (*ggml_backend_cuda_suspend_target_t)(const char * device, unsigned char uuid[16], size_t * restore_bytes);
+    typedef void (*ggml_backend_cuda_suspend_weight_t)(const struct ggml_tensor * tensor, const char * path, size_t offset);
+
     // Device enumeration
     GGML_API size_t             ggml_backend_dev_count(void);
     GGML_API ggml_backend_dev_t ggml_backend_dev_get(size_t index);
