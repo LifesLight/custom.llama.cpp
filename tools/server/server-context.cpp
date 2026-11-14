@@ -35,6 +35,16 @@
 #include <utility>
 #include <fstream>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstring>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -45,6 +55,67 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+#if defined(__linux__)
+static bool server_run_resume_hook(std::vector<std::string> & args, int timeout_seconds) {
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 1);
+    for (auto & arg : args) {
+        argv.push_back(arg.data());
+    }
+    argv.push_back(nullptr);
+
+    posix_spawnattr_t attrs;
+    int err = posix_spawnattr_init(&attrs);
+    if (err != 0) {
+        SRV_ERR("cannot initialize CUDA resume hook: %s\n", strerror(err));
+        return false;
+    }
+    // A separate process group lets a timeout also stop the hook's children.
+    err = posix_spawnattr_setflags(&attrs, POSIX_SPAWN_SETPGROUP);
+    if (err == 0) {
+        err = posix_spawnattr_setpgroup(&attrs, 0);
+    }
+    pid_t pid = 0;
+    if (err == 0) {
+        err = posix_spawn(&pid, argv[0], nullptr, &attrs, argv.data(), environ);
+    }
+    posix_spawnattr_destroy(&attrs);
+    if (err != 0) {
+        SRV_ERR("cannot start CUDA resume hook '%s': %s\n", args.front().c_str(), strerror(err));
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+    int status;
+    for (;;) {
+        const pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                return true;
+            }
+            if (WIFEXITED(status)) {
+                SRV_WRN("CUDA resume hook exited with status %d\n", WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                SRV_WRN("CUDA resume hook stopped by signal %d\n", WTERMSIG(status));
+            }
+            return false;
+        }
+        if (result < 0 && errno != EINTR) {
+            SRV_ERR("cannot wait for CUDA resume hook: %s\n", strerror(errno));
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            kill(-pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            }
+            SRV_WRN("CUDA resume hook timed out after %d seconds\n", timeout_seconds);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+#endif
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -1079,6 +1150,10 @@ public:
         return metrics;
     }
 
+    bool is_gpu_suspended() const {
+        return gpu_suspended.load();
+    }
+
     void reset_metrics_bucket() {
         metrics.reset_bucket();
     }
@@ -1145,6 +1220,11 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+    ggml_backend_cuda_suspend_prepare_t gpu_suspend_prepare = nullptr;
+    ggml_backend_cuda_suspend_set_t gpu_suspend_set = nullptr;
+    ggml_backend_cuda_suspend_target_t gpu_suspend_target = nullptr;
+    std::atomic<bool> gpu_suspended{false};
+    std::vector<int> gpu_suspend_tasks;
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -1215,6 +1295,129 @@ private:
         return true;
     }
 
+    bool configure_gpu_suspend() {
+        if (params_base.split_mode != LLAMA_SPLIT_MODE_NONE && params_base.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+            SRV_ERR("%s", "--can-suspend requires --split-mode none or layer\n");
+            return false;
+        }
+        const auto reg = ggml_backend_reg_by_name("CUDA");
+        if (reg == nullptr) {
+            SRV_ERR("%s", "--can-suspend requires a CUDA backend\n");
+            return false;
+        }
+        const auto configure = reinterpret_cast<ggml_backend_cuda_suspend_configure_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_suspend_configure"));
+        gpu_suspend_prepare = reinterpret_cast<ggml_backend_cuda_suspend_prepare_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_suspend_prepare"));
+        gpu_suspend_set = reinterpret_cast<ggml_backend_cuda_suspend_set_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_suspend_set"));
+        if (!configure || !gpu_suspend_prepare || !gpu_suspend_set || !configure(params_base.suspend_devices.c_str())) {
+            SRV_ERR("cannot configure CUDA suspend on %s (requires CUDA VMM and physical devices)\n",
+                    params_base.suspend_devices.c_str());
+            return false;
+        }
+        if (!params_base.resume_hook.empty()) {
+#if defined(__linux__)
+            if (!std::filesystem::path(params_base.resume_hook).is_absolute() ||
+                    access(params_base.resume_hook.c_str(), X_OK) != 0) {
+                SRV_ERR("CUDA resume hook must be an executable at an absolute path: '%s'\n",
+                        params_base.resume_hook.c_str());
+                return false;
+            }
+            gpu_suspend_target = reinterpret_cast<ggml_backend_cuda_suspend_target_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_suspend_target"));
+            if (!gpu_suspend_target) {
+                SRV_ERR("%s", "CUDA backend does not support resume hook targets\n");
+                return false;
+            }
+#else
+            SRV_ERR("%s", "CUDA resume hooks are supported on Linux only\n");
+            return false;
+#endif
+        }
+        if (params_base.sleep_idle_seconds >= 0) {
+            SRV_WRN("%s", "--can-suspend disables --sleep-idle-seconds\n");
+            params_base.sleep_idle_seconds = -1;
+        }
+        return true;
+    }
+
+    bool run_gpu_resume_hook() const {
+#if defined(__linux__)
+        std::vector<std::string> args = { params_base.resume_hook };
+        for (const auto & device : string_split<std::string>(params_base.suspend_devices, ',')) {
+            unsigned char uuid[16];
+            size_t restore_bytes;
+            if (!gpu_suspend_target(device.c_str(), uuid, &restore_bytes)) {
+                SRV_ERR("cannot read CUDA resume target for %s\n", device.c_str());
+                return false;
+            }
+            constexpr char hex[] = "0123456789abcdef";
+            std::string gpu_uuid = "GPU-";
+            for (size_t i = 0; i < sizeof(uuid); ++i) {
+                if (i == 4 || i == 6 || i == 8 || i == 10) {
+                    gpu_uuid += '-';
+                }
+                gpu_uuid += hex[uuid[i] >> 4];
+                gpu_uuid += hex[uuid[i] & 0xf];
+            }
+            args.emplace_back("--gpu");
+            args.push_back(device + "," + gpu_uuid + "," + std::to_string(restore_bytes));
+        }
+        return server_run_resume_hook(args, params_base.resume_hook_timeout);
+#else
+        return false;
+#endif
+    }
+
+    // A failed handoff leaves the model suspended so a later request can retry.
+    const char * resume_gpu(bool run_hook = true) {
+        if (!gpu_suspended) {
+            return nullptr;
+        }
+        if (run_hook && gpu_suspend_target && !run_gpu_resume_hook()) {
+            return "CUDA resume hook failed; model remains suspended";
+        }
+        if (!gpu_suspend_set(false)) {
+            SRV_ERR("%s", "failed to restore GPU buffers; model stays suspended\n");
+            return "Failed to restore CUDA buffers";
+        }
+        gpu_suspended = false;
+        return nullptr;
+    }
+
+    void reply_gpu_suspend(int id, bool success, const char * error) {
+        if (!success) {
+            send_error(id, error, ERROR_TYPE_UNAVAILABLE);
+            return;
+        }
+        auto res = std::make_unique<server_task_result_control>();
+        res->id = id;
+        res->success = true;
+        queue_results.send(std::move(res));
+    }
+
+    // Called by the inference loop after all active slots have drained.
+    void suspend_gpu_if_idle() {
+        if (gpu_suspend_tasks.empty() ||
+                std::any_of(slots.begin(), slots.end(), [](const auto & slot) { return slot.is_processing(); })) {
+            return;
+        }
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+        const bool success = gpu_suspend_set(true);
+        gpu_suspended = true;
+        if (!success) {
+            resume_gpu(false);
+        }
+        for (const int id : gpu_suspend_tasks) {
+            reply_gpu_suspend(id, success, "Failed to release CUDA buffers");
+        }
+        gpu_suspend_tasks.clear();
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1225,6 +1428,13 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (!params_base.resume_hook.empty() && !params_base.can_suspend) {
+            SRV_ERR("%s", "--resume-hook requires --can-suspend\n");
+            return false;
+        }
+        if (!is_resume && params_base.can_suspend && !configure_gpu_suspend()) {
+            return false;
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1693,6 +1903,11 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        if (gpu_suspend_prepare && !gpu_suspend_prepare()) {
+            SRV_ERR("%s", "cannot reserve CUDA suspend backing memory; check RAM and selected GPU placement\n");
+            return false;
+        }
 
         // propagate new defaults back to caller
         params = params_base;
@@ -3233,7 +3448,29 @@ private:
             return false;
         }
 
+        if ((gpu_suspended || !gpu_suspend_tasks.empty()) &&
+                (task.type == SERVER_TASK_TYPE_SLOT_SAVE || task.type == SERVER_TASK_TYPE_SLOT_RESTORE ||
+                 task.type == SERVER_TASK_TYPE_SLOT_ERASE || task.type == SERVER_TASK_TYPE_SET_LORA)) {
+            send_error(task, "GPU suspension in progress or active", ERROR_TYPE_UNAVAILABLE);
+            return true;
+        }
+
         switch (task.type) {
+            case SERVER_TASK_TYPE_GPU_SUSPEND:
+                if (gpu_suspended) {
+                    reply_gpu_suspend(task.id, gpu_suspend_set(true), "Failed to release CUDA buffers");
+                } else {
+                    gpu_suspend_tasks.push_back(task.id);
+                }
+                break;
+            case SERVER_TASK_TYPE_GPU_RESUME:
+                if (!gpu_suspend_tasks.empty()) {
+                    send_error(task, "GPU suspension in progress", ERROR_TYPE_UNAVAILABLE);
+                } else {
+                    const char * error = resume_gpu();
+                    reply_gpu_suspend(task.id, error == nullptr, error);
+                }
+                break;
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_TRANSCRIBE_RT:
@@ -3243,6 +3480,14 @@ private:
             case SERVER_TASK_TYPE_TTS:
             case SERVER_TASK_TYPE_DECISION:
                 {
+                    if (!gpu_suspend_tasks.empty()) {
+                        send_error(task, "GPU suspension in progress", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (const char * error = resume_gpu()) {
+                        send_error(task, error, ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
                     if (task.need_sampling() && !decision.can_generate()) {
                         send_error(task, "This model is a decision model without text generation, use /v1/systemone", ERROR_TYPE_NOT_SUPPORTED);
                         break;
@@ -3316,6 +3561,8 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    gpu_suspend_tasks.erase(std::remove(gpu_suspend_tasks.begin(), gpu_suspend_tasks.end(), task.id_target),
+                                            gpu_suspend_tasks.end());
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
@@ -3732,6 +3979,10 @@ private:
     }
 
     void update_slots() {
+        suspend_gpu_if_idle();
+        if (gpu_suspended) {
+            return;
+        }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -6135,6 +6386,32 @@ void server_routes::init_routes() {
         return res;
     };
 
+    auto gpu_control = [this](const server_http_req & req, server_task_type type) {
+        auto res = create_response(true);
+        if (!params.can_suspend) {
+            res->error(format_error_response("GPU suspend is disabled", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        server_task task(type);
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task));
+        if (auto result = res->rd.next(req.should_stop)) {
+            if (result->is_error()) {
+                res->error(result->to_json());
+            } else {
+                res->ok(result->to_json());
+            }
+        }
+        return res;
+    };
+    this->post_suspend = [gpu_control](const server_http_req & req) {
+        return gpu_control(req, SERVER_TASK_TYPE_GPU_SUSPEND);
+    };
+    this->post_resume = [gpu_control](const server_http_req & req) {
+        return gpu_control(req, SERVER_TASK_TYPE_GPU_RESUME);
+    };
+
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.slot_save_path.empty()) {
@@ -6175,7 +6452,12 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            auto props = get_res_props(*meta, params, false);
+            if (params.can_suspend) {
+                props["gpu_suspended"] = ctx_server.is_gpu_suspended();
+                props["suspend_devices"] = params.suspend_devices;
+            }
+            res->ok(props);
         }
         return res;
     };

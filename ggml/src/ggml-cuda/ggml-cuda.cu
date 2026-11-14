@@ -2,6 +2,9 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <fstream>
+#include <unordered_set>
+
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/graph.cuh"
@@ -786,10 +789,23 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(g
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(ctx, device));
 }
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static std::mutex cuda_suspend_mutex;
+static bool cuda_suspend_devices[GGML_CUDA_MAX_DEVICES] = {};
+static bool cuda_suspend_enabled = false;
+static std::unordered_set<ggml_backend_cuda_context *> cuda_suspend_contexts;
+#endif
+
 ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     device(device),
     name(GGML_CUDA_NAME + std::to_string(device)),
     concurrent_stream_context(std::make_unique<ggml_cuda_stream_context>()) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (cuda_suspend_enabled) {
+        std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+        cuda_suspend_contexts.insert(this);
+    }
+#endif
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -912,6 +928,12 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (cuda_suspend_enabled) {
+        std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+        cuda_suspend_contexts.erase(this);
+    }
+#endif
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -941,10 +963,90 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct cuda_suspend_weight {
+    std::string path;
+    size_t file_offset;
+    size_t buffer_offset;
+    size_t size;
+};
+
+struct cuda_suspend_buffer {
+    CUdeviceptr address = 0;
+    size_t reserved = 0;
+    bool mapped = false;
+    size_t tensors = 0;
+    std::vector<cuda_suspend_weight> weights;
+    std::unique_ptr<unsigned char[]> pageable;
+    void * pinned = nullptr;
+
+    ~cuda_suspend_buffer() {
+        if (mapped) {
+            CU_CHECK(cuMemUnmap(address, reserved));
+        }
+        if (address) {
+            CU_CHECK(cuMemAddressFree(address, reserved));
+        }
+        if (pinned) {
+            CUDA_CHECK(cudaFreeHost(pinned));
+        }
+    }
+
+    void * backup() const {
+        return pinned ? pinned : pageable.get();
+    }
+
+    void read_backup(const void * src, void * dst, size_t offset, size_t size) const {
+        GGML_ASSERT(backup());
+        const auto relative = reinterpret_cast<uintptr_t>(src) - address;
+        memcpy(dst, static_cast<const unsigned char *>(backup()) + relative + offset, size);
+    }
+
+    bool map(int device) {
+        const int physical = ggml_cuda_get_physical_device(device);
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location = { CU_MEM_LOCATION_TYPE_DEVICE, physical };
+        CUmemGenericAllocationHandle handle;
+        if (cuMemCreate(&handle, reserved, &prop, 0) != CUDA_SUCCESS) {
+            return false;
+        }
+        const auto result = cuMemMap(address, reserved, 0, handle, 0);
+        CU_CHECK(cuMemRelease(handle));
+        if (result != CUDA_SUCCESS) {
+            return false;
+        }
+        mapped = true;
+        CUmemAccessDesc access[GGML_CUDA_MAX_DEVICES];
+        size_t count = 0;
+        for (int peer = 0; peer < ggml_cuda_info().physical_device_count; ++peer) {
+            int can_access = peer == physical;
+            if (!can_access) {
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, peer, physical));
+            }
+            if (can_access) {
+                access[count++] = { { CU_MEM_LOCATION_TYPE_DEVICE, peer }, CU_MEM_ACCESS_FLAGS_PROT_READWRITE };
+            }
+        }
+        if (cuMemSetAccess(address, reserved, access, count) != CUDA_SUCCESS) {
+            CU_CHECK(cuMemUnmap(address, reserved));
+            mapped = false;
+            return false;
+        }
+        return true;
+    }
+};
+
+static std::unordered_set<ggml_backend_buffer_t> cuda_suspend_buffers;
+#endif
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    std::unique_ptr<cuda_suspend_buffer> suspend;
+#endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -952,12 +1054,24 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (suspend) {
+            ggml_cuda_set_device(device);
+            return;
+        }
+#endif
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ctx->suspend) {
+        std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+        cuda_suspend_buffers.erase(buffer);
+    }
+#endif
     delete ctx;
 }
 
@@ -978,6 +1092,11 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ctx->suspend && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        ++ctx->suspend->tensors;
+    }
+#endif
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
@@ -1010,6 +1129,14 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // A graceful shutdown can serialize KV directly from its host backup.
+    if (ctx->suspend && !ctx->suspend->mapped) {
+        ctx->suspend->read_backup(tensor->data, data, offset, size);
+        return;
+    }
+#endif
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -1058,6 +1185,17 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
 
 static void ggml_backend_cuda_buffer_get_tensor_n(ggml_backend_buffer_t buffer, const struct ggml_tensor * const * tensors, void * const * data, const size_t * offsets, const size_t * sizes, size_t n_tensors) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ctx->suspend && !ctx->suspend->mapped) {
+        for (size_t i = 0; i < n_tensors; ++i) {
+            if (sizes[i]) {
+                ctx->suspend->read_backup(tensors[i]->data, data[i], offsets[i], sizes[i]);
+            }
+        }
+        return;
+    }
+#endif
 
     ggml_cuda_set_device(ctx->device);
 
@@ -1199,6 +1337,29 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (size && cuda_suspend_devices[buft_ctx->device]) {
+        auto state = std::make_unique<cuda_suspend_buffer>();
+        const size_t granularity = ggml_cuda_info().devices[buft_ctx->device].vmm_granularity;
+        if (size > SIZE_MAX - granularity) {
+            return nullptr;
+        }
+        state->reserved = GGML_PAD(size, granularity);
+        if (cuMemAddressReserve(&state->address, state->reserved, 0, 0, 0) != CUDA_SUCCESS ||
+                !state->map(buft_ctx->device)) {
+            GGML_LOG_ERROR("%s: cannot allocate %.2f MiB of suspendable CUDA memory on device %d\n",
+                           __func__, size / 1048576.0, buft_ctx->device);
+            return nullptr;
+        }
+        auto * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, reinterpret_cast<void *>(state->address));
+        ctx->suspend = std::move(state);
+        auto * buffer = ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+        std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+        cuda_suspend_buffers.insert(buffer);
+        return buffer;
+    }
+#endif
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
@@ -6865,7 +7026,278 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool ggml_backend_cuda_suspend_configure(const char * devices) {
+    const auto & info = ggml_cuda_info();
+    if (info.device_count != info.physical_device_count || getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY")) {
+        return false;
+    }
+
+    bool selected[GGML_CUDA_MAX_DEVICES] = {};
+    const std::string list(devices);
+    for (size_t start = 0;;) {
+        const size_t end = list.find(',', start);
+        const auto name = list.substr(start, end == std::string::npos ? end : end - start);
+        int device = 0;
+        while (device < info.device_count && name != "CUDA" + std::to_string(device)) {
+            ++device;
+        }
+        if (device == info.device_count || !info.devices[device].vmm || selected[device]) {
+            return false;
+        }
+        selected[device] = true;
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    std::copy_n(selected, GGML_CUDA_MAX_DEVICES, cuda_suspend_devices);
+    cuda_suspend_enabled = true;
+    return true;
+}
+
+static bool ggml_backend_cuda_suspend_target(const char * name, unsigned char uuid[16], size_t * restore_bytes) {
+    std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+    for (int device = 0; device < ggml_cuda_info().device_count; ++device) {
+        if (!cuda_suspend_devices[device] || name != ("CUDA" + std::to_string(device))) {
+            continue;
+        }
+        CUdevice cu_device;
+        CUuuid cu_uuid;
+        if (cuDeviceGet(&cu_device, ggml_cuda_get_physical_device(device)) != CUDA_SUCCESS ||
+                cuDeviceGetUuid(&cu_uuid, cu_device) != CUDA_SUCCESS) {
+            return false;
+        }
+        memcpy(uuid, cu_uuid.bytes, sizeof(cu_uuid.bytes));
+        *restore_bytes = 0;
+        for (const auto * buffer : cuda_suspend_buffers) {
+            const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(buffer->context);
+            if (ctx->device == device && !ctx->suspend->mapped) {
+                *restore_bytes += ctx->suspend->reserved;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static void ggml_backend_cuda_suspend_weight(const ggml_tensor * tensor, const char * path, size_t offset) {
+    if (!cuda_suspend_enabled || !tensor->buffer || tensor->view_src ||
+            !ggml_backend_buffer_is_cuda(tensor->buffer) || !*path) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    if (ctx->suspend) {
+        const size_t dst = reinterpret_cast<uintptr_t>(tensor->data) - ctx->suspend->address;
+        ctx->suspend->weights.push_back({path, offset, dst, ggml_nbytes(tensor)});
+    }
+}
+
+static bool cuda_suspend_needs_backup(ggml_backend_buffer_t buffer, const cuda_suspend_buffer & state) {
+    const auto usage = ggml_backend_buffer_get_usage(buffer);
+    return usage != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        (usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || state.weights.empty() || state.weights.size() != state.tensors);
+}
+
+static bool cuda_suspend_prepare_buffers() {
+    if (cuda_suspend_buffers.empty()) {
+        return false;
+    }
+    try {
+        for (auto * buffer : cuda_suspend_buffers) {
+            auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+            auto & state = *ctx->suspend;
+            if (!cuda_suspend_needs_backup(buffer, state) || state.backup()) {
+                continue;
+            }
+            ggml_cuda_set_device(ctx->device);
+            if (cudaMallocHost(&state.pinned, buffer->size) != cudaSuccess) {
+                (void)cudaGetLastError();
+                state.pinned = nullptr;
+                state.pageable.reset(new unsigned char[buffer->size]);
+                volatile unsigned char * pages = state.pageable.get();
+                for (size_t offset = 0; offset < buffer->size; offset += 4096) {
+                    pages[offset] = 0;
+                }
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_backend_cuda_suspend_prepare() {
+    std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+    return cuda_suspend_prepare_buffers();
+}
+
+static void cuda_suspend_trim() {
+    for (auto * ctx : cuda_suspend_contexts) {
+#ifdef USE_CUDA_GRAPH
+        ctx->cuda_graphs.clear();
+#endif
+        for (int device = 0; device < ggml_cuda_info().device_count; ++device) {
+            if (!cuda_suspend_devices[device]) {
+                continue;
+            }
+            ggml_cuda_set_device(device);
+            for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+                if (ctx->cublas_handles[device][stream]) {
+                    CUBLAS_CHECK(cublasDestroy(ctx->cublas_handles[device][stream]));
+                    ctx->cublas_handles[device][stream] = nullptr;
+                }
+                if (ctx->cublas_workspaces[device][stream]) {
+                    CUDA_CHECK(cudaFree(ctx->cublas_workspaces[device][stream]));
+                    ctx->cublas_workspaces[device][stream] = nullptr;
+                }
+                ctx->pools[device][stream].reset();
+            }
+#if CUDART_VERSION >= 11080
+            if (ctx->cublaslt_handles[device]) {
+                CUBLAS_CHECK(cublasLtDestroy(ctx->cublaslt_handles[device]));
+                ctx->cublaslt_handles[device] = nullptr;
+            }
+#endif
+        }
+    }
+}
+
+static bool cuda_suspend_reload_weights(const ggml_backend_cuda_buffer_context & ctx, size_t size,
+                                        std::unordered_map<std::string, std::ifstream> & files,
+                                        std::vector<char> & staging) {
+    // Clear the quantized padding and gaps between tensors.
+    if (cudaMemset(ctx.dev_ptr, 0, size) != cudaSuccess ||
+            cudaStreamSynchronize(nullptr) != cudaSuccess) {
+        return false;
+    }
+    for (const auto & weight : ctx.suspend->weights) {
+        auto [it, inserted] = files.try_emplace(weight.path);
+        auto & file = it->second;
+        if (inserted) {
+            file.open(weight.path, std::ios::binary);
+        }
+        if (!file.seekg(weight.file_offset)) {
+            return false;
+        }
+        for (size_t done = 0; done < weight.size;) {
+            const size_t count = std::min(staging.size(), weight.size - done);
+            if (!file.read(staging.data(), count) ||
+                    cudaMemcpy(static_cast<char *>(ctx.dev_ptr) + weight.buffer_offset + done,
+                               staging.data(), count, cudaMemcpyHostToDevice) != cudaSuccess) {
+                return false;
+            }
+            done += count;
+        }
+    }
+    return cudaStreamSynchronize(nullptr) == cudaSuccess;
+}
+
+static bool ggml_backend_cuda_suspend_set(bool suspend) {
+    std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+    if (suspend) {
+        if (!cuda_suspend_prepare_buffers()) {
+            return false;
+        }
+        for (int device = 0; device < ggml_cuda_info().device_count; ++device) {
+            if (cuda_suspend_devices[device]) {
+                ggml_cuda_set_device(device);
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    return false;
+                }
+            }
+        }
+
+        // Snapshot before unmapping anything, so a failed copy leaves the model usable.
+        for (auto * buffer : cuda_suspend_buffers) {
+            auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+            auto & state = *ctx->suspend;
+            ggml_cuda_set_device(ctx->device);
+            if (state.mapped && state.backup() &&
+                    cudaMemcpy(state.backup(), ctx->dev_ptr, buffer->size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                return false;
+            }
+        }
+
+        cuda_suspend_trim();
+        for (auto * buffer : cuda_suspend_buffers) {
+            auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+            auto & state = *ctx->suspend;
+            ggml_cuda_set_device(ctx->device);
+            if (state.mapped && cuMemUnmap(state.address, state.reserved) != CUDA_SUCCESS) {
+                return false;
+            }
+            state.mapped = false;
+        }
+        return true;
+    }
+
+    std::vector<ggml_backend_cuda_buffer_context *> restored;
+    bool success = true;
+    try {
+        restored.reserve(cuda_suspend_buffers.size());
+        std::unordered_map<std::string, std::ifstream> files;
+        std::vector<char> staging;
+        for (auto * buffer : cuda_suspend_buffers) {
+            auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+            auto & state = *ctx->suspend;
+            if (state.mapped) {
+                continue;
+            }
+            ggml_cuda_set_device(ctx->device);
+            if (!state.map(ctx->device)) {
+                success = false;
+                break;
+            }
+            restored.push_back(ctx);
+            if (state.backup()) {
+                success = cudaMemcpy(ctx->dev_ptr, state.backup(), buffer->size, cudaMemcpyHostToDevice) == cudaSuccess &&
+                          cudaStreamSynchronize(nullptr) == cudaSuccess;
+            } else if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                if (staging.empty()) {
+                    staging.resize(8 * 1024 * 1024);
+                }
+                success = cuda_suspend_reload_weights(*ctx, buffer->size, files, staging);
+            }
+            if (!success) {
+                break;
+            }
+        }
+    } catch (const std::exception &) {
+        success = false;
+    }
+    if (!success) {
+        // A later request may retry once enough VRAM is available.
+        for (auto * ctx : restored) {
+            ggml_cuda_set_device(ctx->device);
+            (void)cudaStreamSynchronize(nullptr);
+            CU_CHECK(cuMemUnmap(ctx->suspend->address, ctx->suspend->reserved));
+            ctx->suspend->mapped = false;
+        }
+    }
+    return success;
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_suspend_configure") == 0) {
+        return (void *)ggml_backend_cuda_suspend_configure;
+    }
+    if (strcmp(name, "ggml_backend_cuda_suspend_prepare") == 0) {
+        return (void *)ggml_backend_cuda_suspend_prepare;
+    }
+    if (strcmp(name, "ggml_backend_cuda_suspend_set") == 0) {
+        return (void *)ggml_backend_cuda_suspend_set;
+    }
+    if (strcmp(name, "ggml_backend_cuda_suspend_target") == 0) {
+        return (void *)ggml_backend_cuda_suspend_target;
+    }
+    if (strcmp(name, "ggml_backend_cuda_suspend_weight") == 0) {
+        return (void *)ggml_backend_cuda_suspend_weight;
+    }
+#endif
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

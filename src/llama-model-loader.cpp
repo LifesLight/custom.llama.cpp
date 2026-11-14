@@ -1822,6 +1822,9 @@ bool llama_model_loader::load_all_data(
 
     // staging buffer for non-host buffers without async uploads, reused because a fresh allocation per tensor page faults on every load
     std::vector<no_init<uint8_t>> read_buf;
+    const auto cuda_reg = ggml_backend_reg_by_name("CUDA");
+    const auto suspend_weight = cuda_reg ? reinterpret_cast<ggml_backend_cuda_suspend_weight_t>(
+        ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_suspend_weight")) : nullptr;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1967,6 +1970,9 @@ bool llama_model_loader::load_all_data(
             }
         }
 
+        if (suspend_weight) {
+            suspend_weight(cur, fnames.at(weight->idx).c_str(), weight->offs);
+        }
         size_done += n_size;
     }
 

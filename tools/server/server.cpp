@@ -247,6 +247,8 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.post("/suspend",                  ex_wrapper(routes.post_suspend));
+    ctx_http.post("/resume",                   ex_wrapper(routes.post_resume));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -589,6 +591,8 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     routes.post_lora_adapters          = models_routes->proxy_post;
     routes.get_slots                   = models_routes->proxy_get;
     routes.post_slots                  = models_routes->proxy_post;
+    routes.post_suspend                = models_routes->proxy_post;
+    routes.post_resume                 = models_routes->proxy_post;
 
     // custom routes for router
     routes.get_props                   = models_routes->get_router_props;

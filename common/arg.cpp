@@ -3999,6 +3999,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--can-suspend"},
+        "enable manual HTTP suspend for selected CUDA devices (default: disabled)",
+        [](common_params & params) {
+            params.can_suspend = true;
+        }
+    ).set_env("LLAMA_ARG_CAN_SUSPEND").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--suspend-devices"}, "DEVICES",
+        "comma-separated CUDA devices to suspend (default: CUDA0)",
+        [](common_params & params, const std::string & value) {
+            params.suspend_devices = value;
+        }
+    ).set_env("LLAMA_ARG_SUSPEND_DEVICES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--resume-hook"}, "PATH",
+        "absolute path to an executable to run before restoring suspended CUDA buffers (Linux)",
+        [](common_params & params, const std::string & value) {
+            params.resume_hook = value;
+        }
+    ).set_env("LLAMA_ARG_RESUME_HOOK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--resume-hook-timeout"}, "SECONDS",
+        string_format("maximum time for the CUDA resume hook (default: %d)", params.resume_hook_timeout),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("resume hook timeout must be positive");
+            }
+            params.resume_hook_timeout = value;
+        }
+    ).set_env("LLAMA_ARG_RESUME_HOOK_TIMEOUT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--sleep-idle-seconds"}, "SECONDS",
         string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
         [](common_params & params, int value) {

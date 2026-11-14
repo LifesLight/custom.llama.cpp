@@ -3542,6 +3542,9 @@ struct mtmd_model_loader {
             ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             // read the weight from file
             if (!no_alloc) {
+                const auto cuda_reg = ggml_backend_reg_by_name("CUDA");
+                const auto suspend_weight = cuda_reg ? reinterpret_cast<ggml_backend_cuda_suspend_weight_t>(
+                    ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_suspend_weight")) : nullptr;
                 size_t data_loaded = 0;
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(model.ctx_data.get(), t->name);
@@ -3562,6 +3565,9 @@ struct mtmd_model_loader {
                         read_buf.resize(num_bytes);
                         fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
                         ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
+                    }
+                    if (suspend_weight) {
+                        suspend_weight(cur, fname.c_str(), offset);
                     }
                     data_loaded += num_bytes;
                     if (progress_callback && total_data_size > 0) {

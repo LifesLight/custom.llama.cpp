@@ -2612,6 +2612,22 @@ Example of an error:
 }
 ```
 
+## Manual CUDA suspend
+
+Start a CUDA build with `--can-suspend` (or `LLAMA_ARG_CAN_SUSPEND=1`). It targets `CUDA0` by default. Use `--suspend-devices CUDA0,CUDA1` (or `LLAMA_ARG_SUSPEND_DEVICES`) to select both. Device names follow llama-server's `--list-devices` output. This requires CUDA virtual memory support and `--split-mode none` or `layer`. Enabling it disables `--sleep-idle-seconds`.
+
+- `POST /suspend` waits for active requests to finish, backs up the selected devices' KV and other live GPU state in RAM, then releases their buffers. A successful response means the buffers have been released. The CUDA context stays alive.
+- The next inference request restores the selected devices before running. `POST /resume` performs the same restore explicitly. If there is insufficient GPU memory, the server returns an error and a later request can retry.
+- `GET /props` reports `gpu_suspended` and `suspend_devices` when this feature is enabled. Health and status requests leave the model suspended.
+
+Leave host RAM for the selected devices' full KV allocations, including any GPU draft KV, plus auxiliary GPU state that cannot be rebuilt from disk. The CPU expert bank stays resident. Keep the model and mmproj files available and unchanged for weight reloads.
+
+With llama-swap, use `POST /upstream/<model-id>/suspend` and `POST /upstream/<model-id>/resume`. Keep the model's server process alive to retain the RAM state.
+
+On Linux, `--resume-hook /absolute/path/to/executable` (or `LLAMA_ARG_RESUME_HOOK`) runs a program before a suspended model restores GPU buffers. Both explicit and inference-triggered resume use the hook. The executable is launched directly with one `--gpu CUDA0,GPU-<uuid>,<restore-bytes>` argument pair per selected device. The UUID identifies the physical GPU regardless of `CUDA_VISIBLE_DEVICES`. Restore bytes count the unmapped CUDA allocations, excluding any extra workspace allocated by later inference.
+
+The hook inherits the server environment. Exit zero to allow restore. A nonzero exit or timeout leaves the model suspended and returns HTTP 503 so another request can retry. Set the time limit with `--resume-hook-timeout SECONDS` or `LLAMA_ARG_RESUME_HOOK_TIMEOUT` (default 120 seconds).
+
 ## Sleeping on Idle
 
 The server supports an automatic sleep mode that activates after a specified period of inactivity (no incoming tasks). This feature, introduced in [PR #18228](https://github.com/ggml-org/llama.cpp/pull/18228), can be enabled using the `--sleep-idle-seconds` command-line argument. It works seamlessly in both single-model and multi-model configurations.
