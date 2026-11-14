@@ -300,7 +300,14 @@ struct mtmd_model_loader {
                         hparams.rope_theta = 10000.0f;
                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
                         hparams.image_resize_pad  = PAD_NONE;
-                        hparams.warmup_image_size = 640;
+                        if (hparams.custom_image_max_tokens > 0) {
+                            constexpr int cell_area = 40 * 40;
+                            if (hparams.custom_image_max_tokens > INT32_MAX / cell_area) {
+                                throw std::runtime_error("Inkling 2 image token limit is too large");
+                            }
+                            hparams.image_max_pixels = hparams.custom_image_max_tokens * cell_area;
+                        }
+                        hparams.set_warmup_n_tokens(256);
                     } break;
                 case PROJECTOR_TYPE_INKLING:
                     {

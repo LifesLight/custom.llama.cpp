@@ -940,15 +940,47 @@ mtmd_image_preproc_out mtmd_image_preprocessor_inkling2::preprocess(const mtmd_i
     const int cell = hparams.patch_size * hparams.n_merge;
     GGML_ASSERT(cell == 40);
 
-    const auto size = img.get_size();
-    const int rows = (size.height + cell - 1) / cell;
-    const int cols = (size.width  + cell - 1) / cell;
-    const mtmd_image_size padded = { cols * cell, rows * cell };
+    const auto padded_size = [cell](mtmd_image_size size) -> mtmd_image_size {
+        return { MTMD_ALIGN(size.width, cell), MTMD_ALIGN(size.height, cell) };
+    };
+    const auto fits = [&](mtmd_image_size size) {
+        const auto padded = padded_size(size);
+        return int64_t(padded.width) * padded.height <= hparams.image_max_pixels;
+    };
+
+    const auto original = img.get_size();
+    mtmd_image_u8 resized;
+    const mtmd_image_u8 * input = &img;
+    if (hparams.image_max_pixels > 0 && !fits(original)) {
+        const bool landscape = original.width >= original.height;
+        const int long_edge = std::max(original.width, original.height);
+        const int short_edge = std::min(original.width, original.height);
+        const auto scaled_size = [&](int edge) -> mtmd_image_size {
+            const int other = std::max(1, static_cast<int>(int64_t(short_edge) * edge / long_edge));
+            return landscape ? mtmd_image_size{edge, other} : mtmd_image_size{other, edge};
+        };
+
+        // Find the largest proportional resize whose padded grid fits the token budget.
+        int lo = 1;
+        int hi = long_edge;
+        while (hi - lo > 1) {
+            const int mid = lo + (hi - lo) / 2;
+            if (fits(scaled_size(mid))) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        img_tool::resize(img, resized, scaled_size(lo), hparams.image_resize_algo, PAD_NONE);
+        input = &resized;
+    }
+    const auto size = input->get_size();
+    const auto padded = padded_size(size);
 
     mtmd_image_f32 out;
-    out.set_size(padded, img.is_placeholder(), false);
+    out.set_size(padded, input->is_placeholder(), false);
     mtmd_image_preproc_out output;
-    if (img.is_placeholder()) {
+    if (input->is_placeholder()) {
         output.entries.push_back(std::move(out));
         return output;
     }
@@ -975,7 +1007,7 @@ mtmd_image_preproc_out mtmd_image_preprocessor_inkling2::preprocess(const mtmd_i
         for (int x = 0; x < padded.width; ++x) {
             const size_t off = ((size_t) y * padded.width + x) * 3;
             const bool in_image = y < size.height && x < size.width;
-            const auto rgb = in_image ? img.get_pixel(x, y) : std::array<uint8_t, 3>{ 0, 0, 0 };
+            const auto rgb = in_image ? input->get_pixel(x, y) : std::array<uint8_t, 3>{ 0, 0, 0 };
             for (int c = 0; c < 3; ++c) {
                 buf[off + c] = lut[c][in_image ? rgb[c] + 1 : 0];
             }

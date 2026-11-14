@@ -119,6 +119,21 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+// mixed token/embd ubatch: 1 for the token rows, 0 for the embd rows
+class llm_graph_input_inkling2_tok : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch->is_mixed() && tok_mask->ne[1] == (int64_t) ubatch->n_tokens);
+        std::vector<float> data(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            data[i] = ubatch->type[i] == 0 ? 1.0f : 0.0f;
+        }
+        ggml_backend_tensor_set(tok_mask, data.data(), 0, ggml_nbytes(tok_mask));
+    }
+
+    ggml_tensor * tok_mask = nullptr; // [1, n_tokens]
+};
+
 class llm_graph_input_inkling2 : public llm_graph_input_i {
 public:
     llm_graph_input_inkling2(const llama_hparams & hparams, const llama_memory_hybrid_iswa_context * mctx) :
@@ -607,8 +622,21 @@ llama_model_inkling2::graph::graph(const llama_model & model, const llm_graph_pa
     };
 
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
-    ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.token) {
+    if (ubatch.is_mixed()) {
+        // the token embeddings are normed, the media embeddings are not: select per row, exactly
+        // (m*n + (1 - m)*x with m in {0, 1} gives n or x bit for bit)
+        auto inp_tok = std::make_unique<llm_graph_input_inkling2_tok>();
+        inp_tok->tok_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(inp_tok->tok_mask);
+        cb(inp_tok->tok_mask, "inp_tok_mask", -1);
+        ggml_tensor * m = inp_tok->tok_mask;
+        res->add_input(std::move(inp_tok));
+        if (cur->type != GGML_TYPE_F32) {
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        }
+        ggml_tensor * normed = build_norm(cur, model.tok_norm, NULL, LLM_NORM_RMS, -1);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, normed, m), ggml_mul(ctx0, cur, ggml_scale_bias(ctx0, m, -1.0f, 1.0f)));
+    } else if (ubatch.token) {
         cur = build_norm(cur, model.tok_norm, NULL, LLM_NORM_RMS, -1);
     }
     if (cur->type != GGML_TYPE_F32) {
