@@ -19,7 +19,7 @@ struct llama_moe_hot_params {
 // a GPU tier for the experts of the MoE stream during decode: the most used streamed experts are executed from
 // banks on the GPUs, the others keep the CPU path of the stream. the banks are allocated once per small-batch
 // phase, one bank per weight layout (role, type, shape) and device; their contents change only between
-// synchronized batches, and the GGUF stays the backing store of every expert
+// synchronized batches, and the GGUF stays the backing store of every expert: the banks are released without copies
 class llama_moe_hot {
 public:
     // seeded with the most used experts of the stream; call between synchronized graphs
@@ -53,7 +53,6 @@ public:
     // between synchronized batches
     bool update_due() const;
     bool update(llama_moe_stream & stream, double synchronize_ms); // true if the graph topology changed
-    void demote_all(llama_moe_stream & stream);                    // admit the GPU experts to RAM before release
 
 private:
     struct impl;

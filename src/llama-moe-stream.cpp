@@ -3578,9 +3578,9 @@ struct llama_moe_stream::impl {
         }
     }
 
-    // admit expert e of layer li into the slot that the policy evicts first, its tensors written by reader. with
-    // spare_tier, not into the RAM copy of another expert of the tier (the whole tier is released)
-    bool restore_ram(int il, int e, const llama_moe_stream::expert_reader & reader, bool spare_tier) {
+    // admit expert e of layer li into the slot that the policy evicts first (a RAM copy of an expert of the tier if
+    // there is one), its tensors written by reader
+    bool restore_ram(int il, int e, const llama_moe_stream::expert_reader & reader) {
         if (il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
             return false;
         }
@@ -3596,8 +3596,7 @@ struct llama_moe_stream::impl {
         int32_t best = -1;
         for (int32_t s = 0; s < (int32_t) p.n_slots; ++s) {
             const int lo = p.slot_layer[s];
-            if (p.busy[s] || p.pf[s] || (lo != li && layers[lo].n_cached <= layers[lo].n_min) ||
-                    (spare_tier && in_tier(lo, p.slot_expert[s]))) {
+            if (p.busy[s] || p.pf[s] || (lo != li && layers[lo].n_cached <= layers[lo].n_min)) {
                 continue;
             }
             if (best < 0 || evict_before(p, s, best)) {
@@ -4069,47 +4068,98 @@ void llama_moe_stream::quiesce_hot() {
 }
 
 bool llama_moe_stream::with_expert(int il, int e, const expert_writer & writer) {
+    return with_experts({ { il, e } }, [&](size_t, const ggml_tensor * t, const void * src, size_t size) { writer(t, src, size); });
+}
+
+bool llama_moe_stream::with_experts(const std::vector<std::pair<int, int>> & experts, const expert_batch_writer & writer) {
 #ifdef __linux__
-    if (il < 0 || il >= (int) pimpl->layer_of_il.size() || pimpl->layer_of_il[il] < 0) {
-        return false;
-    }
-    const auto & l = pimpl->layers[pimpl->layer_of_il[il]];
-    if (e < 0 || e >= l.n_expert) {
-        return false;
-    }
-    const int s = l.slot_of[e];
-    std::vector<uint8_t> plane; // an expert not in RAM is read one tensor at a time
-    for (int idx : l.tensors) {
-        const auto & t = pimpl->tensors[idx];
-        if (s >= 0) {
-            writer(t.t, t.bank_data + s*t.expert_size, t.expert_size);
+    struct item {
+        size_t              i;
+        const impl::layer * l;
+        int                 e;
+    };
+    std::vector<item> disk;
+    for (size_t i = 0; i < experts.size(); ++i) {
+        const auto [il, e] = experts[i];
+        if (il < 0 || il >= (int) pimpl->layer_of_il.size() || pimpl->layer_of_il[il] < 0) {
+            return false;
+        }
+        const auto & l = pimpl->layers[pimpl->layer_of_il[il]];
+        if (e < 0 || e >= l.n_expert) {
+            return false;
+        }
+        const int s = l.slot_of[e];
+        if (s < 0) {
+            disk.push_back({ i, &l, e });
             continue;
         }
-        plane.resize(t.expert_size);
-        impl::wait_group wg;
-        pimpl->submit_bounce(t.file, t.file_offs + e*t.expert_size, t.expert_size, plane.data(), wg);
-        if (!pimpl->wait(wg)) {
-            throw std::runtime_error("moe_stream: read of a GPU tier expert failed");
+        for (int idx : l.tensors) {
+            const auto & t = pimpl->tensors[idx];
+            writer(i, t.t, t.bank_data + s*t.expert_size, t.expert_size);
         }
-        writer(t.t, plane.data(), t.expert_size);
+    }
+
+    // the others from the model file, in chunks that the IO threads read while the previous one is written
+    constexpr size_t CHUNK = 256ull*1024*1024;
+    std::vector<uint8_t> buf[2];
+    impl::wait_group     wg[2];
+    size_t next = 0;
+    auto submit = [&](int b) {
+        const size_t begin = next;
+        size_t bytes = 0;
+        while (next < disk.size()) {
+            const size_t n = pimpl->expert_bytes(*disk[next].l);
+            if (next > begin && bytes + n > CHUNK) {
+                break;
+            }
+            bytes += n;
+            next++;
+        }
+        buf[b].resize(std::max(buf[b].size(), bytes));
+        size_t off = 0;
+        for (size_t j = begin; j < next; ++j) {
+            for (int idx : disk[j].l->tensors) {
+                const auto & t = pimpl->tensors[idx];
+                pimpl->submit_bounce(t.file, t.file_offs + disk[j].e*t.expert_size, t.expert_size, buf[b].data() + off, wg[b]);
+                off += t.expert_size;
+            }
+        }
+        return std::make_pair(begin, next);
+    };
+    int  cur   = 0;
+    auto range = submit(cur);
+    while (range.first < range.second) {
+        const auto ahead = submit(1 - cur);
+        if (!pimpl->wait(wg[cur])) {
+            pimpl->wait(wg[1 - cur]); // the reads into the other buffer finish before it is freed
+            throw std::runtime_error("moe_stream: read of GPU tier experts failed");
+        }
+        size_t off = 0;
+        for (size_t j = range.first; j < range.second; ++j) {
+            for (int idx : disk[j].l->tensors) {
+                const auto & t = pimpl->tensors[idx];
+                writer(disk[j].i, t.t, buf[cur].data() + off, t.expert_size);
+                off += t.expert_size;
+            }
+        }
+        cur   = 1 - cur;
+        range = ahead;
     }
     return true;
 #else
-    GGML_UNUSED(il);
-    GGML_UNUSED(e);
+    GGML_UNUSED(experts);
     GGML_UNUSED(writer);
     return false;
 #endif
 }
 
-bool llama_moe_stream::restore_expert(int il, int e, const expert_reader & reader, bool spare_tier) {
+bool llama_moe_stream::restore_expert(int il, int e, const expert_reader & reader) {
 #ifdef __linux__
-    return pimpl->restore_ram(il, e, reader, spare_tier);
+    return pimpl->restore_ram(il, e, reader);
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(e);
     GGML_UNUSED(reader);
-    GGML_UNUSED(spare_tier);
     return false;
 #endif
 }

@@ -1154,7 +1154,7 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
-    // Free the GPU expert tier of the MoE stream, admitting its experts back to the RAM cache where possible
+    // Free the GPU expert tier of the MoE stream (the model file backs its experts)
     // It is rebuilt by the next small decode batch. Call before releasing GPU memory (e.g. a CUDA suspend)
     LLAMA_API void llama_moe_hot_release(struct llama_context * ctx);
 

@@ -80,9 +80,13 @@ public:
     using expert_reader = std::function<void(const ggml_tensor *, void *, size_t)>;
     // the tensors of an expert, from the RAM cache or read from the model file, false if not streamed
     bool with_expert(int il, int expert, const expert_writer & writer);
+    // the tensors of the experts (il, expert) for writer(index, ...): from the RAM cache, the others read from the
+    // model file in parallel, while the previous ones are written. false if one is not streamed
+    using expert_batch_writer = std::function<void(size_t, const ggml_tensor *, const void *, size_t)>;
+    bool with_experts(const std::vector<std::pair<int, int>> & experts, const expert_batch_writer & writer);
     // admit an expert to the RAM cache, its tensors written by reader, false if no slot can take it. the RAM copies
-    // of the experts of the tier are evicted first (a decode miss takes them), with spare_tier they are kept
-    bool restore_expert(int il, int expert, const expert_reader & reader, bool spare_tier);
+    // of the experts of the tier are evicted first (a decode miss takes them)
+    bool restore_expert(int il, int expert, const expert_reader & reader);
     // the experts of the tier changed
     void hot_changed();
 

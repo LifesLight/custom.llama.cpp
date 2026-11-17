@@ -1027,9 +1027,10 @@ void llama_context::sched_reserve() {
         sched.reset();
         if (moe_hot_drop) {
             if (moe_hot) {
-                moe_hot->demote_all(*moe_stream);
+                // no copies: the model file backs the experts, and the RAM cache keeps what decode missed
                 moe_stream->set_hot_observer(nullptr);
                 moe_hot.reset();
+                LLAMA_LOG_INFO("moe_hot: released\n");
             }
             moe_hot_drop = false;
         }
