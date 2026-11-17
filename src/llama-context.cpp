@@ -922,7 +922,6 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens) {
                 sched_reserve();
                 if (moe_hot) {
                     moe_stream->set_hot_observer(moe_hot.get());
-                    moe_hot->make_exclusive(*moe_stream);
                 }
             } catch (const std::exception & e) {
                 drop_hot("activation", e);

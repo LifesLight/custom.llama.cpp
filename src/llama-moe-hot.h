@@ -53,7 +53,6 @@ public:
     // between synchronized batches
     bool update_due() const;
     bool update(llama_moe_stream & stream, double synchronize_ms); // true if the graph topology changed
-    void make_exclusive(llama_moe_stream & stream);                // repurpose the RAM copies of GPU experts
     void demote_all(llama_moe_stream & stream);                    // admit the GPU experts to RAM before release
 
 private:

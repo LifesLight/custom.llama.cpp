@@ -153,12 +153,14 @@ struct llama_moe_stream::impl {
     // the eviction order of a cache slot: slru: the probation segment first; lfu: the least used first; then
     // the least recently used first
     struct okey {
+        uint8_t  keep;  // 0: a RAM copy of an expert of the GPU tier, evicted first
         uint8_t  prot;
         double   score;
         uint64_t stamp;
         int32_t  slot;
 
         bool operator<(const okey & o) const {
+            if (keep  != o.keep)  { return keep  < o.keep;  }
             if (prot  != o.prot)  { return prot  < o.prot;  }
             if (score != o.score) { return score < o.score; }
             if (stamp != o.stamp) { return stamp < o.stamp; }
@@ -1640,13 +1642,23 @@ struct llama_moe_stream::impl {
     // replacement policy, for the batches computed on the CPU
     //
 
-    // the order of eviction of the cache slots of a pool: lru: the least recently used first; slru: the same, the
-    // probation segment first; lfu: the least used first
+    // the expert is in the GPU tier: its RAM copy is not read by the CPU path
+    bool in_tier(int li, int32_t e) const {
+        return hot_observer != nullptr && hot_observer->contains(layers[li].il, e);
+    }
+
+    // the order of eviction of the cache slots of a pool: the RAM copies of the experts of the GPU tier first, then
+    // lru: the least recently used first; slru: the same, the probation segment first; lfu: the least used first
     bool evict_before(const pool & p, int32_t a, int32_t b) const {
         const auto & la = layers[p.slot_layer[a]];
         const auto & lb = layers[p.slot_layer[b]];
         const int32_t ea = p.slot_expert[a];
         const int32_t eb = p.slot_expert[b];
+        const bool ta = in_tier(p.slot_layer[a], ea);
+        const bool tb = in_tier(p.slot_layer[b], eb);
+        if (ta != tb) {
+            return ta;
+        }
         if (policy == LLAMA_MOE_STREAM_POLICY_SLRU && la.prot[ea] != lb.prot[eb]) {
             return la.prot[ea] < lb.prot[eb];
         }
@@ -1676,6 +1688,7 @@ struct llama_moe_stream::impl {
         const auto & l = layers[p.slot_layer[s]];
         const int32_t e = p.slot_expert[s];
         okey k;
+        k.keep  = !in_tier(p.slot_layer[s], e);
         k.prot  = policy == LLAMA_MOE_STREAM_POLICY_SLRU ? l.prot[e] : 0;
         k.score = policy == LLAMA_MOE_STREAM_POLICY_LFU  ? l.score[e] : 0.0;
         k.stamp = l.stamp[e];
@@ -2542,7 +2555,7 @@ struct llama_moe_stream::impl {
                 const int lo = p.slot_layer[s];
                 auto & lv = layers[lo];
                 const int32_t v = p.slot_expert[s];
-                if (l.window && policy == LLAMA_MOE_STREAM_POLICY_LFU && l.score[e] <= lv.score[v]) {
+                if (l.window && policy == LLAMA_MOE_STREAM_POLICY_LFU && l.score[e] <= lv.score[v] && !in_tier(lo, v)) {
                     overflow.push_back(e);
                     continue;
                 }
@@ -3565,8 +3578,9 @@ struct llama_moe_stream::impl {
         }
     }
 
-    // admit expert e of layer li into the slot that the policy evicts first, its tensors written by reader
-    bool restore_ram(int il, int e, const llama_moe_stream::expert_reader & reader) {
+    // admit expert e of layer li into the slot that the policy evicts first, its tensors written by reader. with
+    // spare_tier, not into the RAM copy of another expert of the tier (the whole tier is released)
+    bool restore_ram(int il, int e, const llama_moe_stream::expert_reader & reader, bool spare_tier) {
         if (il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
             return false;
         }
@@ -3582,7 +3596,8 @@ struct llama_moe_stream::impl {
         int32_t best = -1;
         for (int32_t s = 0; s < (int32_t) p.n_slots; ++s) {
             const int lo = p.slot_layer[s];
-            if (p.busy[s] || p.pf[s] || (lo != li && layers[lo].n_cached <= layers[lo].n_min)) {
+            if (p.busy[s] || p.pf[s] || (lo != li && layers[lo].n_cached <= layers[lo].n_min) ||
+                    (spare_tier && in_tier(lo, p.slot_expert[s]))) {
                 continue;
             }
             if (best < 0 || evict_before(p, s, best)) {
@@ -3603,101 +3618,6 @@ struct llama_moe_stream::impl {
         }
         commit_ram_slot(li, e, best);
         return true;
-    }
-
-    // the RAM slots of the experts in the GPU tier take the most used experts that are in neither, read in one go.
-    // a layer only gives a slot to another one of its pool above its least slots
-    size_t reclaim_gpu_ram(const llama_moe_hot & hot) {
-        size_t res = 0;
-        for (auto & p : pools) {
-            // the slots to refill, by layer
-            std::unordered_map<int, std::vector<int32_t>> dups;
-            size_t n_dups = 0;
-            for (int32_t s = 0; s < (int32_t) p.n_slots; ++s) {
-                if (!p.busy[s] && !p.pf[s] && hot.contains(layers[p.slot_layer[s]].il, p.slot_expert[s])) {
-                    dups[p.slot_layer[s]].push_back(s);
-                    n_dups++;
-                }
-            }
-            if (n_dups == 0) {
-                continue;
-            }
-
-            struct candidate {
-                double score;
-                int    li;
-                int    e;
-            };
-            // the generation scores once there are enough of them (as hot_experts), those of all the batches before
-            const bool generation = gclock >= 64;
-            std::vector<candidate> cands;
-            for (int li : p.layers) {
-                const auto & l = layers[li];
-                for (int e = 0; e < l.n_expert; ++e) {
-                    const double score = generation ? l.score[e] : l.rscore[e];
-                    if (l.slot_of[e] < 0 && score > 0.0 && !hot.contains(l.il, e)) {
-                        cands.push_back({ score, li, e });
-                    }
-                }
-            }
-            const size_t n_top = std::min(cands.size(), n_dups);
-            std::partial_sort(cands.begin(), cands.begin() + n_top, cands.end(),
-                    [](const candidate & a, const candidate & b) { return a.score > b.score; });
-
-            // the slots each layer would have after the refills
-            std::unordered_map<int, int64_t> n_cached;
-            for (int li : p.layers) {
-                n_cached[li] = layers[li].n_cached;
-            }
-
-            struct refill {
-                int32_t s;
-                int     li;
-                int     e;
-            };
-            std::vector<refill> plan;
-            for (size_t i = 0; i < n_top; ++i) {
-                const auto & c = cands[i];
-                // a slot of the same layer, or of a layer that has slots to give
-                int from = dups.count(c.li) && !dups[c.li].empty() ? c.li : -1;
-                if (from < 0) {
-                    for (auto & [lo, slots] : dups) {
-                        if (!slots.empty() && n_cached[lo] > layers[lo].n_min) {
-                            from = lo;
-                            break;
-                        }
-                    }
-                }
-                if (from < 0) {
-                    continue;
-                }
-                plan.push_back({ dups[from].back(), c.li, c.e });
-                dups[from].pop_back();
-                n_cached[from]--;
-                n_cached[c.li]++;
-            }
-            if (plan.empty()) {
-                continue;
-            }
-
-            wait_group wg;
-            for (const auto & r : plan) {
-                read_experts(layers[r.li], r.e, r.s, 1, wg);
-            }
-            if (!wait(wg)) {
-                std::vector<int32_t> slots;
-                for (const auto & r : plan) {
-                    slots.push_back(r.s);
-                }
-                repair_ram_slots(p, slots);
-                throw std::runtime_error("moe_stream: RAM refill read failed");
-            }
-            for (const auto & r : plan) {
-                commit_ram_slot(r.li, r.e, r.s);
-                res += expert_bytes(layers[r.li]);
-            }
-        }
-        return res;
     }
 
     // the bytes of an expert of a layer, all its tensors
@@ -4120,6 +4040,7 @@ std::vector<const ggml_tensor *> llama_moe_stream::layer_tensors(int il) const {
 
 void llama_moe_stream::set_hot_observer(llama_moe_hot * observer) {
     pimpl->hot_observer = observer;
+    hot_changed();
 }
 
 bool llama_moe_stream::cpu_batch(int64_t tokens) const {
@@ -4181,24 +4102,23 @@ bool llama_moe_stream::with_expert(int il, int e, const expert_writer & writer) 
 #endif
 }
 
-bool llama_moe_stream::restore_expert(int il, int e, const expert_reader & reader) {
+bool llama_moe_stream::restore_expert(int il, int e, const expert_reader & reader, bool spare_tier) {
 #ifdef __linux__
-    return pimpl->restore_ram(il, e, reader);
+    return pimpl->restore_ram(il, e, reader, spare_tier);
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(e);
     GGML_UNUSED(reader);
+    GGML_UNUSED(spare_tier);
     return false;
 #endif
 }
 
-size_t llama_moe_stream::reclaim_hot_ram(const llama_moe_hot & hot) {
-#ifdef __linux__
-    return pimpl->reclaim_gpu_ram(hot);
-#else
-    GGML_UNUSED(hot);
-    return 0;
-#endif
+void llama_moe_stream::hot_changed() {
+    // the eviction keys of the pools depend on the tier
+    for (auto & p : pimpl->pools) {
+        p.order_valid = false;
+    }
 }
 
 bool llama_moe_stream::overlap() const {
