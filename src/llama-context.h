@@ -62,7 +62,7 @@ struct llama_context {
 
     void synchronize();
 
-    // free the GPU expert tier (admitting its experts to RAM), rebuilt by the next small batch
+    // free the GPU expert tier, rebuilt by the next small batch
     void moe_hot_release();
 
     const llama_model   & get_model()   const;

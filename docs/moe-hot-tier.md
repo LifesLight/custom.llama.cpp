@@ -65,7 +65,8 @@ fall back to the streamed experts.
 victims of the eviction policy, so that decode misses take their slots and VRAM adds to the RAM working set,
 without extra reads. A replaced GPU expert is first admitted to RAM (downloaded, preferably into such a copy), and
 is kept on the GPU if no RAM slot can take it. When the tier is released (a large batch, or a GPU suspend), its
-experts are admitted to RAM the same way, keeping the copies of the others.
+banks are simply freed: nothing is copied, the RAM cache keeps what decode missed (a long prompt reads nearly all
+experts anyway, so which ones are in RAM barely matters to it).
 The GGUF stays the backing store of every expert: an expert is never only on a GPU.
 
 **Timing.** Replacements happen between synchronized batches, never while a graph runs. A check costs a scan of
@@ -73,8 +74,8 @@ the expert usage and, if anything is replaced, the transfers; the graph is only 
 again if a layer gains or loses its branch on a GPU.
 
 **Phases.** A batch larger than `LLAMA_DECODE_WORKSPACE` (a new prompt) releases the tier and restores the full
-workspace; the next small batch rebuilds the tier from RAM. Each new prompt therefore costs a download of the
-tier to RAM and an upload of the new one.
+workspace; the next small batch rebuilds the tier, from RAM or read from the model file in parallel chunks while
+the previous ones are uploaded. Each new prompt therefore costs one fill of the tier.
 
 **Suspend.** `--can-suspend` frees the tier before the CUDA buffers are suspended (`llama_moe_hot_release`), so
 that it needs no host backup and no VRAM on restore; it is rebuilt from the free VRAM at the next decode.
@@ -86,7 +87,7 @@ that it needs no host backup and no VRAM on restore; it is rebuilt from the free
 - `moe_hot: T tokens: GPU a% of routes (...), RAM b%, GPU+RAM c%; ...` every `LLAMA_MOE_STREAM_INTERVAL` decode
   tokens: the share of all routes of the streamed layers computed by the GPUs and found in RAM, and the
   cumulative replacements. Tokens include rejected draft tokens.
-- `moe_hot: released: ...` at phase exit.
+- `moe_hot: released` at phase exit, `moe_hot: N experts filled in T ms (X MiB read from the model file)` at entry.
 
 ## Limitations
 

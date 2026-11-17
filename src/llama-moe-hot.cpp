@@ -173,6 +173,7 @@ struct llama_moe_hot::impl {
         // the most used experts first, wherever they are (an expert that is not in RAM is read from the model file,
         // e.g. after a prompt on another topic), each on the device with the most budget left after it: one owner per
         // expert, whatever device the layer is on. without usage, only the experts in RAM
+        stream.quiesce_hot(); // no prefetch writes a slot that is read below
         struct seed {
             double  usage;
             bool    cached;
@@ -290,20 +291,26 @@ struct llama_moe_hot::impl {
             }
         }
 
+        // from RAM, or read from the model file while the previous experts are uploaded
+        std::vector<std::pair<int, int>> list;
         size_t from_ssd = 0;
+        for (const auto & p : plan) {
+            list.emplace_back(p.il, p.e);
+            from_ssd += p.cached ? 0 : layers[p.il].bytes;
+        }
+        const bool ok = stream.with_experts(list, [&](size_t i, const ggml_tensor * w, const void * src, size_t size) {
+            const auto & p = plan[i];
+            ggml_tensor * bank = devices[p.device].bindings.at(w);
+            GGML_ASSERT(size == bank->nb[2]);
+            ggml_backend_tensor_set(bank, src, p.slot*bank->nb[2], size);
+        });
+        if (!ok) {
+            throw std::runtime_error("moe_hot: seed expert unavailable");
+        }
         for (const auto & p : plan) {
             auto & d = devices[p.device];
             auto & l = layers[p.il];
             auto & g = *l.group_of[p.device];
-            const bool ok = stream.with_expert(p.il, p.e, [&](const ggml_tensor * w, const void * src, size_t size) {
-                ggml_tensor * bank = d.bindings.at(w);
-                GGML_ASSERT(size == bank->nb[2]);
-                ggml_backend_tensor_set(bank, src, p.slot*bank->nb[2], size);
-            });
-            if (!ok) {
-                throw std::runtime_error("moe_hot: seed expert unavailable");
-            }
-            from_ssd += p.cached ? 0 : l.bytes;
             g.owner[p.slot] = { p.il, p.e };
             l.n_owned[p.device]++;
             d.payload += l.bytes;
@@ -543,7 +550,7 @@ struct llama_moe_hot::impl {
             if (g.owner[s].first >= 0) {
                 // the victim is admitted to RAM before its slot is reused, otherwise it is kept
                 const auto [vil, ve] = g.owner[s];
-                if (!stream.restore_expert(vil, ve, download(d, s), false)) {
+                if (!stream.restore_expert(vil, ve, download(d, s))) {
                     blocked++;
                     continue;
                 }
@@ -580,48 +587,6 @@ struct llama_moe_hot::impl {
                     elapsed, sync_ms, changed ? ", topology changed" : "");
         }
         return changed;
-    }
-
-    void demote_all(llama_moe_stream & stream) {
-        stream.quiesce_hot();
-        std::vector<std::vector<double>> usage(layers.size());
-        for (size_t il = 0; il < layers.size(); ++il) {
-            usage[il] = stream.usage((int) il);
-            usage[il].resize(layers[il].owner.size(), 0.0);
-        }
-        const int64_t t_start = ggml_time_us();
-        const size_t down0 = download_bytes;
-
-        // the most used first: a later admission can evict an earlier one
-        struct entry {
-            double  heat;
-            int     device;
-            group * g;
-            int32_t slot;
-        };
-        std::vector<entry> owned;
-        for (size_t id = 0; id < devices.size(); ++id) {
-            for (auto & [key, g] : devices[id].groups) {
-                for (int32_t s = 0; s < g.n_slots; ++s) {
-                    const auto [il, e] = g.owner[s];
-                    if (il >= 0) {
-                        owned.push_back({ usage[il][e], (int) id, &g, s });
-                    }
-                }
-            }
-        }
-        std::sort(owned.begin(), owned.end(), [](const entry & a, const entry & b) { return a.heat > b.heat; });
-
-        uint64_t restored = 0;
-        for (const auto & o : owned) {
-            const auto [il, e] = o.g->owner[o.slot];
-            restored += stream.restore_expert(il, e, download(devices[o.device], o.slot), true);
-        }
-        demotions += restored;
-        const double elapsed = (ggml_time_us() - t_start)/1000.0;
-        update_ms += elapsed;
-        LLAMA_LOG_INFO("moe_hot: released: %" PRIu64 " of %zu GPU experts admitted to RAM (%.0f MiB) in %.0f ms\n",
-                restored, owned.size(), (download_bytes - down0)/MiB, elapsed);
     }
 };
 
@@ -728,6 +693,3 @@ bool llama_moe_hot::update(llama_moe_stream & stream, double synchronize_ms) {
     return pimpl->update(stream, synchronize_ms);
 }
 
-void llama_moe_hot::demote_all(llama_moe_stream & stream) {
-    pimpl->demote_all(stream);
-}
