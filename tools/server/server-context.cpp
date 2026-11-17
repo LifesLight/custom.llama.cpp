@@ -1410,6 +1410,8 @@ private:
                 std::any_of(slots.begin(), slots.end(), [](const auto & slot) { return slot.is_processing(); })) {
             return;
         }
+        // the GPU expert tier is a cache: freed rather than backed up to host memory, rebuilt after the restore
+        llama_moe_hot_release(ctx_tgt);
         llama_synchronize(ctx_tgt);
         if (ctx_dft) {
             llama_synchronize(ctx_dft);
