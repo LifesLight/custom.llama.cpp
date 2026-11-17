@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
 #include "llama-moe-stream.h"
+#include "llama-moe-hot.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -60,6 +61,9 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    // free the GPU expert tier (admitting its experts to RAM), rebuilt by the next small batch
+    void moe_hot_release();
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -314,6 +318,9 @@ private:
     // create a new backend scheduler with the given parameters, unless the current one can be reused
     void sched_new(const sched_params & params);
 
+    // switch the workspace for a batch of n_tokens (small or large), and manage the GPU expert tier, false on failure
+    bool sched_reserve_for_batch(uint32_t n_tokens);
+
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -347,6 +354,13 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
     llama_moe_stream_ptr moe_stream;
+
+    // the GPU expert tier of the MoE stream, for the small-batch phase of workspace switching
+    std::unique_ptr<llama_moe_hot> moe_hot;
+    llama_moe_hot_params moe_hot_params = {};
+    bool moe_hot_enabled   = false;
+    bool moe_hot_attempted = false; // in this phase: not rebuilt after a failure
+    bool moe_hot_drop      = false; // released with the next workspace
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -408,6 +422,11 @@ private:
     sched_params sched_params_cur;
 
     bool sched_need_reserve = true;
+
+    // decode workspace switching (LLAMA_DECODE_WORKSPACE): batches of up to that many tokens use a small workspace
+    uint32_t sched_decode_workspace   = 0;
+    bool     sched_workspace_small    = false;
+    bool     sched_workspace_recreate = false; // free the scheduler before the next reservation
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

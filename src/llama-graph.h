@@ -25,6 +25,7 @@ struct llama_hadamard;
 
 class llama_moe_cache;
 class llama_moe_stream;
+class llama_moe_hot;
 
 // the expert matmuls of a layer computed on the CPU from the MoE stream cache in two parts: the cached experts
 // while the missing ones are read (ids_a), then the missing ones (ids_b); down has all of them (ids_all)
@@ -815,6 +816,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     const llama_moe_stream       * moe_stream;
+    const llama_moe_hot          * moe_hot;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1089,6 +1091,7 @@ struct llm_graph_context {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
     const llama_moe_stream       * moe_stream;
+    const llama_moe_hot          * moe_hot;
 
     const llama_prec_policy * prec_policy;
 
@@ -1153,7 +1156,8 @@ struct llm_graph_context {
               ggml_tensor * w_s   = nullptr,
               ggml_tensor * slots = nullptr,
                      bool   cached = true,
-      const llm_moe_split * split  = nullptr) const;
+      const llm_moe_split * split  = nullptr,
+                      int   hot_device = -1) const; // >= 0: from the bank of the GPU expert tier on that device, slots are its slots
 
     // the mul_mat_id of the experts as of w, on the backend it belongs to, with the precision of w
     ggml_tensor * build_mm_id_experts(
@@ -1161,7 +1165,8 @@ struct llm_graph_context {
               ggml_tensor * as,
               ggml_tensor * cur,
               ggml_tensor * ids,
-                     bool   cached) const;
+                     bool   cached,
+           ggml_backend_t   backend = nullptr) const; // backend: forced (GPU expert tier)
 
     // rescale `cur` (the src1 of a matmul) by a power of two, computed from its maximum absolute
     // keep both individual values and Q8 activation block sums within F16 range
