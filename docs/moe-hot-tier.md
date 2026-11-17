@@ -61,19 +61,20 @@ part, in which the stream gives the tier's experts zero rows, before the router 
 activation are the same graph code as the CPU path, with the original expert ids. Unsupported ops make the tier
 fall back to the streamed experts.
 
-**RAM.** A GPU hit skips the RAM cache and its prefetches. The RAM copies of the tier's experts are refilled with
-the most used experts that are in neither (read from the GGUF in parallel), so that VRAM adds to the RAM working
-set. A replaced GPU expert is first admitted to RAM (downloaded), and is kept on the GPU if no RAM slot can take
-it. When the tier is released (a large batch, or a GPU suspend), its experts are admitted to RAM the same way.
+**RAM.** A GPU hit skips the RAM cache and its prefetches. The RAM copies of the tier's experts are the first
+victims of the eviction policy, so that decode misses take their slots and VRAM adds to the RAM working set,
+without extra reads. A replaced GPU expert is first admitted to RAM (downloaded, preferably into such a copy), and
+is kept on the GPU if no RAM slot can take it. When the tier is released (a large batch, or a GPU suspend), its
+experts are admitted to RAM the same way, keeping the copies of the others.
 The GGUF stays the backing store of every expert: an expert is never only on a GPU.
 
 **Timing.** Replacements happen between synchronized batches, never while a graph runs. A check costs a scan of
-the expert usage and, if anything is replaced, the transfers and the refill reads; the graph is only reserved
+the expert usage and, if anything is replaced, the transfers; the graph is only reserved
 again if a layer gains or loses its branch on a GPU.
 
 **Phases.** A batch larger than `LLAMA_DECODE_WORKSPACE` (a new prompt) releases the tier and restores the full
 workspace; the next small batch rebuilds the tier from RAM. Each new prompt therefore costs a download of the
-tier to RAM, an upload of the new one, and the RAM refill reads.
+tier to RAM and an upload of the new one.
 
 **Suspend.** `--can-suspend` frees the tier before the CUDA buffers are suspended (`llama_moe_hot_release`), so
 that it needs no host backup and no VRAM on restore; it is rebuilt from the free VRAM at the next decode.

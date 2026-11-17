@@ -91,7 +91,7 @@ struct llama_moe_hot::impl {
     uint64_t batch_routes = 0, batch_bytes = 0, batch_ram_hits = 0;
 
     uint64_t n_updates = 0, promotions = 0, demotions = 0, blocked = 0; // demotions: GPU experts admitted to RAM
-    size_t   upload_bytes = 0, download_bytes = 0, refill_bytes = 0;
+    size_t   upload_bytes = 0, download_bytes = 0;
     double   update_ms = 0.0, synchronize_ms = 0.0;
 
     // the layout of a set of expert tensors: the role (the name without the block prefix), type, shape and stride
@@ -403,10 +403,10 @@ struct llama_moe_hot::impl {
         }
         // percentages of all the routes of the streamed layers
         LLAMA_LOG_INFO("moe_hot: %" PRIu64 " tokens: GPU %.1f%% of routes (%.1f%% of expert bytes%s), RAM %.1f%%, GPU+RAM %.1f%%; "
-                "%" PRIu64 " updates: %" PRIu64 " promoted, %" PRIu64 " blocked, up %.0f MiB, down %.0f MiB, refilled %.0f MiB, %.0f ms + sync %.0f ms\n",
+                "%" PRIu64 " updates: %" PRIu64 " promoted, %" PRIu64 " blocked, up %.0f MiB, down %.0f MiB, %.0f ms + sync %.0f ms\n",
                 nt, nr ? 100.0*hits/nr : 0.0, nb ? 100.0*hit_bytes/nb : 0.0, per_device.c_str(),
                 nr ? 100.0*rh/nr : 0.0, nr ? 100.0*(hits + rh)/nr : 0.0,
-                n_updates, promotions, blocked, upload_bytes/MiB, download_bytes/MiB, refill_bytes/MiB, update_ms, synchronize_ms);
+                n_updates, promotions, blocked, upload_bytes/MiB, download_bytes/MiB, update_ms, synchronize_ms);
         logged_tokens     = tokens;
         logged_routes     = routes;
         logged_bytes      = bytes;
@@ -454,7 +454,7 @@ struct llama_moe_hot::impl {
         };
     }
 
-    bool update(llama_moe_stream & stream, const llama_moe_hot & hot, double sync_ms) {
+    bool update(llama_moe_stream & stream, double sync_ms) {
         last_update = tokens;
         n_updates++;
         synchronize_ms += sync_ms;
@@ -543,7 +543,7 @@ struct llama_moe_hot::impl {
             if (g.owner[s].first >= 0) {
                 // the victim is admitted to RAM before its slot is reused, otherwise it is kept
                 const auto [vil, ve] = g.owner[s];
-                if (!stream.restore_expert(vil, ve, download(d, s))) {
+                if (!stream.restore_expert(vil, ve, download(d, s), false)) {
                     blocked++;
                     continue;
                 }
@@ -567,15 +567,16 @@ struct llama_moe_hot::impl {
             spent += l.bytes;
         }
 
-        const size_t refilled = promotions > promotions0 ? stream.reclaim_hot_ram(hot) : 0;
-        refill_bytes += refilled;
+        if (promotions > promotions0) {
+            stream.hot_changed();
+        }
 
         const bool changed = topology() != before;
         const double elapsed = (ggml_time_us() - t_start)/1000.0;
         update_ms += elapsed;
         if (promotions > promotions0) {
-            LLAMA_LOG_DEBUG("moe_hot: update: %" PRIu64 " promoted, up %.0f MiB, down %.0f MiB, refilled %.0f MiB, %.1f ms + sync %.1f ms%s\n",
-                    promotions - promotions0, (upload_bytes - up0)/MiB, (download_bytes - down0)/MiB, refilled/MiB,
+            LLAMA_LOG_DEBUG("moe_hot: update: %" PRIu64 " promoted, up %.0f MiB, down %.0f MiB, %.1f ms + sync %.1f ms%s\n",
+                    promotions - promotions0, (upload_bytes - up0)/MiB, (download_bytes - down0)/MiB,
                     elapsed, sync_ms, changed ? ", topology changed" : "");
         }
         return changed;
@@ -614,7 +615,7 @@ struct llama_moe_hot::impl {
         uint64_t restored = 0;
         for (const auto & o : owned) {
             const auto [il, e] = o.g->owner[o.slot];
-            restored += stream.restore_expert(il, e, download(devices[o.device], o.slot));
+            restored += stream.restore_expert(il, e, download(devices[o.device], o.slot), true);
         }
         demotions += restored;
         const double elapsed = (ggml_time_us() - t_start)/1000.0;
@@ -724,18 +725,7 @@ bool llama_moe_hot::update_due() const {
 }
 
 bool llama_moe_hot::update(llama_moe_stream & stream, double synchronize_ms) {
-    return pimpl->update(stream, *this, synchronize_ms);
-}
-
-void llama_moe_hot::make_exclusive(llama_moe_stream & stream) {
-    stream.quiesce_hot();
-    const int64_t t_start = ggml_time_us();
-    const size_t refilled = stream.reclaim_hot_ram(*this);
-    const double elapsed = (ggml_time_us() - t_start)/1000.0;
-    pimpl->refill_bytes += refilled;
-    pimpl->update_ms    += elapsed;
-    LLAMA_LOG_INFO("moe_hot: refilled %.0f MiB of RAM copies of GPU experts with other experts in %.0f ms\n",
-            refilled/MiB, elapsed);
+    return pimpl->update(stream, synchronize_ms);
 }
 
 void llama_moe_hot::demote_all(llama_moe_stream & stream) {

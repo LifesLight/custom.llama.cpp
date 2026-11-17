@@ -66,7 +66,8 @@ public:
     void save_state();
     // the streamed expert tensors of a layer, sorted by name, empty if the layer is not streamed
     std::vector<const ggml_tensor *> layer_tensors(int il) const;
-    // the tier observes the routing of the CPU path, and its experts bypass the RAM cache and its prefetches
+    // the tier observes the routing of the CPU path, its experts bypass the RAM cache and its prefetches, and their
+    // RAM copies are the first victims of its misses
     void set_hot_observer(llama_moe_hot * observer);
     // all the layers compute a batch of that many tokens on the CPU
     bool cpu_batch(int64_t tokens) const;
@@ -79,10 +80,11 @@ public:
     using expert_reader = std::function<void(const ggml_tensor *, void *, size_t)>;
     // the tensors of an expert, from the RAM cache or read from the model file, false if not streamed
     bool with_expert(int il, int expert, const expert_writer & writer);
-    // admit an expert to the RAM cache, its tensors written by reader, false if no slot can take it
-    bool restore_expert(int il, int expert, const expert_reader & reader);
-    // refill the RAM slots of the experts that the tier holds with the most used experts in neither, returns the bytes
-    size_t reclaim_hot_ram(const llama_moe_hot & hot);
+    // admit an expert to the RAM cache, its tensors written by reader, false if no slot can take it. the RAM copies
+    // of the experts of the tier are evicted first (a decode miss takes them), with spare_tier they are kept
+    bool restore_expert(int il, int expert, const expert_reader & reader, bool spare_tier);
+    // the experts of the tier changed
+    void hot_changed();
 
     // true if src is an expert tensor handled by the stream
     bool is_streamed(const ggml_tensor * src) const;
