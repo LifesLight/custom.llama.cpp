@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "llama-moe-stream.h"
+#include "llama-moe-hot.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -26,6 +27,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -1625,6 +1627,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     moe_stream       (params.moe_stream),
+    moe_hot          (params.moe_hot),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -1814,11 +1817,18 @@ ggml_tensor * llm_graph_context::build_mm_id_experts(
           ggml_tensor * as,
           ggml_tensor * cur,
           ggml_tensor * ids,
-                 bool   cached) const {
+                 bool   cached,
+       ggml_backend_t   backend) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, as, cur, ids);
 
-    // the experts of the MoE stream are computed on the CPU from its cache, or offloaded, whatever the batch size
-    if (moe_stream != nullptr && moe_cache == nullptr) {
+    if (backend != nullptr) {
+        // a bank of the GPU expert tier
+        if (!ggml_backend_supports_op(backend, res)) {
+            throw std::runtime_error(format("moe_hot: %s does not support the expert matmul", ggml_backend_name(backend)));
+        }
+        ggml_backend_sched_set_tensor_backend(sched, res, backend);
+    } else if (moe_stream != nullptr && moe_cache == nullptr) {
+        // the experts of the MoE stream are computed on the CPU from its cache, or offloaded, whatever the batch size
         if (cached) {
             ggml_backend_sched_set_tensor_backend(sched, res, backend_cpu);
         } else if (ggml_backend_t backend = moe_stream->offload_backend(w)) {
@@ -1846,12 +1856,19 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w_s,
           ggml_tensor * slots,
                  bool   cached,
-  const llm_moe_split * split) const {
+  const llm_moe_split * split,
+                  int   hot_device) const {
     // Folded weights read the transformed input; LoRA still reads cur.
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
 
     ggml_tensor * res;
-    if (split != nullptr) {
+    if (hot_device >= 0) {
+        // the bank of the GPU tier device, slots are its bank slots
+        GGML_ASSERT(moe_hot != nullptr && slots != nullptr);
+        ggml_tensor * bank = moe_hot->bank(w, hot_device);
+        GGML_ASSERT(bank != nullptr);
+        res = build_mm_id_experts(w, bank, cur_mm, slots, true, moe_hot->backend(hot_device));
+    } else if (split != nullptr) {
         ggml_tensor * bank = moe_stream->get_bank(w);
         if (w == split->down) {
             res = build_mm_id_experts(w, bank, cur_mm, split->ids_all, true);
@@ -2626,6 +2643,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
+    // the experts of the GPU tier are computed on their devices below, the slot op of the stream gives them zero
+    // rows on the CPU
+    const bool hot = slots != nullptr && moe_cache == nullptr && moe_hot != nullptr && moe_hot->has_layer(il);
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {
@@ -2833,12 +2854,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, int hot_device = -1) {
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached, split); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached, split, hot_device); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (up_exps_s) {
@@ -2857,7 +2878,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, mm_ids, cached, split); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, mm_ids, cached, split, hot_device); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_s) {
@@ -2870,7 +2891,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (gate_exps) {
-                cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, mm_ids, cached, split); // [n_ff, n_expert_used, n_tokens]
+                cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, mm_ids, cached, split, hot_device); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -2899,7 +2920,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cur = amax_src1.res;
         }
 
-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached, split); // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached, split, hot_device); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
         cb(experts, "ffn_moe_down", il);
 
@@ -2920,9 +2941,59 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     }, &build_experts);
     }
 
+    // the CPU part, for the profile mark below
+    ggml_tensor * experts_cpu = experts;
+
+    if (hot) {
+        // one routed row per logical token on the GPUs, [n_embd, 1, n_expert_used*n_tokens], so that the routes of
+        // the experts a device does not hold all read its single zero expert
+        const int64_t n_sel = selected_experts->ne[0];
+        ggml_tensor * flat_selected = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts), 1, n_sel*n_tokens);
+        ggml_backend_sched_set_tensor_backend(sched, flat_selected->view_src, backend_cpu);
+        ggml_build_forward_expand(gf, flat_selected);
+
+        for (int device = 0; device < moe_hot->n_devices(); ++device) {
+            if (!moe_hot->has_layer(il, device)) {
+                continue;
+            }
+            ggml_backend_t backend = moe_hot->backend(device);
+
+            ggml_tensor * hot_ids = moe_hot->build_ids(ctx0, flat_selected, il, device);
+            ggml_backend_sched_set_tensor_backend(sched, hot_ids, backend_cpu);
+            ggml_build_forward_expand(gf, hot_ids);
+
+            // per device, so that each branch only copies cur
+            ggml_tensor * input = cur;
+            if (input->ne[1] == 1 && n_sel > 1) {
+                input = ggml_repeat_4d(ctx0, input, n_embd, n_sel, n_tokens, 1);
+            }
+            input = ggml_reshape_3d(ctx0, ggml_cont(ctx0, input), n_embd, 1, n_sel*n_tokens);
+            ggml_tensor * part = build_experts(input, flat_selected, hot_ids, true, device);
+            part = ggml_reshape_3d(ctx0, part, part->ne[0], n_sel, n_tokens);
+
+            // the branches are added before the CPU part, so that the scheduler starts them first
+            const int i_begin = ggml_graph_n_nodes(gf);
+            ggml_build_forward_expand(gf, part);
+            for (int i = i_begin; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node->op == GGML_OP_CUSTOM || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+                        node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+                    continue;
+                }
+                if (!ggml_backend_supports_op(backend, node)) {
+                    throw std::runtime_error(format("moe_hot: %s does not support %s", ggml_backend_name(backend), ggml_op_desc(node)));
+                }
+                ggml_backend_sched_set_tensor_backend(sched, node, backend);
+            }
+            experts = ggml_add(ctx0, experts, part);
+            ggml_backend_sched_set_tensor_backend(sched, experts, backend);
+        }
+    }
+
     // the end of the expert matmuls of a layer computed on the CPU from the MoE stream cache, for its profile
+    // (of the CPU part: the merge with the GPU tier is on a GPU, a mark after it would synchronize every layer)
     if (slots != nullptr && moe_cache == nullptr && moe_stream != nullptr) {
-        if (ggml_tensor * mark = moe_stream->build_profile_mark(ctx0, experts, il)) {
+        if (ggml_tensor * mark = moe_stream->build_profile_mark(ctx0, experts_cpu, il)) {
             ggml_backend_sched_set_tensor_backend(sched, mark, backend_cpu);
             ggml_build_forward_expand(gf, mark);
         }
