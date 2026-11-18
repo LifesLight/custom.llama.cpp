@@ -1528,6 +1528,9 @@ private:
             mparams.n_threads        = params_base.cpuparams.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;
             mparams.warmup           = params_base.warmup;
+            // reserved at load (also for the fit) for the largest image (--image-max-tokens), an image prompt stays
+            // within the memory of the load instead of growing the compute buffers of the projector later
+            mparams.warmup_max       = true;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.video_image_min_tokens = params_base.video_image_min_tokens;

@@ -10,6 +10,7 @@
 #include "ggml-cpu.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
@@ -78,6 +79,7 @@ mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_n
             set_threadpool_fn(backend_cpu, threadpool.get());
         }
     }
+    this->device = device;
     if (device != nullptr) {
         backend = ggml_backend_dev_init(device, nullptr);
         if (!backend) {
@@ -113,6 +115,29 @@ void mtmd_backends::reset_sched() {
     }
 }
 
+void mtmd_backends::release_device() {
+    if (backend == backend_cpu || backend == nullptr) {
+        reset_sched();
+        return;
+    }
+    sched.reset();
+    ggml_backend_free(backend);
+    backend = nullptr;
+    ptrs[0] = nullptr;
+}
+
+void mtmd_backends::restore_device() {
+    if (backend != nullptr) {
+        return;
+    }
+    backend = ggml_backend_dev_init(device, nullptr);
+    if (!backend) {
+        throw std::runtime_error(mtmd_format("failed to initialize \"%s\" backend", ggml_backend_dev_name(device)));
+    }
+    ptrs[0] = backend;
+    reset_sched();
+}
+
 mtmd_backends::~mtmd_backends() {
     // before the backends it uses
     sched.reset();
@@ -134,7 +159,8 @@ mtmd_subcontext::mtmd_subcontext(const mtmd_model & model, mtmd_backends & backe
         model(model),
         backends(backends),
         max_nodes(model.max_nodes),
-        flash_attn_type(params.flash_attn_type) {
+        flash_attn_type(params.flash_attn_type),
+        warmup_max(params.warmup_max) {
     if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_AUTO && !model.flash_attn_auto) {
         flash_attn_type = MTMD_FLASH_ATTN_TYPE_DISABLED;
     }
@@ -159,7 +185,12 @@ mtmd_image_f32_batch mtmd_subcontext::get_dummy_batch() const {
     mtmd_image_f32_batch batch;
     mtmd_image_f32 img;
     if (model.modality == MTMD_MODALITY_VISION) {
-        const int sz = hparams.warmup_image_size;
+        int sz = hparams.warmup_image_size;
+        if (warmup_max && hparams.image_max_pixels > 0) {
+            // the square of the largest area, its patches bound those of any image the preprocessor makes
+            const int align = hparams.patch_size * std::max(1, hparams.n_merge);
+            sz = std::max(sz, (int) std::sqrt((double) hparams.image_max_pixels) / align * align);
+        }
         img.set_size({sz, sz}, false, false);
         LOG_INF("%s: warmup with image size = %d x %d\n", __func__, sz, sz);
     } else if (model.modality == MTMD_MODALITY_GEN_AUDIO) {
@@ -622,7 +653,11 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!is_allocated) {
-        warmup(*params->imgs);
+        if (warmup_max && model.modality == MTMD_MODALITY_VISION) {
+            warmup(get_dummy_batch());
+        } else {
+            warmup(*params->imgs);
+        }
     }
 
     if (model.proj_type == PROJECTOR_TYPE_KOKORO && !params->kokoro) {

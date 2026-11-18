@@ -27,6 +27,7 @@ enum mtmd_flash_attn_type {
 struct mtmd_subctx_params {
     enum mtmd_flash_attn_type flash_attn_type;
     bool warmup;
+    bool warmup_max; // see mtmd_context_params
 };
 
 // the device the weights and the graphs are placed on, nullptr means CPU
@@ -55,6 +56,13 @@ struct mtmd_backends {
 
     // a new scheduler without buffers: frees the compute buffers, the subcontexts must reserve their graphs again
     void reset_sched();
+
+    // frees the scheduler and the accelerator backend with its memory pool and library workspaces (a CUDA pool keeps
+    // the largest temporary buffers of the encodes), until restore_device(); the subcontexts must reserve again
+    void release_device();
+    void restore_device();
+
+    ggml_backend_dev_t device = nullptr; // of the accelerator backend, nullptr without one
 
     int max_nodes = 0;
     ggml_backend_sched_eval_callback cb_eval = nullptr;
@@ -191,6 +199,7 @@ struct mtmd_subcontext {
     int max_nodes = 8192;
     mtmd_flash_attn_type flash_attn_type = MTMD_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
+    bool warmup_max   = false; // the graph is reserved for the largest image
 
     bool debug_output_embeddings = false;
 

@@ -82,11 +82,14 @@ or one with media embeddings, a prompt, does not build it). Each new prompt ther
 that it needs no host backup and no VRAM on restore; it is rebuilt from the free VRAM at the next decode.
 
 **Vision projector.** With the tier, the server frees the device memory of a vision mmproj (weights and compute
-buffers) as soon as no active slot has a media chunk left to process (also when idle), so before the small batch
+buffers, and its GPU backend with the CUDA memory pool of the encodes) as soon as no active slot has a media chunk
+left to process (also when idle), so before the small batch
 of the prompt tail that builds the tier, and reads the weights again from the file before the next media encode,
 after freeing the tier banks (the memory layout of the load). A tier built while the projector was resident is
 rebuilt after the release. Prompts without media, or with their media already cached, do not restore it. Not for
-audio projectors.
+audio projectors. The server reserves the compute buffers of the projector for the largest image
+(`--image-max-tokens`) at load, and again at each restore, so an image prompt needs the memory of the load and not
+more.
 
 ## Logs
 

@@ -599,6 +599,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* media_marker      */ mtmd_default_marker(),
         /* flash_attn_type   */ LLAMA_FLASH_ATTN_TYPE_AUTO,
         /* warmup            */ true,
+        /* warmup_max        */ false,
         /* image_min_tokens  */ -1,
         /* image_max_tokens  */ -1,
         /* cb_eval           */ nullptr,
@@ -911,6 +912,7 @@ struct mtmd_context {
         mtmd_subctx_params sctx_params {
             /* flash_attn_type   */ mtmd_to_flash_attn_type(ctx_params.flash_attn_type),
             /* warmup            */ ctx_params.warmup,
+            /* warmup_max        */ ctx_params.warmup_max,
         };
         if (models.v) {
             ctx_v = std::make_unique<mtmd_subcontext>(*models.v, *backends, sctx_params);
@@ -2697,6 +2699,7 @@ static bool mtmd_restore_locked(mtmd_context * ctx) {
     }
     try {
         const int64_t t_start = ggml_time_us();
+        ctx->backends->restore_device();
         mtmd_model_restore_weights(*ctx->models.v);
         ctx->released = false;
         LOG_INF("%s: mmproj weights restored in %.0f ms\n", __func__, (ggml_time_us() - t_start)/1000.0);
@@ -2723,7 +2726,7 @@ bool mtmd_release_device_memory(mtmd_context * ctx) {
             compute += ggml_backend_sched_get_buffer_size(ctx->backends->sched.get(), b);
         }
     }
-    ctx->backends->reset_sched();
+    ctx->backends->release_device();
     ctx->ctx_v->is_allocated = false; // the next encode reserves its graph
     ctx->released = true;
     LOG_INF("%s: mmproj released: %.0f MiB of weights, %.0f MiB of compute buffers\n", __func__,

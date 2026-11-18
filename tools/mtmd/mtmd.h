@@ -114,6 +114,9 @@ struct mtmd_context_params {
     const char * media_marker;
     enum llama_flash_attn_type flash_attn_type;
     bool warmup; // whether to run a warmup encode pass after initialization
+    // reserve the compute buffers for the largest image instead of the default warmup size (often smaller), also when
+    // the graph is reserved again after mtmd_release_device_memory(): the memory of an image stays the one of the load
+    bool warmup_max;
 
     // limit number of image tokens, only for vision models with dynamic resolution
     int image_min_tokens; // minimum number of tokens for image input (default: read from metadata)
