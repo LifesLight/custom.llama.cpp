@@ -323,7 +323,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
         cur = build_norm(cur, l.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cur = build_moe_ffn(cur, l.ffn_gate_inp, nullptr, nullptr, l.ffn_down_exps, l.ffn_exp_probs_b,
                 hparams.n_expert, hparams.n_expert_used(il), LLM_FFN_SITU, true, hparams.expert_weights_scale,
-                LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps);
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, il, nullptr, l.ffn_gate_up_exps,
+                l.ffn_gate_up_exps_s, nullptr, l.ffn_down_exps_s); // NVFP4 scale2 of the merged gate_up and of down
         cur = convolve(cur, l.ffn_post_conv, nullptr, state, history, recr, 2*kv + n_embd);
         cur = ggml_add(ctx0, residual, cur);
         cb(cur, "l_out", il);
