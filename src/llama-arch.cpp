@@ -1475,7 +1475,6 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
         case LLM_ARCH_DFLASH:
         case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_LIMITE:
-        case LLM_ARCH_INKLING2:
             return false;
         default:
             return true;
