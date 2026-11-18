@@ -881,14 +881,18 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
-bool llama_context::sched_reserve_for_batch(uint32_t n_tokens) {
+bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media) {
     const bool small = sched_decode_workspace > 0 && !cparams.training && n_tokens <= sched_decode_workspace;
     if (!small) {
         moe_hot_attempted = false;
     }
+    // a batch with media embeddings is a prompt, also when small: the projector may still hold its memory
+    moe_hot_n_small = small && !media ? moe_hot_n_small + (moe_hot_n_small < 2) : 0;
 
     // with the GPU tier, the small batches (MTP verification) take the CPU path of the stream up to 32 tokens
-    const bool hot = small && moe_hot_enabled && loras->empty() && (moe_hot || !moe_hot_attempted);
+    // built from the second small batch in a row: not for a lone one, such as the memory probe of the server at load
+    const bool hot = small && !media && moe_hot_enabled && loras->empty() &&
+        (moe_hot || (!moe_hot_attempted && moe_hot_n_small >= 2));
     if (moe_stream && moe_stream->set_hot_cpu_max(hot ? std::min<uint32_t>(sched_decode_workspace, 32) : 0)) {
         sched_workspace_recreate = true;
         sched_need_reserve = true;
@@ -2500,7 +2504,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
-    if (!sched_reserve_for_batch(n_tokens_all)) {
+    if (!sched_reserve_for_batch(n_tokens_all, batch_inp.n_embd > 0)) {
         return -2;
     }
 

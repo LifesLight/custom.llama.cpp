@@ -74,8 +74,9 @@ the expert usage and, if anything is replaced, the transfers; the graph is only 
 again if a layer gains or loses its branch on a GPU.
 
 **Phases.** A batch larger than `LLAMA_DECODE_WORKSPACE` (a new prompt) releases the tier and restores the full
-workspace; the next small batch rebuilds the tier, from RAM or read from the model file in parallel chunks while
-the previous ones are uploaded. Each new prompt therefore costs one fill of the tier.
+workspace; the second small batch in a row rebuilds the tier, from RAM or read from the model file in parallel
+chunks while the previous ones are uploaded (a lone small batch, such as the memory probe of the server at load,
+or one with media embeddings, a prompt, does not build it). Each new prompt therefore costs one fill of the tier.
 
 **Suspend.** `--can-suspend` frees the tier before the CUDA buffers are suspended (`llama_moe_hot_release`), so
 that it needs no host backup and no VRAM on restore; it is rebuilt from the free VRAM at the next decode.
