@@ -396,6 +396,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_BANDED,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2261,6 +2262,20 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // flash attention with an additive banded relative-position bias, applied after the scale, without a dense bias:
+    //   rel_logits: [rel_extent, n_head, n_batch, ne3] (ne3 may be 1)
+    //   rel_dist = q_idx + (n_kv - n_batch) - kv_idx, the K/V rows in position order with the queries at their tail
+    //   score += rel_logits[rel_dist, head, q_idx, i3] iff 0 <= rel_dist < rel_extent
+    // the sinks of ggml_flash_attn_ext_add_sinks() can also be per query: [n_head, n_batch, 1 or ne3]
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * rel_logits,
+            float                 scale);
 
     // same as ggml_flash_attn_ext, but each q slice attends to its own list of K/V rows
     // q:       [n_embd_k, n_batch, n_head,    ne3]

@@ -2481,6 +2481,10 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic, ggml_tensor * state, ggml_tensor * history, llm_graph_input_rs * inp, int64_t offset);
+        // the attention over the K/V rows in position order with the banded relative bias, see ggml_flash_attn_ext_banded
+        // n_kv: the contiguous cells, or with gather_idx/gather_mask the gathered rows
+        ggml_tensor * attn_banded(llm_graph_input_attn_kv_iswa * attn, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+                ggml_tensor * rel_logits, ggml_tensor * sinks, uint32_t n_kv, ggml_tensor * gather_idx, ggml_tensor * gather_mask, int il);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

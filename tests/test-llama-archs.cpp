@@ -329,7 +329,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
     } else if (arch == LLM_ARCH_INKLING2) {
         n_embd  = 128;
-        n_head  = 4;
+        n_head  = 2;
         n_ff    = 24;
         n_layer = 3;
     }
@@ -698,6 +698,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     }
 
     if (arch == LLM_ARCH_INKLING2) {
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    uint32_t(128));
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  uint32_t(128));
         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,   uint32_t(4));
         ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,   uint32_t(16));
         ms.add_kv(LLM_KV_ATTENTION_QK_CLIP,           0.25f);

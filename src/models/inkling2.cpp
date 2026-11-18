@@ -129,18 +129,51 @@ public:
     ggml_tensor * tok_mask = nullptr; // [1, n_tokens]
 };
 
+// the relative positions of the attention of the base (0) and the SWA (1) caches
+//  - banded: the cells are in position order, no input
+//  - gather: the cells of the sequence gathered in position order (gather_idx) with their mask
+//  - dense:  the distance of each cell to each token, the bias is gathered per head
 class llm_graph_input_inkling2_pos : public llm_graph_input_i {
 public:
-    const llama_kv_cache_context * cache[2];
-    ggml_tensor * distance[2];
-    uint32_t extent[2];
+    enum path_t { PATH_DENSE, PATH_BANDED, PATH_GATHER };
+
+    const llama_kv_cache_context * cache[2] = {};
+    path_t        path[2]        = { PATH_DENSE, PATH_DENSE };
+    uint32_t      n_kv[2]        = {}; // banded: the contiguous cells, gather: the gathered rows
+    ggml_tensor * distance[2]    = {};
+    ggml_tensor * gather_idx[2]  = {};
+    ggml_tensor * gather_mask[2] = {};
+    uint32_t      extent[2]      = {};
+
+    // the path of the attention of a cache, banded and gathered for flash attention over F32/F16/BF16 K/V only
+    static path_t select(const llama_kv_cache_context * cache, bool banded_ok, uint32_t & n) {
+        n = 0;
+        if (!banded_ok) {
+            return PATH_DENSE;
+        }
+        if ((n = cache->get_n_kv_pos_gather()) > 0) {
+            return PATH_GATHER;
+        }
+        if ((n = cache->get_n_kv_pos_contiguous()) > 0) {
+            return PATH_BANDED;
+        }
+        return PATH_DENSE;
+    }
 
     bool can_reuse(const llm_graph_params & params) override {
+        // the banded path follows the cell count of every ubatch
+        if (path[0] != PATH_DENSE || path[1] != PATH_DENSE) {
+            return false;
+        }
         const auto * memory = static_cast<const llama_memory_hybrid_iswa_context *>(params.mctx);
         cache[0] = memory->get_attn()->get_base();
         cache[1] = memory->get_attn()->get_swa();
         for (int i = 0; i < 2; ++i) {
-            if (distance[i]->ne[0] != cache[i]->get_n_kv() || distance[i]->ne[1] != params.ubatch.n_tokens) {
+            uint32_t n = 0;
+            if (select(cache[i], banded_ok[i], n) != PATH_DENSE) {
+                return false;
+            }
+            if (distance[i] && (distance[i]->ne[0] != cache[i]->get_n_kv() || distance[i]->ne[1] != params.ubatch.n_tokens)) {
                 return false;
             }
         }
@@ -149,12 +182,94 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         for (int i = 0; i < 2; ++i) {
-            if (distance[i]->buffer) {
+            if (distance[i] && distance[i]->buffer) {
                 cache[i]->set_input_relative_pos(distance[i], ubatch, extent[i]);
+            }
+            if (gather_idx[i] && gather_idx[i]->buffer) {
+                cache[i]->set_input_pos_gather(gather_idx[i], gather_mask[i], ubatch);
             }
         }
     }
+
+    bool banded_ok[2] = {};
 };
+
+ggml_tensor * llama_model_inkling2::graph::attn_banded(llm_graph_input_attn_kv_iswa * attn, ggml_tensor * q, ggml_tensor * k,
+        ggml_tensor * v, ggml_tensor * rel_logits, ggml_tensor * sinks, uint32_t n_kv, ggml_tensor * gather_idx,
+        ggml_tensor * gather_mask, int il) {
+    const bool swa = hparams.is_swa(il);
+    const int64_t hd = hparams.n_embd_head_k(il);
+
+    // as build_attn() does
+    auto * k_rot = swa ? attn->self_k_rot_swa[il] : attn->self_k_rot[il];
+    auto * v_rot = swa ? attn->self_v_rot_swa[il] : attn->self_v_rot[il];
+    if (k_rot) {
+        q = llama_mul_mat_hadamard(ctx0, q, k_rot);
+        k = llama_mul_mat_hadamard(ctx0, k, k_rot);
+    }
+    if (v_rot) {
+        v = llama_mul_mat_hadamard(ctx0, v, v_rot);
+    }
+    const auto * mc = swa ? attn->mctx->get_swa() : attn->mctx->get_base();
+    ggml_tensor * k_scale = mc->get_k_scale(il);
+    ggml_tensor * v_scale = mc->get_v_scale(il);
+    if (k_scale) {
+        q = ggml_mul(ctx0, q, k_scale);
+        k = ggml_div(ctx0, k, k_scale);
+    }
+    if (v_scale) {
+        v = ggml_div(ctx0, v, v_scale);
+    }
+    ggml_build_forward_expand(gf, q);
+    ggml_build_forward_expand(gf, k);
+    ggml_build_forward_expand(gf, v);
+    ggml_build_forward_expand(gf, mc->cpy_k(ctx0, k, swa ? attn->get_k_idxs_swa() : attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mc->cpy_v(ctx0, v, swa ? attn->get_v_idxs_swa() : attn->get_v_idxs(), il));
+
+    ggml_tensor * k_all = mc->get_k(ctx0, il); // [hd, n_head_kv, n_kv, 1]
+    ggml_tensor * v_all = mc->get_v(ctx0, il);
+    GGML_ASSERT(k_all->ne[3] == 1 && v_all->nb[1] <= v_all->nb[2]); // one stream, V not transposed (flash attention)
+
+    ggml_tensor * k_fa;
+    ggml_tensor * v_fa;
+    ggml_tensor * mask;
+    if (gather_idx) {
+        // the cells of the sequence in position order: row n_kv - n_tokens + i holds the position of token i
+        auto gather = [&](ggml_tensor * t) {
+            ggml_tensor * rows = ggml_view_2d(ctx0, t, t->ne[0]*t->ne[1], t->ne[2], t->nb[2], 0);
+            ggml_tensor * g = ggml_get_rows(ctx0, rows, gather_idx);
+            if (t->type != GGML_TYPE_F32) {
+                g = ggml_cast(ctx0, g, t->type);
+            }
+            return ggml_permute(ctx0, ggml_reshape_4d(ctx0, g, t->ne[0], t->ne[1], gather_idx->ne[0], 1), 0, 2, 1, 3);
+        };
+        k_fa = gather(k_all);
+        v_fa = gather(v_all);
+        mask = ggml_reshape_4d(ctx0, gather_mask, gather_mask->ne[0], gather_mask->ne[1], 1, 1);
+    } else {
+        // the first n_kv cells hold positions 0 .. n_kv - 1, the tokens are the last ones
+        k_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_kv, 1, k_all->nb[1], k_all->nb[2], k_all->nb[3], 0), 0, 2, 1, 3);
+        v_fa = ggml_permute(ctx0, ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_kv, 1, v_all->nb[1], v_all->nb[2], v_all->nb[3], 0), 0, 2, 1, 3);
+        ggml_tensor * m = swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+        mask = ggml_cont(ctx0, ggml_view_4d(ctx0, m, n_kv, m->ne[1], m->ne[2], m->ne[3], m->nb[1], m->nb[2], m->nb[3], 0));
+    }
+
+    ggml_tensor * q_fa = ggml_permute(ctx0, ggml_reshape_4d(ctx0, q, hd, q->ne[1], n_tokens, 1), 0, 2, 1, 3);
+    ggml_tensor * cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_logits, 1.0f/sqrtf(hd));
+    ggml_flash_attn_ext_add_sinks(cur, ggml_reshape_3d(ctx0, sinks, sinks->ne[0], n_tokens, 1));
+    ggml_prec_set_acc(cur, GGML_PREC_F32);
+    // with --flash-attn auto, a device without the banded op disables it (the dense path)
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    if (v_scale) {
+        cur = ggml_mul(ctx0, cur, v_scale);
+    }
+    cb(cur, "kqv_out", il);
+    if (v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+    }
+    return cur;
+}
 
 ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
     if (scale) {
@@ -212,15 +327,40 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
     auto * positions = build_inp_pos();
     auto * out_ids = build_inp_out_ids();
     auto rel = std::make_unique<llm_graph_input_inkling2_pos>();
+    using pos_t = llm_graph_input_inkling2_pos;
     rel->cache[0] = attn->mctx->get_base();
     rel->cache[1] = attn->mctx->get_swa();
     rel->extent[0] = hparams.n_relative_extent;
     rel->extent[1] = hparams.n_swa;
-    ggml_tensor * distances[2];
+    // banded flash attention: F32/F16/BF16 K/V, head size 64 or 128, one stream without per-sequence K/V rows
     for (int i = 0; i < 2; ++i) {
-        distances[i] = rel->distance[i] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, rel->cache[i]->get_n_kv(), n_tokens);
-        ggml_set_input(distances[i]);
+        const auto * c = rel->cache[i];
+        const auto type_ok = [](ggml_type t) { return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16; };
+        bool ok = cparams.flash_attn && cparams.causal_attn && type_ok(c->type_k()) && type_ok(c->type_v()) &&
+            (i ? attn->self_attn_mask_swa.rows : attn->self_attn_mask.rows) == nullptr;
+        for (int il = 0; il < n_layer && ok; ++il) {
+            if (hparams.is_swa(il) == (i == 1)) {
+                const int64_t hd = hparams.n_embd_head_k(il);
+                ok = (hd == 64 || hd == 128) && hparams.n_embd_head_v(il) == hd;
+            }
+        }
+        rel->banded_ok[i] = ok;
+        rel->path[i] = pos_t::select(c, ok, rel->n_kv[i]);
+        if (rel->path[i] == pos_t::PATH_DENSE) {
+            rel->distance[i] = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, c->get_n_kv(), n_tokens);
+            ggml_set_input(rel->distance[i]);
+        } else if (rel->path[i] == pos_t::PATH_GATHER) {
+            rel->gather_idx[i]  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, rel->n_kv[i]);
+            rel->gather_mask[i] = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, rel->n_kv[i], n_tokens);
+            ggml_set_input(rel->gather_idx[i]);
+            ggml_set_input(rel->gather_mask[i]);
+        }
     }
+    const pos_t::path_t paths[2] = { rel->path[0], rel->path[1] };
+    const uint32_t n_kv_banded[2] = { rel->n_kv[0], rel->n_kv[1] };
+    ggml_tensor * distances[2]    = { rel->distance[0], rel->distance[1] };
+    ggml_tensor * gather_idx[2]   = { rel->gather_idx[0], rel->gather_idx[1] };
+    ggml_tensor * gather_mask[2]  = { rel->gather_mask[0], rel->gather_mask[1] };
     res->add_input(std::move(rel));
     auto * tau = ggml_scale_bias(ctx0, ggml_cast(ctx0, positions, GGML_TYPE_F32), 1.0f, 1.0f);
     tau = ggml_log(ctx0, ggml_clamp(ctx0, ggml_scale(ctx0, tau, 1.0f/hparams.n_log_scale_floor), 1.0f, INFINITY));
@@ -285,32 +425,38 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
             q = ggml_mul(ctx0, q, tau);
             r = ggml_mul(ctx0, r, tau);
         }
-        auto * mask = swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
-        const int64_t streams = mask->ne[3];
-        const int64_t n_kv = distances[swa]->ne[0];
         auto * sinks = build_lora_mm(l.attn_sink_proj, inputs[0]);
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x nh
-        auto * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, l.attn_rel_bias, 0, 1, 0, 0), r);
-        if (cparams.flash_attn) {
-            // exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
-            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, nh, n_tokens));
+        if (paths[swa] != pos_t::PATH_DENSE) {
+            // the bias of the distances 0 .. extent - 1, the farther cells have none
+            auto * rel_logits = ggml_mul_mat(ctx0, l.attn_rel_bias, r); // [extent, nh, n_tokens]
+            cur = attn_banded(attn, q, k, v, rel_logits, sinks, n_kv_banded[swa], gather_idx[swa], gather_mask[swa], il);
         } else {
-            // build_attn scales the bias along with QK; FA adds the mask after scaling QK.
-            table = ggml_scale(ctx0, table, sqrtf(hd));
+            auto * mask = swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw;
+            const int64_t streams = mask->ne[3];
+            const int64_t n_kv = distances[swa]->ne[0];
+            // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x nh
+            auto * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, l.attn_rel_bias, 0, 1, 0, 0), r);
+            if (cparams.flash_attn) {
+                // exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))).
+                table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, nh, n_tokens));
+            } else {
+                // build_attn scales the bias along with QK; FA adds the mask after scaling QK.
+                table = ggml_scale(ctx0, table, sqrtf(hd));
+            }
+            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+            auto * bias = ggml_get_rows(ctx0, table, distances[swa]);
+            bias = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, bias, nh, n_kv, n_tokens/streams, streams), 2, 0, 1, 3));
+            ggml_tensor * fa_mask = nullptr;
+            if (cparams.flash_attn) {
+                fa_mask = ggml_cast(ctx0, ggml_add(ctx0, bias, ggml_cast(ctx0, mask, GGML_TYPE_F32)), GGML_TYPE_F16);
+                sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
+                bias = nullptr;
+            } else {
+                sinks = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
+                        ggml_reshape_3d(ctx0, sinks, nh, n_tokens/streams, streams), 1, 0, 2, 3)), 1, n_tokens/streams, nh, streams);
+            }
+            cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, bias, sinks, nullptr, 1.0f/sqrtf(hd), il, fa_mask);
         }
-        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-        auto * bias = ggml_get_rows(ctx0, table, distances[swa]);
-        bias = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_4d(ctx0, bias, nh, n_kv, n_tokens/streams, streams), 2, 0, 1, 3));
-        ggml_tensor * fa_mask = nullptr;
-        if (cparams.flash_attn) {
-            fa_mask = ggml_cast(ctx0, ggml_add(ctx0, bias, ggml_cast(ctx0, mask, GGML_TYPE_F32)), GGML_TYPE_F16);
-            sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, nh), 0.0f);
-            bias = nullptr;
-        } else {
-            sinks = ggml_reshape_4d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0,
-                    ggml_reshape_3d(ctx0, sinks, nh, n_tokens/streams, streams), 1, 0, 2, 3)), 1, n_tokens/streams, nh, streams);
-        }
-        cur = build_attn(attn, nullptr, nullptr, nullptr, q, k, v, bias, sinks, nullptr, 1.0f/sqrtf(hd), il, fa_mask);
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(l.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(l.wo, cur), l.attn_post_conv, nullptr, state, history, recr, 2*kv);
         if (il % hparams.attn_res_block_size == 0) {
