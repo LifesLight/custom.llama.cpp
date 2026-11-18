@@ -1537,7 +1537,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch batch = common_batch_get_one(lctx, tmp);
             std::vector<float> zeros;
             common_batch_set_zero_state(batch, model, zeros);
-            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            llama_decode_startup_probe(lctx, batch.get());
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
@@ -1606,10 +1606,10 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         common_batch batch = common_batch_get_one(ctx, tmp);
         std::vector<float> zeros;
         common_batch_set_zero_state(batch, llama_get_model(ctx), zeros);
-        ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        ret = llama_decode_startup_probe(ctx, batch.get());
     }
     if (ret != 0) {
-        COM_ERR("llama_process() failed: %d\n", ret);
+        COM_ERR("startup probe failed: %d\n", ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
         goto done;
     }

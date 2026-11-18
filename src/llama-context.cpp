@@ -881,8 +881,8 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
-bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media) {
-    const bool small = sched_decode_workspace > 0 && !cparams.training && n_tokens <= sched_decode_workspace;
+bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe) {
+    const bool small = !startup_probe && sched_decode_workspace > 0 && !cparams.training && n_tokens <= sched_decode_workspace;
     if (!small) {
         moe_hot_attempted = false;
     }
@@ -890,7 +890,7 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media) {
     moe_hot_n_small = small && !media ? moe_hot_n_small + (moe_hot_n_small < 2) : 0;
 
     // with the GPU tier, the small batches (MTP verification) take the CPU path of the stream up to 32 tokens
-    // built from the second small batch in a row: not for a lone one, such as the memory probe of the server at load
+    // built from the second small batch in a row
     const bool hot = small && !media && moe_hot_enabled && loras->empty() &&
         (moe_hot || (!moe_hot_attempted && moe_hot_n_small >= 2));
     if (moe_stream && moe_stream->set_hot_cpu_max(hot ? std::min<uint32_t>(sched_decode_workspace, 32) : 0)) {
@@ -2406,7 +2406,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp) {
+int llama_context::decode(const llama_batch_ext & batch_inp, bool startup_probe) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2504,7 +2504,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
-    if (!sched_reserve_for_batch(n_tokens_all, batch_inp.n_embd > 0)) {
+    if (!sched_reserve_for_batch(n_tokens_all, batch_inp.n_embd > 0, startup_probe)) {
         return -2;
     }
 
@@ -5508,6 +5508,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 //
 // ext
 //
+
+int32_t llama_decode_startup_probe(llama_context * ctx, llama_batch_ext * batch) {
+    return ctx->decode(*batch, true);
+}
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();

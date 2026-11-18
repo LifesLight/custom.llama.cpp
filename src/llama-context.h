@@ -167,7 +167,7 @@ struct llama_context {
                        ggml_status & ret);
 
     int encode(const llama_batch_ext & batch_inp);
-    int decode(const llama_batch_ext & batch_inp);
+    int decode(const llama_batch_ext & batch_inp, bool startup_probe = false);
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -320,7 +320,7 @@ private:
     void sched_new(const sched_params & params);
 
     // switch the workspace for a batch of n_tokens (small or large), and manage the GPU expert tier, false on failure
-    bool sched_reserve_for_batch(uint32_t n_tokens, bool media);
+    bool sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
