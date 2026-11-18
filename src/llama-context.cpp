@@ -5007,6 +5007,10 @@ void llama_moe_hot_release(llama_context * ctx) {
     ctx->moe_hot_release();
 }
 
+bool llama_moe_hot_enabled(const llama_context * ctx) {
+    return ctx->moe_hot_is_enabled();
+}
+
 float * llama_get_logits(llama_context * ctx) {
     ctx->synchronize();
 

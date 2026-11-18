@@ -4259,6 +4259,13 @@ struct mtmd_model_loader {
                     }
                 }
                 LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
+
+                model.weights_fname = fname;
+                model.weights_buft  = buft;
+                model.weights_offs.clear();
+                for (auto & t : tensors_to_load) {
+                    model.weights_offs.emplace_back(ggml_get_tensor(model.ctx_data.get(), t->name), tensor_offset.at(t->name));
+                }
             } else {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
@@ -4420,6 +4427,49 @@ struct mtmd_model_loader {
 //
 // loading
 //
+
+bool mtmd_model_release_weights(mtmd_model & model) {
+    if (!model.buf || model.weights_offs.empty() || ggml_backend_buft_is_host(model.weights_buft)) {
+        return false;
+    }
+    model.buf.reset();
+    for (ggml_tensor * t = ggml_get_first_tensor(model.ctx_data.get()); t; t = ggml_get_next_tensor(model.ctx_data.get(), t)) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+    }
+    return true;
+}
+
+void mtmd_model_restore_weights(mtmd_model & model) {
+    GGML_ASSERT(!model.buf && model.weights_buft);
+    model.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_data.get(), model.weights_buft));
+    if (!model.buf) {
+        throw std::runtime_error("failed to allocate the mmproj weights");
+    }
+    ggml_backend_buffer_set_usage(model.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::ifstream fin(model.weights_fname, std::ios::binary);
+    if (!fin) {
+        model.buf.reset();
+        throw std::runtime_error(mtmd_format("failed to open %s", model.weights_fname.c_str()));
+    }
+    const auto cuda_reg = ggml_backend_reg_by_name("CUDA");
+    const auto suspend_weight = cuda_reg ? reinterpret_cast<ggml_backend_cuda_suspend_weight_t>(
+        ggml_backend_reg_get_proc_address(cuda_reg, "ggml_backend_cuda_suspend_weight")) : nullptr;
+    std::vector<uint8_t> read_buf;
+    for (const auto & [t, offset] : model.weights_offs) {
+        const size_t num_bytes = ggml_nbytes(t);
+        read_buf.resize(num_bytes);
+        if (!fin.seekg(offset, std::ios::beg) || !fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes)) {
+            model.buf.reset();
+            throw std::runtime_error(mtmd_format("failed to read tensor %s from %s", t->name, model.weights_fname.c_str()));
+        }
+        ggml_backend_tensor_set(t, read_buf.data(), 0, num_bytes);
+        if (suspend_weight) {
+            suspend_weight(t, model.weights_fname.c_str(), offset);
+        }
+    }
+}
 
 mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params, ggml_backend_buffer_type_t buft) {
     mtmd_model_loader loader(fname,

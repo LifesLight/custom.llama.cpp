@@ -1404,6 +1404,50 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // a media chunk of the prompt of the slot is not processed yet, so it may need the projector
+    static bool slot_has_media_ahead(const server_slot & slot) {
+        if (slot.state == SLOT_STATE_IDLE || slot.state == SLOT_STATE_DONE_PROMPT || slot.state == SLOT_STATE_GENERATING ||
+                !slot.task || !slot.task->tokens.has_mtmd) {
+            return false;
+        }
+        // before the prompt is processed, the cached prefix is not known yet
+        const auto & tokens = slot.task->tokens;
+        const size_t from = slot.state == SLOT_STATE_PROCESSING_PROMPT ? (size_t) slot.prompt.n_tokens() : 0;
+        if (from < tokens.size() && tokens[from] == LLAMA_TOKEN_NULL) {
+            return true;
+        }
+        return tokens.find_next_media_chunk(from).first != nullptr;
+    }
+
+    // with the GPU expert tier, the device memory of the vision projector goes to the tier while no active slot has a
+    // media chunk to process: already before the tail of a prompt, whose small batch builds the tier. it is read again
+    // before the next media encode
+    void release_mmproj_if_unused() {
+        if (mctx == nullptr || mmproj_resident || !llama_moe_hot_enabled(ctx_tgt) || mtmd_device_memory_released(mctx) ||
+                std::any_of(slots.begin(), slots.end(), slot_has_media_ahead)) {
+            return;
+        }
+        if (mtmd_release_device_memory(mctx)) {
+            // a tier built while the projector was resident would not use its memory: rebuilt with it by the next small batch
+            llama_moe_hot_release(ctx_tgt);
+        } else {
+            mmproj_resident = true; // host memory, or audio
+        }
+    }
+
+    // the projector cannot be released, see mtmd_release_device_memory()
+    bool mmproj_resident = false;
+
+    // before a media encode: the tier frees its banks first, so that the projector fits where it was at load
+    void restore_mmproj() {
+        if (mctx != nullptr && mtmd_device_memory_released(mctx)) {
+            llama_moe_hot_release(ctx_tgt);
+            if (!mtmd_restore_device_memory(mctx)) {
+                SRV_ERR("%s", "failed to restore the mmproj weights\n");
+            }
+        }
+    }
+
     // Called by the inference loop after all active slots have drained.
     void suspend_gpu_if_idle() {
         if (gpu_suspend_tasks.empty() ||
@@ -3926,6 +3970,7 @@ private:
         if (gpu_suspended) {
             return;
         }
+        release_mmproj_if_unused();
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4807,6 +4852,7 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
+                        restore_mmproj();
                         queue_tasks.yield_to_queue([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
@@ -5013,6 +5059,7 @@ private:
         float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
         if (!embd) {
             int32_t res = 0;
+            restore_mmproj();
             queue_tasks.yield_to_queue([&]() {
                 res = encode_mtmd_chunk(slot, slot.mbatch, idx);
             });
@@ -5061,6 +5108,7 @@ private:
             if (!embd) {
                 // encode on the worker thread, so we can still handle metrics tasks
                 int32_t res = 0;
+                restore_mmproj();
                 queue_tasks.yield_to_queue([&]() {
                     res = encode_mtmd_chunk(slot, slot.mbatch, cur_token_idx);
                 });

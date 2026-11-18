@@ -53,6 +53,13 @@ struct mtmd_backends {
 
     std::map<ggml_backend_dev_t, size_t> get_mem_compute() const;
 
+    // a new scheduler without buffers: frees the compute buffers, the subcontexts must reserve their graphs again
+    void reset_sched();
+
+    int max_nodes = 0;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
+
     mtmd_backends(const mtmd_backends &) = delete;
     mtmd_backends & operator=(const mtmd_backends &) = delete;
 };

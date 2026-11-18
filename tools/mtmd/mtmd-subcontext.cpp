@@ -99,6 +99,14 @@ mtmd_backends::mtmd_backends(ggml_backend_dev_t device, int n_threads, int max_n
     ptrs.push_back(backend_cpu);
     bufts.push_back(ggml_backend_get_default_buffer_type(backend_cpu));
 
+    this->max_nodes         = max_nodes;
+    this->cb_eval           = cb_eval;
+    this->cb_eval_user_data = cb_eval_user_data;
+    reset_sched();
+}
+
+void mtmd_backends::reset_sched() {
+    sched.reset(); // its buffers first
     sched.reset(ggml_backend_sched_new(ptrs.data(), bufts.data(), ptrs.size(), max_nodes, false, true));
     if (cb_eval != nullptr) {
         ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);

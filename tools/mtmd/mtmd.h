@@ -151,6 +151,13 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
 
+// free the device memory of a vision projector (weights and compute buffers) while it is not used, e.g. during
+// text generation; returns false if not supported (audio, host memory). the next encode reads the weights again
+// from the file, or call mtmd_restore_device_memory() first to control when that memory comes back
+MTMD_API bool mtmd_release_device_memory(mtmd_context * ctx);
+MTMD_API bool mtmd_restore_device_memory(mtmd_context * ctx); // false on failure
+MTMD_API bool mtmd_device_memory_released(mtmd_context * ctx);
+
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk
 MTMD_API bool mtmd_decode_use_non_causal(const mtmd_context * ctx, const mtmd_input_chunk * chunk);
