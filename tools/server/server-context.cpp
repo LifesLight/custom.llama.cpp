@@ -1397,6 +1397,35 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // with the GPU expert tier, the device memory of the vision projector goes to it while every active slot generates
+    // text: it is read again before the next media encode
+    void release_mmproj_if_generating() {
+        if (mctx == nullptr || !llama_moe_hot_enabled(ctx_tgt) || mtmd_device_memory_released(mctx)) {
+            return;
+        }
+        bool generating = false;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING) {
+                generating = true;
+            } else if (slot.state != SLOT_STATE_IDLE) {
+                return; // a prompt is processed
+            }
+        }
+        if (generating) {
+            mtmd_release_device_memory(mctx);
+        }
+    }
+
+    // before a media encode: the tier frees its banks first, so that the projector fits where it was at load
+    void restore_mmproj() {
+        if (mctx != nullptr && mtmd_device_memory_released(mctx)) {
+            llama_moe_hot_release(ctx_tgt);
+            if (!mtmd_restore_device_memory(mctx)) {
+                SRV_ERR("%s", "failed to restore the mmproj weights\n");
+            }
+        }
+    }
+
     // Called by the inference loop after all active slots have drained.
     void suspend_gpu_if_idle() {
         if (gpu_suspend_tasks.empty() ||
@@ -3985,6 +4014,7 @@ private:
         if (gpu_suspended) {
             return;
         }
+        release_mmproj_if_generating();
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4896,6 +4926,7 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
+                        restore_mmproj();
                         queue_tasks.yield_to_queue([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
@@ -5102,6 +5133,7 @@ private:
         float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
         if (!embd) {
             int32_t res = 0;
+            restore_mmproj();
             queue_tasks.yield_to_queue([&]() {
                 res = encode_mtmd_chunk(slot, slot.mbatch, idx);
             });
@@ -5150,6 +5182,7 @@ private:
             if (!embd) {
                 // encode on the worker thread, so we can still handle metrics tasks
                 int32_t res = 0;
+                restore_mmproj();
                 queue_tasks.yield_to_queue([&]() {
                     res = encode_mtmd_chunk(slot, slot.mbatch, cur_token_idx);
                 });

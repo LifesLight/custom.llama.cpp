@@ -80,6 +80,11 @@ the previous ones are uploaded. Each new prompt therefore costs one fill of the 
 **Suspend.** `--can-suspend` frees the tier before the CUDA buffers are suspended (`llama_moe_hot_release`), so
 that it needs no host backup and no VRAM on restore; it is rebuilt from the free VRAM at the next decode.
 
+**Vision projector.** With the tier, the server frees the device memory of a vision mmproj (weights and compute
+buffers) once every active slot generates, so that the tier can use it, and reads the weights again from the file
+before the next media encode, after freeing the tier banks (the memory layout of the load). Prompts without media
+do not restore it. Not for audio projectors.
+
 ## Logs
 
 - `workspace_switch:` the compute buffer and free memory of each backend at a switch.

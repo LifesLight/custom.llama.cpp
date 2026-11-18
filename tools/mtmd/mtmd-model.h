@@ -896,6 +896,12 @@ struct mtmd_model {
     ggml_backend_buffer_ptr buf;
     std::map<ggml_backend_dev_t, size_t> mem_weights;
 
+    // where the weights are read from, to free them during text generation and read them again
+    // (mtmd_release_device_memory)
+    std::string                                   weights_fname;
+    ggml_backend_buffer_type_t                    weights_buft = nullptr;
+    std::vector<std::pair<ggml_tensor *, size_t>> weights_offs; // tensor of ctx_data, offset in the file
+
     // embeddings
     ggml_tensor * class_embedding = nullptr;
     ggml_tensor * patch_embeddings_0 = nullptr;
@@ -1322,6 +1328,11 @@ struct mtmd_models {
 
 // the weights are allocated in buft, throws on error
 mtmd_models mtmd_model_load(const char * fname, const mtmd_model_params & params, ggml_backend_buffer_type_t buft);
+
+// free the device memory of the weights, false if they are in host memory or not loaded
+bool mtmd_model_release_weights(mtmd_model & model);
+// allocate the weights again and read them from the file, throws on failure
+void mtmd_model_restore_weights(mtmd_model & model);
 
 struct mtmd_model_caps {
     bool has_vision;
