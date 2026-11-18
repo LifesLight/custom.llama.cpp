@@ -15,8 +15,10 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -26,6 +28,23 @@
 //
 // llama_context
 //
+
+static constexpr uint64_t MiB = 1024*1024;
+
+// an unsigned integer environment variable, fallback if unset
+static uint64_t env_uint(const char * name, uint64_t fallback, uint64_t max) {
+    const char * env = getenv(name);
+    if (env == nullptr) {
+        return fallback;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long value = strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value > max) {
+        throw std::runtime_error(format("%s must be an integer from 0 to %" PRIu64, name, max));
+    }
+    return value;
+}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -648,6 +667,34 @@ llama_context::llama_context(
             }
         }
 
+        // the GPU expert tier of the MoE stream (LLAMA_MOE_HOT=1), in the VRAM that decode workspace switching frees
+        const bool hot_requested = moe_stream && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && env_uint("LLAMA_MOE_HOT", 0, 1) != 0;
+        {
+            const uint64_t value = env_uint("LLAMA_DECODE_WORKSPACE", hot_requested ? 32 : 0, UINT32_MAX);
+            const uint32_t full  = std::min(cparams.n_ctx, cparams.n_ubatch);
+            if (value > 0) {
+                if (cparams.n_seq_max != 1 || !cparams.causal_attn || !memory || llama_model_has_encoder(&model) || model.no_alloc()) {
+                    LLAMA_LOG_WARN("workspace_switch: disabled: requires one sequence, causal decoder-only inference with memory\n");
+                } else if (value >= full) {
+                    LLAMA_LOG_WARN("workspace_switch: disabled: limit %" PRIu64 " is not smaller than the ubatch %u\n", value, full);
+                } else {
+                    sched_decode_workspace = (uint32_t) value;
+                    LLAMA_LOG_INFO("workspace_switch: small <= %u tokens, large <= %u tokens\n", sched_decode_workspace, full);
+                }
+            }
+        }
+        if (hot_requested && sched_decode_workspace > 0) {
+            if (!model.hdmd.rot.empty() || !model.hdmd.inv.empty()) {
+                LLAMA_LOG_WARN("moe_hot: disabled: rotated experts\n");
+            } else {
+                moe_hot_enabled = true;
+                moe_hot_params.headroom        = env_uint("LLAMA_MOE_HOT_HEADROOM_MIB", 256, SIZE_MAX/MiB)*MiB;
+                moe_hot_params.update_interval = env_uint("LLAMA_MOE_HOT_UPDATE",       32,  UINT32_MAX);
+                moe_hot_params.update_bytes    = env_uint("LLAMA_MOE_HOT_UPDATE_MIB",   256, SIZE_MAX/MiB)*MiB;
+            }
+        } else if (hot_requested) {
+            LLAMA_LOG_WARN("moe_hot: disabled: requires decode workspace switching\n");
+        }
 
         sched_reserve();
 
@@ -691,6 +738,15 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    // the GGUF backs the experts of the GPU tier, no demotion; the state file still lists them
+    if (moe_stream) {
+        if (moe_hot) {
+            moe_stream->save_state();
+        }
+        moe_stream->set_hot_observer(nullptr);
+    }
+    moe_hot.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -824,6 +880,103 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
+bool llama_context::sched_reserve_for_batch(uint32_t n_tokens) {
+    const bool small = sched_decode_workspace > 0 && !cparams.training && n_tokens <= sched_decode_workspace;
+    if (!small) {
+        moe_hot_attempted = false;
+    }
+
+    // with the GPU tier, the small batches (MTP verification) take the CPU path of the stream up to 32 tokens
+    const bool hot = small && moe_hot_enabled && loras->empty() && (moe_hot || !moe_hot_attempted);
+    if (moe_stream && moe_stream->set_hot_cpu_max(hot ? std::min<uint32_t>(sched_decode_workspace, 32) : 0)) {
+        sched_workspace_recreate = true;
+        sched_need_reserve = true;
+    }
+    if (moe_hot && !hot) {
+        moe_hot_drop = true;
+        sched_workspace_recreate = true;
+        sched_need_reserve = true;
+    }
+    if (small != sched_workspace_small) {
+        sched_workspace_small = small;
+        sched_workspace_recreate = true;
+        sched_need_reserve = true;
+    }
+
+    // falls back to the streamed experts: the tier is released with the workspace
+    auto drop_hot = [&](const char * what, const std::exception & e) {
+        LLAMA_LOG_WARN("moe_hot: %s failed (%s), using the streamed experts\n", what, e.what());
+        moe_stream->set_hot_cpu_max(0);
+        moe_hot_drop = true;
+        sched_workspace_recreate = true;
+        sched_need_reserve = true;
+        sched_reserve();
+    };
+
+    try {
+        sched_reserve();
+
+        if (hot && !moe_hot && moe_stream->cpu_batch(n_tokens)) {
+            moe_hot_attempted = true;
+            synchronize();
+            try {
+                moe_hot = std::make_unique<llama_moe_hot>(model, backend_ptrs, *moe_stream, moe_hot_params);
+                if (moe_hot->empty()) {
+                    moe_hot.reset();
+                    moe_stream->set_hot_cpu_max(0);
+                }
+                sched_workspace_recreate = true;
+                sched_need_reserve = true;
+                sched_reserve();
+                if (moe_hot) {
+                    moe_stream->set_hot_observer(moe_hot.get());
+                }
+            } catch (const std::exception & e) {
+                drop_hot("activation", e);
+            }
+        }
+
+        if (moe_hot && moe_hot->update_due() && moe_stream->cpu_batch(n_tokens)) {
+            const int64_t t_start_us = ggml_time_us();
+            synchronize();
+            const double sync_ms = (ggml_time_us() - t_start_us)/1000.0;
+            try {
+                if (moe_hot->update(*moe_stream, sync_ms)) {
+                    sched_need_reserve = true;
+                    sched_reserve();
+                }
+            } catch (const std::exception & e) {
+                drop_hot("update", e);
+            }
+        }
+        return true;
+    } catch (const std::exception & e) {
+        // the old workspace was released: retry the reservation before any later graph
+        sched_need_reserve = true;
+        sched_workspace_recreate = true;
+        LLAMA_LOG_ERROR("workspace_switch: reservation failed: %s\n", e.what());
+        return false;
+    }
+}
+
+void llama_context::moe_hot_release() {
+    moe_hot_attempted = false;
+    if (!moe_hot) {
+        return;
+    }
+    synchronize();
+    moe_hot_drop = true;
+    sched_workspace_recreate = true;
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        sched_need_reserve = true;
+        sched_workspace_recreate = true;
+        LLAMA_LOG_ERROR("workspace_switch: reservation failed: %s\n", e.what());
+    }
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -838,7 +991,20 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = std::min(cparams.n_ctx,
+            sched_workspace_small && !cparams.training ? sched_decode_workspace : cparams.n_ubatch);
+
+    const bool switching = sched_workspace_recreate;
+    std::vector<size_t> old_sizes;
+    std::vector<size_t> free_before;
+    if (switching) {
+        for (auto * backend : backend_ptrs) {
+            old_sizes.push_back(sched ? ggml_backend_sched_get_buffer_size(sched.get(), backend) : 0);
+            size_t available = 0, total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(backend), &available, &total);
+            free_before.push_back(available);
+        }
+    }
 
     const size_t max_nodes = this->graph_max_nodes();
 
@@ -851,6 +1017,23 @@ void llama_context::sched_reserve() {
     for (auto & res : gf_res_prev) {
         res->set_max_nodes(max_nodes);
         res->reset();
+    }
+
+    if (switching) {
+        // switching the workspace: free the old scheduler (and the GPU tier) before allocating the new one, the
+        // synchronization and graph invalidation above precede freeing their tensor storage
+        copy_experts.reset();
+        sched.reset();
+        if (moe_hot_drop) {
+            if (moe_hot) {
+                // no copies: the model file backs the experts, and the RAM cache keeps what decode missed
+                moe_stream->set_hot_observer(nullptr);
+                moe_hot.reset();
+                LLAMA_LOG_INFO("moe_hot: released\n");
+            }
+            moe_hot_drop = false;
+        }
+        sched_workspace_recreate = false;
     }
 
     sched_new({
@@ -966,6 +1149,13 @@ void llama_context::sched_reserve() {
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
+        if (switching) {
+            size_t available = 0, total = 0;
+            ggml_backend_dev_memory(ggml_backend_get_device(backend), &available, &total);
+            LLAMA_LOG_INFO("workspace_switch: context=%p mode=%s tokens=%u backend=%s compute_MiB=%.2f->%.2f free_MiB=%.2f->%.2f\n",
+                    (void *) this, sched_workspace_small ? "small" : "large", n_tokens, ggml_backend_name(backend),
+                    old_sizes[i]/1048576.0, backend_buf_exp_size[i]/1048576.0, free_before[i]/1048576.0, available/1048576.0);
+        }
     }
 
     {
@@ -989,6 +1179,10 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    if (switching) {
+        LLAMA_LOG_INFO("workspace_switch: context=%p mode=%s ready in %.2f ms\n",
+                (void *) this, sched_workspace_small ? "small" : "large", (t_end_us - t_start_us)/1000.0);
+    }
 }
 
 void llama_context::synchronize() {
@@ -1106,8 +1300,12 @@ bool llama_context::memory_update(bool optimize) {
         }
     }
 
-    // if the memory module did any computation, we have to reserve a new worst-case graph
-    {
+    // the memory update can grow the allocator beyond the small workspace: reserve it again from scratch
+    if (sched_workspace_small) {
+        sched_need_reserve = true;
+        sched_workspace_recreate = true;
+        sched_reserve();
+    } else {
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");
@@ -1887,7 +2085,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & e) {
+            if (!moe_hot) {
+                throw;
+            }
+            // a shape that the GPU tier does not support: this batch fails, the next ones use the streamed experts
+            LLAMA_LOG_ERROR("%s: graph build failed: %s\n", __func__, e.what());
+            moe_hot_drop = true;
+            sched_workspace_recreate = true;
+            sched_need_reserve = true;
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1923,8 +2134,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
 
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
     if (moe_stream) {
-        moe_stream->end_graph();
+        moe_stream->end_graph(status == GGML_STATUS_SUCCESS);
     }
 
     if (status != GGML_STATUS_SUCCESS) {
@@ -2284,6 +2499,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
+    if (!sched_reserve_for_batch(n_tokens_all)) {
+        return -2;
+    }
+
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
@@ -2291,8 +2510,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
-
-    sched_reserve();
 
     bool did_optimize = false;
 
@@ -2992,6 +3209,15 @@ uint32_t llama_context::graph_max_nodes() const {
         res *= 4;
     }
 
+    // the expert branches of the GPU tier
+    if (moe_hot) {
+        const uint64_t expanded = (uint64_t) res*(1 + moe_hot->n_devices());
+        if (expanded > UINT32_MAX) {
+            throw std::runtime_error("moe_hot: graph node capacity overflow");
+        }
+        res = (uint32_t) expanded;
+    }
+
     return res;
 }
 
@@ -3141,6 +3367,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
         /*.moe_stream  =*/ moe_stream.get(),
+        /*.moe_hot     =*/ moe_hot.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
@@ -4784,6 +5011,14 @@ bool llama_get_causal_attn(const llama_context * ctx) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_moe_hot_release(llama_context * ctx) {
+    ctx->moe_hot_release();
+}
+
+bool llama_moe_hot_enabled(const llama_context * ctx) {
+    return ctx->moe_hot_is_enabled();
 }
 
 float * llama_get_logits(llama_context * ctx) {

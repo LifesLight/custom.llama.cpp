@@ -4,11 +4,13 @@
 
 #include "ggml-backend.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 struct llama_model;
+class llama_moe_hot;
 
 struct llama_moe_stream_params {
     int32_t     n_threads; // IO threads
@@ -50,6 +52,43 @@ public:
 
     // false if there is nothing to stream (no memory mapped experts)
     bool active() const;
+
+    //
+    // GPU expert tier (llama_moe_hot): called between synchronized graphs, except the observer callbacks
+    //
+
+    // the usage of the experts of a layer: their decayed selections (LLAMA_MOE_STREAM_HALFLIFE) by the batches
+    // computed on the CPU, or by all the batches early on (as hot_experts), empty if the layer is not streamed
+    std::vector<double> usage(int il) const;
+    // the expert is in the RAM cache
+    bool cached(int il, int expert) const;
+    // save the cached experts and their usage now (with the experts of the GPU tier, which are not in RAM)
+    void save_state();
+    // the streamed expert tensors of a layer, sorted by name, empty if the layer is not streamed
+    std::vector<const ggml_tensor *> layer_tensors(int il) const;
+    // the tier observes the routing of the CPU path, its experts bypass the RAM cache and its prefetches, and their
+    // RAM copies are the first victims of its misses
+    void set_hot_observer(llama_moe_hot * observer);
+    // all the layers compute a batch of that many tokens on the CPU
+    bool cpu_batch(int64_t tokens) const;
+    // the CPU path takes batches of up to that many tokens, if the cache allows, true if it changed
+    bool set_hot_cpu_max(int64_t tokens);
+    // finish the prefetches, so that the cache can change
+    void quiesce_hot();
+
+    using expert_writer = std::function<void(const ggml_tensor *, const void *, size_t)>;
+    using expert_reader = std::function<void(const ggml_tensor *, void *, size_t)>;
+    // the tensors of an expert, from the RAM cache or read from the model file, false if not streamed
+    bool with_expert(int il, int expert, const expert_writer & writer);
+    // the tensors of the experts (il, expert) for writer(index, ...): from the RAM cache, the others read from the
+    // model file in parallel, while the previous ones are written. false if one is not streamed
+    using expert_batch_writer = std::function<void(size_t, const ggml_tensor *, const void *, size_t)>;
+    bool with_experts(const std::vector<std::pair<int, int>> & experts, const expert_batch_writer & writer);
+    // admit an expert to the RAM cache, its tensors written by reader, false if no slot can take it. the RAM copies
+    // of the experts of the tier are evicted first (a decode miss takes them)
+    bool restore_expert(int il, int expert, const expert_reader & reader);
+    // the experts of the tier changed
+    void hot_changed();
 
     // true if src is an expert tensor handled by the stream
     bool is_streamed(const ggml_tensor * src) const;
@@ -101,7 +140,7 @@ public:
     // of the expert matmuls that the scheduler assigned to the GPU
     // expect_more is a hint that another ubatch will follow, so its first tensors can be prefetched
     void begin_graph(ggml_backend_sched_t sched, ggml_cgraph * gf, int64_t n_tokens, bool expect_more);
-    void end_graph();
+    void end_graph(bool success = true);
 
     // ggml_backend_sched copy callback for the experts of src
     // counts: the tokens per expert selected by the router (nullptr = copy all), dst: the copy of src on the device

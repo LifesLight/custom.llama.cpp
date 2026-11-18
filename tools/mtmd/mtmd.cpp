@@ -616,6 +616,9 @@ struct mtmd_context {
     // held by every public function that runs a graph, the internals never lock
     std::mutex compute_mutex;
 
+    // the device memory of the vision projector is freed (mtmd_release_device_memory)
+    bool released = false;
+
     std::unique_ptr<mtmd_subcontext> ctx_v; // vision
     std::unique_ptr<mtmd_subcontext> ctx_a; // audio
     std::vector<float> out_embd; // image embedding vector
@@ -2440,9 +2443,63 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
     return 1;
 }
 
+// with compute_mutex held: the weights of a released projector, read again before an encode
+static bool mtmd_restore_locked(mtmd_context * ctx) {
+    if (!ctx->released) {
+        return true;
+    }
+    try {
+        const int64_t t_start = ggml_time_us();
+        mtmd_model_restore_weights(*ctx->models.v);
+        ctx->released = false;
+        LOG_INF("%s: mmproj weights restored in %.0f ms\n", __func__, (ggml_time_us() - t_start)/1000.0);
+        return true;
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
+
+bool mtmd_release_device_memory(mtmd_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    // vision only: the audio preprocessor keeps the scheduler, and audio generation runs during decode
+    if (ctx->released || !ctx->ctx_v || ctx->ctx_a || ctx->ctx_gen_a) {
+        return ctx->released;
+    }
+    const size_t weights = ctx->models.v->buf ? ggml_backend_buffer_get_size(ctx->models.v->buf.get()) : 0;
+    if (!mtmd_model_release_weights(*ctx->models.v)) {
+        return false;
+    }
+    size_t compute = 0;
+    for (ggml_backend_t b : ctx->backends->ptrs) {
+        if (b != ctx->backends->backend_cpu) {
+            compute += ggml_backend_sched_get_buffer_size(ctx->backends->sched.get(), b);
+        }
+    }
+    ctx->backends->reset_sched();
+    ctx->ctx_v->is_allocated = false; // the next encode reserves its graph
+    ctx->released = true;
+    LOG_INF("%s: mmproj released: %.0f MiB of weights, %.0f MiB of compute buffers\n", __func__,
+            weights/1048576.0, compute/1048576.0);
+    return true;
+}
+
+bool mtmd_restore_device_memory(mtmd_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return mtmd_restore_locked(ctx);
+}
+
+bool mtmd_device_memory_released(mtmd_context * ctx) {
+    std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    return ctx->released;
+}
+
 int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     // this is the non-batching version
     std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    if (!mtmd_restore_locked(ctx)) {
+        return 1;
+    }
     try {
         return mtmd_encode_chunk_impl(ctx, chunk, ctx->out_embd);
     } catch (const std::exception & e) {
@@ -2453,6 +2510,9 @@ int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
 
 int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) {
     std::lock_guard<std::mutex> lock(ctx->compute_mutex);
+    if (!mtmd_restore_locked(ctx)) {
+        return 1;
+    }
     try {
         return mtmd_encode_impl(ctx, image_tokens, ctx->out_embd);
     } catch (const std::exception & e) {
@@ -3333,6 +3393,9 @@ static int32_t mtmd_batch_encode_impl(mtmd_batch * batch) {
 
 int32_t mtmd_batch_encode(mtmd_batch * batch) {
     std::lock_guard<std::mutex> lock(batch->ctx->compute_mutex);
+    if (!mtmd_restore_locked(batch->ctx)) {
+        return 1;
+    }
     try {
         return mtmd_batch_encode_impl(batch);
     } catch (const std::exception & e) {

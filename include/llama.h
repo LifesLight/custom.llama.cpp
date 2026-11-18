@@ -1125,6 +1125,13 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
+    // Free the GPU expert tier of the MoE stream (the model file backs its experts)
+    // It is rebuilt by the next small decode batch. Call before releasing GPU memory (e.g. a CUDA suspend)
+    LLAMA_API void llama_moe_hot_release(struct llama_context * ctx);
+
+    // The GPU expert tier is enabled (LLAMA_MOE_HOT=1): VRAM freed during decode is used by it
+    LLAMA_API bool llama_moe_hot_enabled(const struct llama_context * ctx);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.
