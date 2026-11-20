@@ -64,6 +64,8 @@ struct llama_context {
 
     // free the GPU expert tier, rebuilt by the next small batch
     void moe_hot_release();
+    size_t moe_stream_shrink(size_t bytes);
+    size_t moe_stream_grow();
     bool moe_hot_is_enabled() const { return moe_hot_enabled; }
 
     const llama_model   & get_model()   const;

@@ -1230,6 +1230,7 @@ private:
     ggml_backend_cuda_suspend_prepare_t gpu_suspend_prepare = nullptr;
     ggml_backend_cuda_suspend_set_t gpu_suspend_set = nullptr;
     ggml_backend_cuda_suspend_target_t gpu_suspend_target = nullptr;
+    ggml_backend_cuda_suspend_release_t gpu_suspend_release = nullptr;
     std::atomic<bool> gpu_suspended{false};
     std::vector<int> gpu_suspend_tasks;
 
@@ -1323,6 +1324,15 @@ private:
                     params_base.suspend_devices.c_str());
             return false;
         }
+        if (params_base.suspend_free_ram > 0) {
+            // the RAM backups of the suspended buffers only exist while suspended, freed after each restore
+            gpu_suspend_release = reinterpret_cast<ggml_backend_cuda_suspend_release_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_suspend_release"));
+            if (!gpu_suspend_release) {
+                SRV_ERR("%s", "--suspend-free-ram: the CUDA backend cannot release the suspend backups\n");
+                return false;
+            }
+        }
         if (!params_base.resume_hook.empty()) {
 #if defined(__linux__)
             if (!std::filesystem::path(params_base.resume_hook).is_absolute() ||
@@ -1390,6 +1400,10 @@ private:
             return "Failed to restore CUDA buffers";
         }
         gpu_suspended = false;
+        if (params_base.suspend_free_ram > 0) {
+            // the backups are not needed once restored; the RAM lent out comes back when idle (on_idle)
+            gpu_suspend_release();
+        }
         return nullptr;
     }
 
@@ -1459,6 +1473,10 @@ private:
         llama_synchronize(ctx_tgt);
         if (ctx_dft) {
             llama_synchronize(ctx_dft);
+        }
+        // RAM lent out while suspended: released before the backups of the CUDA buffers are allocated in it
+        if (params_base.suspend_free_ram > 0) {
+            llama_moe_stream_shrink(ctx_tgt, params_base.suspend_free_ram);
         }
         const bool success = gpu_suspend_set(true);
         gpu_suspended = true;
@@ -1969,7 +1987,8 @@ private:
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
-        if (gpu_suspend_prepare && !gpu_suspend_prepare()) {
+        // with --suspend-free-ram the backups are only allocated while suspended
+        if (gpu_suspend_prepare && params_base.suspend_free_ram == 0 && !gpu_suspend_prepare()) {
             SRV_ERR("%s", "cannot reserve CUDA suspend backing memory; check RAM and selected GPU placement\n");
             return false;
         }
@@ -2005,6 +2024,24 @@ private:
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
+        if (params_base.can_suspend && params_base.suspend_free_ram > 0) {
+            // the RAM lent out while suspended comes back when the server has been idle for a moment, not at the
+            // resume: the first request after a resume does not wait for it, and requests in a row (an automated
+            // loop of suspends) do not refill what the next suspend releases again
+            constexpr int64_t REGROW_IDLE_MS = 3000;
+            queue_tasks.on_idle([this]() {
+                if (gpu_suspended) {
+                    return true; // lent out while suspended: the resume is a task, which starts a new idle period
+                }
+                for (const auto & slot : slots) {
+                    if (slot.is_processing()) {
+                        return false; // not idle after all: again in a moment
+                    }
+                }
+                llama_moe_stream_grow(ctx_tgt);
+                return true;
+            }, REGROW_IDLE_MS);
+        }
 
         metrics.init();
 

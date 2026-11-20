@@ -76,6 +76,17 @@ public:
     // finish the prefetches, so that the cache can change
     void quiesce_hot();
 
+    //
+    // lending RAM out, e.g. while the GPUs are suspended for another program: between synchronized graphs
+    //
+
+    // release about bytes of the expert cache: its least used experts are evicted (each layer keeps its least
+    // slots) and the memory of their slots is unlocked and dropped. returns the bytes released
+    size_t shrink_cache(size_t bytes);
+    // take the released memory back, as far as the available RAM minus the reserve allows, and fill it with the most
+    // used experts that are not cached (read before this returns). returns the bytes taken back
+    size_t grow_cache();
+
     using expert_writer = std::function<void(const ggml_tensor *, const void *, size_t)>;
     using expert_reader = std::function<void(const ggml_tensor *, void *, size_t)>;
     // the tensors of an expert, from the RAM cache or read from the model file, false if not streamed

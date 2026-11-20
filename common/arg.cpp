@@ -4042,6 +4042,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_RESUME_HOOK_TIMEOUT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--suspend-free-ram"}, "GiB",
+        "with --can-suspend and --moe-stream: GiB of the RAM expert cache released while suspended (its least used\n"
+        "experts), taken back on resume as far as the available RAM minus --moe-stream-reserve allows. the RAM backup\n"
+        "of the suspended CUDA buffers (KV cache...) is then also only allocated while suspended (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            const double gib = std::stod(value);
+            if (gib < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.suspend_free_ram = (size_t) (gib*1024*1024*1024);
+        }
+    ).set_env("LLAMA_ARG_SUSPEND_FREE_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--sleep-idle-seconds"}, "SECONDS",
         string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
         [](common_params & params, int value) {

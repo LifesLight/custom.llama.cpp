@@ -292,6 +292,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     worker.thread = std::thread([this]() { worker_loop(); });
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
+    int64_t idle_done_for = -1; // the time_last_task of the idle period the idle callback ran for
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
         if (idle_sleep_ms < 0 || n_inflight > 0) {
@@ -326,6 +327,26 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
                 break; // go back to process new tasks or terminate
+            }
+
+            // idle work, once per idle period, without the lock so that new tasks can be posted meanwhile
+            if (callback_idle && n_inflight == 0 && idle_done_for != time_last_task &&
+                    ggml_time_ms() - time_last_task >= idle_after_ms) {
+                const int64_t period = time_last_task;
+                lock.unlock();
+                if (callback_idle()) {
+                    idle_done_for = period;
+                    continue; // check for new tasks again
+                }
+                lock.lock();
+                if (!running || !queue_tasks.empty()) {
+                    break;
+                }
+                // not done: wait a moment (or for a new task) before calling it again
+                if (condition_tasks.wait_for(lock, max_wait_time, [&]{ return !queue_tasks.empty() || !running; })) {
+                    break;
+                }
+                continue;
             }
 
             // no tasks, check for sleeping state

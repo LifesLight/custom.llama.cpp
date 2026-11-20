@@ -187,7 +187,9 @@ struct llama_moe_stream::impl {
     // do not fit in the cache
     struct pool {
         std::vector<int> layers;
-        int64_t n_slots = 0;
+        int64_t n_slots = 0;     // the slots in use: everything but the banks and the windows only sees these
+        int64_t n_phys  = 0;     // the slots in the banks, the window after them. n_slots < n_phys while the memory
+                                 // of the slots [n_slots, n_phys) is released (shrink_cache)
         bool    window  = false;
 
         std::vector<int32_t> slot_layer;  // [n_slots] the layer of the expert in the slot
@@ -352,6 +354,11 @@ struct llama_moe_stream::impl {
     std::atomic<int>     graphs_running { 0 };
     std::atomic<int64_t> graph_end_us { 0 };
     bool                 thp_fault = true; // advise the next chunks of the cache for huge pages at the fault
+
+    // RAM lent out (shrink_cache / grow_cache): the released slots of each pool are [n_slots, n_phys)
+    size_t ram_reserve  = 0;     // RAM left available when the cache grows back (--moe-stream-reserve)
+    size_t ram_lent     = 0;     // bytes of the released slots
+    bool   cache_locked = false; // the slots are locked in RAM (mlock)
     bool           pinned     = false;
 
     // staging buffers
@@ -604,6 +611,7 @@ struct llama_moe_stream::impl {
         const int n_threads = std::max(1, params.n_threads);
 
         plan(params.resident, params.reserve, n_threads);
+        ram_reserve = params.reserve;
 
         if (params.state != "none") {
             state_path = params.state.empty() ? files[0].path + ".moe-stream" : params.state;
@@ -1371,6 +1379,396 @@ struct llama_moe_stream::impl {
         }
     }
 
+    //
+    // lending RAM out (shrink_cache / grow_cache), e.g. while the GPUs are suspended for another program
+    //
+    // every slot [0, n_slots) of a pool always holds an expert, and everything but the banks and the windows only
+    // looks at those slots. shrinking moves the experts kept from the tail of the slots into the slots of the evicted
+    // ones, then lowers n_slots: the released slots [n_slots, n_phys) are unreachable (no slot_of points to them, they
+    // are not in the eviction order, the loops end at n_slots), and their memory is unlocked and dropped. growing
+    // locks it again, gives the slots to the most used experts that are not cached and reads them before n_slots is
+    // raised. the windows stay at n_phys. both run between graphs, with no read into the cache in progress
+    //
+
+    // the bytes of a slot of a pool: one expert of each of its tensors
+    size_t slot_bytes(const pool & p) const {
+        size_t b = 0;
+        for (int idx : layers[p.layers[0]].tensors) {
+            b += tensors[idx].expert_size;
+        }
+        return b;
+    }
+
+    // no graph and no read into the cache in progress, so that its slots and their memory can change
+    bool cache_quiet() {
+        if (graphs_running.load() != 0 || pend_li >= 0) {
+            return false;
+        }
+        drain_prefetch(true);
+        wait_pf_pending();
+        for (const auto & p : pools) {
+            for (int64_t s = 0; s < p.n_phys; ++s) {
+                if (p.busy[s] || p.pf[s]) {
+                    return false;
+                }
+            }
+        }
+        for (const auto & l : layers) {
+            if (!l.pf_slots.empty() || !l.pf_pred.empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // fault in (and lock, if the cache is locked) [b, b + n): with THP, huge pages only where free 2 MiB blocks are
+    // available, as at the start, and small pages elsewhere (MADV_NOHUGEPAGE: no synchronous compaction)
+    bool fault_released(uint8_t * b, size_t n) {
+        constexpr size_t  STEP    = 32*THP_SIZE;
+        constexpr int64_t MARGIN  = 256;
+        for (size_t off = 0; off < n; off += STEP) {
+            const size_t len = std::min(STEP, n - off);
+            if (thp) {
+                const bool huge = thp_fault && free_huge_blocks() >= (int64_t) (len/THP_SIZE) + MARGIN;
+                madvise(b + off, len, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+            }
+            if (cache_locked && mlock(b + off, len) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // [b, e) of a bank, rounded inwards (release) or outwards (fault) to pages
+    void page_range(uint8_t * b, uint8_t * e, bool inwards, uint8_t *& pb, size_t & n) const {
+        const size_t lo = inwards ? align_up((size_t) b, page_size) : (size_t) b / page_size * page_size;
+        const size_t hi = inwards ? (size_t) e / page_size * page_size : align_up((size_t) e, page_size);
+        pb = (uint8_t *) lo;
+        n  = hi > lo ? hi - lo : 0;
+    }
+
+    // the slot bookkeeping is consistent: the slots in use and the cached experts map to each other one to one, each
+    // layer counts the experts it has, and the released slots hold none. aborts otherwise: an inconsistency here
+    // would compute experts from the data of others
+    void check_cache(const char * what) const {
+        for (size_t pi = 0; pi < pools.size(); ++pi) {
+            const auto & p = pools[pi];
+            int64_t sum = 0;
+            for (int li : p.layers) {
+                const auto & l = layers[li];
+                int64_t n = 0;
+                for (int64_t e = 0; e < l.n_expert; ++e) {
+                    const int32_t sl = l.slot_of[e];
+                    if (sl < 0) {
+                        continue;
+                    }
+                    if (sl >= p.n_slots || p.slot_layer[sl] != li || p.slot_expert[sl] != e) {
+                        GGML_ABORT("moe_stream: %s: expert %d of layer %d maps to slot %d, which does not hold it", what, (int) e, l.il, sl);
+                    }
+                    n++;
+                }
+                if (n != l.n_cached) {
+                    GGML_ABORT("moe_stream: %s: layer %d has %d cached experts, counts %d", what, l.il, (int) n, (int) l.n_cached);
+                }
+                sum += n;
+            }
+            if (sum != p.n_slots) {
+                GGML_ABORT("moe_stream: %s: pool %d has %d slots in use and %d cached experts", what, (int) pi, (int) p.n_slots, (int) sum);
+            }
+            for (int64_t sl = p.n_slots; sl < p.n_phys; ++sl) {
+                if (p.slot_layer[sl] != -1 || p.slot_expert[sl] != -1 || p.busy[sl] || p.pf[sl]) {
+                    GGML_ABORT("moe_stream: %s: released slot %d of pool %d is in use", what, (int) sl, (int) pi);
+                }
+            }
+        }
+    }
+
+    size_t shrink_cache(size_t bytes) {
+        if (!is_active || bytes == 0 || bank_ranges.empty()) {
+            return 0;
+        }
+        if (pinned) {
+            LLAMA_LOG_WARN("moe_stream: shrink: the cache is pinned (LLAMA_MOE_STREAM_PIN), it cannot release memory\n");
+            return 0;
+        }
+        // the collapse into huge pages works on this memory
+        thp_stop = true;
+        if (thp_thread.joinable()) {
+            thp_thread.join();
+        }
+        if (!cache_quiet()) {
+            LLAMA_LOG_WARN("moe_stream: shrink: the cache is in use, nothing released\n");
+            return 0;
+        }
+
+        size_t total = 0;
+        for (const auto & p : pools) {
+            total += (size_t) p.n_slots*slot_bytes(p);
+        }
+        if (total == 0) {
+            return 0;
+        }
+
+        const double t0 = t_now();
+        size_t freed = 0;
+        for (auto & p : pools) {
+            const size_t sb = slot_bytes(p);
+            if (p.n_slots == 0 || sb == 0) {
+                continue;
+            }
+            // its share of the bytes, no layer below its least slots
+            int64_t room = 0;
+            for (int li : p.layers) {
+                room += std::max<int64_t>(0, layers[li].n_cached - layers[li].n_min);
+            }
+            const int64_t k = std::clamp<int64_t>((int64_t) ((double) bytes*(double) sb*(double) p.n_slots/(double) total/(double) sb), 0, room);
+            if (k == 0) {
+                continue;
+            }
+
+            // the victims: the least valuable experts by the policy (lfu: the least used), each layer keeping its least slots
+            std::vector<int32_t> by_value(p.n_slots);
+            for (int32_t i = 0; i < (int32_t) p.n_slots; ++i) {
+                by_value[i] = i;
+            }
+            auto colder = [&](int32_t a, int32_t b) {
+                const auto & la = layers[p.slot_layer[a]];
+                const auto & lb = layers[p.slot_layer[b]];
+                const int32_t ea = p.slot_expert[a];
+                const int32_t eb = p.slot_expert[b];
+                if (policy == LLAMA_MOE_STREAM_POLICY_LFU && la.score[ea] != lb.score[eb]) {
+                    return la.score[ea] < lb.score[eb];
+                }
+                if (policy == LLAMA_MOE_STREAM_POLICY_SLRU && la.prot[ea] != lb.prot[eb]) {
+                    return la.prot[ea] < lb.prot[eb];
+                }
+                if (la.stamp[ea] != lb.stamp[eb]) {
+                    return la.stamp[ea] < lb.stamp[eb];
+                }
+                return a < b;
+            };
+            std::sort(by_value.begin(), by_value.end(), colder);
+            std::vector<int64_t> left(layers.size(), 0);
+            for (int li : p.layers) {
+                left[li] = layers[li].n_cached - layers[li].n_min;
+            }
+            std::vector<uint8_t> victim(p.n_slots, 0);
+            int64_t n_victims = 0;
+            for (int32_t sl : by_value) {
+                if (n_victims == k) {
+                    break;
+                }
+                const int lo = p.slot_layer[sl];
+                if (left[lo] > 0) {
+                    left[lo]--;
+                    victim[sl] = 1;
+                    n_victims++;
+                }
+            }
+            GGML_ASSERT(n_victims == k);
+
+            const int64_t n_old = p.n_slots;
+            const int64_t n_new = n_old - k;
+
+            // evict the victims
+            for (int32_t sl = 0; sl < (int32_t) n_old; ++sl) {
+                if (!victim[sl]) {
+                    continue;
+                }
+                auto & lv = layers[p.slot_layer[sl]];
+                const int32_t v = p.slot_expert[sl];
+                GGML_ASSERT(lv.slot_of[v] == sl);
+                if (lv.prot[v]) {
+                    lv.prot[v] = 0;
+                    p.prot.erase({ lv.stamp[v], sl });
+                }
+                lv.slot_of[v]    = -1;
+                lv.evicted_at[v] = ++lv.n_evict;
+                lv.n_cached--;
+                lv.dirty = true;
+            }
+
+            // move the kept experts of the tail [n_new, n_old) into the slots of the victims before it
+            std::vector<int32_t> into, from;
+            for (int32_t sl = 0; sl < (int32_t) n_new; ++sl) {
+                if (victim[sl]) {
+                    into.push_back(sl);
+                }
+            }
+            for (int32_t sl = (int32_t) n_new; sl < (int32_t) n_old; ++sl) {
+                if (!victim[sl]) {
+                    from.push_back(sl);
+                }
+            }
+            GGML_ASSERT(into.size() == from.size());
+            const auto & roles = layers[p.layers[0]].tensors;
+            for (size_t i = 0; i < from.size(); ++i) {
+                const int32_t f = from[i];
+                const int32_t d = into[i];
+                const int     lt = p.slot_layer[f];
+                const int32_t et = p.slot_expert[f];
+                auto & lt_ = layers[lt];
+                GGML_ASSERT(lt_.slot_of[et] == f);
+                for (int idx : roles) {
+                    const auto & ti = tensors[idx];
+                    uint8_t * base = p.bank_data[ti.role];
+                    memcpy(base + (size_t) d*ti.expert_size, base + (size_t) f*ti.expert_size, ti.expert_size);
+                }
+                if (lt_.prot[et]) {
+                    p.prot.erase({ lt_.stamp[et], f });
+                    p.prot.emplace(lt_.stamp[et], d);
+                }
+                lt_.slot_of[et]  = d;
+                p.slot_layer [d] = lt;
+                p.slot_expert[d] = et;
+                lt_.dirty = true;
+            }
+            for (int32_t sl = (int32_t) n_new; sl < (int32_t) n_old; ++sl) {
+                p.slot_layer [sl] = -1;
+                p.slot_expert[sl] = -1;
+            }
+            p.n_slots     = n_new;
+            p.order_valid = false;
+            p.order.clear();
+
+            // release the memory of the slots [n_new, n_old) of each bank
+            for (int idx : roles) {
+                const auto & ti = tensors[idx];
+                uint8_t * base = p.bank_data[ti.role];
+                uint8_t * pb;
+                size_t    n;
+                page_range(base + (size_t) n_new*ti.expert_size, base + (size_t) n_old*ti.expert_size, true, pb, n);
+                if (n > 0) {
+                    if (cache_locked) {
+                        munlock(pb, n);
+                    }
+                    madvise(pb, n, MADV_DONTNEED);
+                }
+            }
+            freed += (size_t) k*sb;
+        }
+
+        check_cache("shrink");
+        ram_lent   += freed;
+        state_dirty = true;
+        LLAMA_LOG_INFO("moe_stream: shrink: released %.2f GiB of the expert cache in %.2f s (%.2f GiB released in all)\n",
+                freed/GiB, t_now() - t0, ram_lent/GiB);
+        return freed;
+    }
+
+    size_t grow_cache() {
+        if (!is_active || ram_lent == 0) {
+            return 0;
+        }
+        if (!cache_quiet()) {
+            LLAMA_LOG_WARN("moe_stream: grow: the cache is in use, it stays smaller for now\n");
+            return 0;
+        }
+
+        // as much as the available RAM minus the reserve allows, the same fraction of each pool
+        const size_t avail  = mem_available() + arc_evictable();
+        const size_t budget = avail > ram_reserve ? avail - ram_reserve : 0;
+        const double frac   = std::min(1.0, (double) budget/(double) ram_lent);
+
+        const double t0 = t_now();
+        wait_group wg;
+        size_t grown = 0;
+        for (size_t pi = 0; pi < pools.size(); ++pi) {
+            auto & p = pools[pi];
+            const size_t sb = slot_bytes(p);
+            if (p.n_phys == p.n_slots || sb == 0) {
+                continue;
+            }
+            int64_t g = frac >= 1.0 ? p.n_phys - p.n_slots : (int64_t) ((double) (p.n_phys - p.n_slots)*frac);
+
+            // the most used experts that are not cached
+            std::vector<std::pair<int, int32_t>> cands;
+            for (int li : p.layers) {
+                const auto & l = layers[li];
+                for (int32_t e = 0; e < (int32_t) l.n_expert; ++e) {
+                    if (l.slot_of[e] < 0) {
+                        cands.emplace_back(li, e);
+                    }
+                }
+            }
+            g = std::min<int64_t>(g, (int64_t) cands.size());
+            if (g <= 0) {
+                continue;
+            }
+            std::partial_sort(cands.begin(), cands.begin() + g, cands.end(), [&](const auto & a, const auto & b) {
+                const auto & la = layers[a.first];
+                const auto & lb = layers[b.first];
+                if (la.score[a.second] != lb.score[b.second]) {
+                    return la.score[a.second] > lb.score[b.second];
+                }
+                if (la.rscore[a.second] != lb.rscore[b.second]) {
+                    return la.rscore[a.second] > lb.rscore[b.second];
+                }
+                return la.stamp[a.second] > lb.stamp[b.second];
+            });
+
+            // the memory of the slots [n_slots, n_slots + g) of each bank
+            const auto & roles = layers[p.layers[0]].tensors;
+            bool ok = true;
+            for (int idx : roles) {
+                const auto & ti = tensors[idx];
+                uint8_t * base = p.bank_data[ti.role];
+                uint8_t * pb;
+                size_t    n;
+                page_range(base + (size_t) p.n_slots*ti.expert_size, base + (size_t) (p.n_slots + g)*ti.expert_size, false, pb, n);
+                if (n > 0 && !fault_released(pb, n)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                // the slots stay released: drop what was faulted in again (the pages shared with the last slot in use
+                // are only unlocked when they are inside the released range)
+                for (int idx : roles) {
+                    const auto & ti = tensors[idx];
+                    uint8_t * base = p.bank_data[ti.role];
+                    uint8_t * pb;
+                    size_t    n;
+                    page_range(base + (size_t) p.n_slots*ti.expert_size, base + (size_t) p.n_phys*ti.expert_size, true, pb, n);
+                    if (n > 0) {
+                        munlock(pb, n);
+                        madvise(pb, n, MADV_DONTNEED);
+                    }
+                }
+                LLAMA_LOG_WARN("moe_stream: grow: cannot lock the memory of the cache again (%s), it stays smaller\n", strerror(errno));
+                continue;
+            }
+
+            for (int64_t i = 0; i < g; ++i) {
+                const int32_t sl = (int32_t) (p.n_slots + i);
+                const int     li = cands[i].first;
+                const int32_t e  = cands[i].second;
+                auto & l = layers[li];
+                l.slot_of[e]      = sl;
+                l.prot[e]         = 0;
+                l.n_cached++;
+                l.dirty           = true;
+                p.slot_layer [sl] = li;
+                p.slot_expert[sl] = e;
+                read_experts(l, e, sl, 1, wg);
+            }
+            p.n_slots    += g;
+            p.order_valid = false;
+            p.order.clear();
+            grown += (size_t) g*sb;
+        }
+        if (!wait(wg)) {
+            GGML_ABORT("moe_stream: grow: failed to read the experts into the cache");
+        }
+        check_cache("grow");
+
+        ram_lent   -= std::min(ram_lent, grown);
+        state_dirty = true;
+        LLAMA_LOG_INFO("moe_stream: grow: took back %.2f GiB of the expert cache in %.2f s (%.2f GiB still released)\n",
+                grown/GiB, t_now() - t0, ram_lent/GiB);
+        return grown;
+    }
+
     // the cache: for each role of each pool its slots, ending at a page boundary, followed by its overflow window if any
     bool alloc_cache() {
         struct region {
@@ -1393,6 +1791,7 @@ struct llama_moe_stream::impl {
 
         for (size_t pi = 0; pi < pools.size(); ++pi) {
             auto & p = pools[pi];
+            p.n_phys = p.n_slots;
             const auto & l0 = layers[p.layers[0]];
             // a window per role, each over its own staging buffer
             p.window = memfd >= 0 && l0.streamed() && l0.tensors.size() <= slots.size();
@@ -1407,7 +1806,7 @@ struct llama_moe_stream::impl {
                 r.pool   = (int) pi;
                 r.role   = ti.role;
                 r.t      = idx;
-                r.bank   = p.n_slots*ti.expert_size;
+                r.bank   = p.n_phys*ti.expert_size;
                 r.padded = align_up(r.bank, align);
                 r.window = p.window;
                 if (r.bank == 0 && !r.window) {
@@ -1452,6 +1851,7 @@ struct llama_moe_stream::impl {
         const bool want_pin = env_pin && atoi(env_pin) != 0;
 
         bool lock_failed = false;
+        cache_locked = true;
         size_t n_pinned = 0;
 
         uint8_t * cur = (uint8_t *) arena;
@@ -1462,7 +1862,8 @@ struct llama_moe_stream::impl {
             if (r.padded > 0) {
                 // locking also allocates all the pages now
                 if (!lock_failed && !lock_pages(cur, r.padded)) {
-                    lock_failed = true;
+                    lock_failed  = true;
+                    cache_locked = false;
                     LLAMA_LOG_WARN("moe_stream: failed to lock the expert cache (%s), it may be swapped out\n", strerror(errno));
                     LLAMA_LOG_WARN("moe_stream: raise the limit with 'ulimit -l unlimited' (or LimitMEMLOCK=infinity for a systemd service)\n");
                 }
@@ -1504,7 +1905,7 @@ struct llama_moe_stream::impl {
                 GGML_ASSERT(!r.window || n_window >= layers[li].n_expert - layers[li].n_min);
             }
 
-            ggml_tensor * bank = ggml_new_tensor_3d(bank_ctx, ti.t->type, ti.t->ne[0], ti.t->ne[1], p.n_slots + n_window);
+            ggml_tensor * bank = ggml_new_tensor_3d(bank_ctx, ti.t->type, ti.t->ne[0], ti.t->ne[1], p.n_phys + n_window);
             GGML_ASSERT((size_t) bank->nb[2] == ti.expert_size);
             if (p.layers.size() > 1) {
                 const char * name = ti.t->name;
@@ -2864,7 +3265,7 @@ struct llama_moe_stream::impl {
                     ov_index[e] = (int32_t) j;
                     for (int idx : l.tensors) {
                         const auto & ti = tensors[idx];
-                        uint8_t * dst = ti.bank_data + (p.n_slots + j)*ti.expert_size;
+                        uint8_t * dst = ti.bank_data + (p.n_phys + j)*ti.expert_size;
                         submit_bounce(ti.file, ti.file_offs + e*ti.expert_size, ti.expert_size, dst, wg);
                     }
                 }
@@ -2917,7 +3318,7 @@ struct llama_moe_stream::impl {
                     dst[i1*k + i0] = -1;
                     continue;
                 }
-                const int32_t slot = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) p.n_slots + ov_index[e];
+                const int32_t slot = l.slot_of[e] >= 0 ? l.slot_of[e] : (int32_t) p.n_phys + ov_index[e];
                 const bool    rd   = being_read[e] != 0;
                 pend_all [i1*k + i0] = slot;
                 pend_read[i1*k + i0] = rd;
@@ -4332,6 +4733,23 @@ void llama_moe_stream::quiesce_hot() {
 #ifdef __linux__
     pimpl->drain_prefetch(true);
     pimpl->wait_pf_pending();
+#endif
+}
+
+size_t llama_moe_stream::shrink_cache(size_t bytes) {
+#ifdef __linux__
+    return pimpl->shrink_cache(bytes);
+#else
+    GGML_UNUSED(bytes);
+    return 0;
+#endif
+}
+
+size_t llama_moe_stream::grow_cache() {
+#ifdef __linux__
+    return pimpl->grow_cache();
+#else
+    return 0;
 #endif
 }
 

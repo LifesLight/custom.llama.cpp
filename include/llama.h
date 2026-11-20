@@ -1158,6 +1158,14 @@ extern "C" {
     // It is rebuilt by the next small decode batch. Call before releasing GPU memory (e.g. a CUDA suspend)
     LLAMA_API void llama_moe_hot_release(struct llama_context * ctx);
 
+    // Release about bytes of the RAM expert cache of the MoE stream (its least used experts), e.g. while the GPUs are
+    // suspended for another program. Returns the bytes released. Call between decodes, after llama_moe_hot_release
+    LLAMA_API size_t llama_moe_stream_shrink(struct llama_context * ctx, size_t bytes);
+
+    // Take the released RAM back, as far as the available RAM minus --moe-stream-reserve allows, filled with the most
+    // used experts that are not cached. Returns the bytes taken back. Call between decodes
+    LLAMA_API size_t llama_moe_stream_grow(struct llama_context * ctx);
+
     // The GPU expert tier is enabled (LLAMA_MOE_HOT=1): VRAM freed during decode is used by it
     LLAMA_API bool llama_moe_hot_enabled(const struct llama_context * ctx);
 

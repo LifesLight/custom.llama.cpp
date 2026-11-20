@@ -7352,8 +7352,32 @@ static bool ggml_backend_cuda_suspend_set(bool suspend) {
 }
 #endif
 
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// the backups of the buffers that are mapped (restored, or never suspended) are not read: free them. a suspended
+// buffer keeps its backup, which holds its contents
+static void ggml_backend_cuda_suspend_release() {
+    std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+    for (auto * buffer : cuda_suspend_buffers) {
+        auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
+        auto & state = *ctx->suspend;
+        if (!state.mapped) {
+            continue;
+        }
+        if (state.pinned) {
+            ggml_cuda_set_device(ctx->device);
+            CUDA_CHECK(cudaFreeHost(state.pinned));
+            state.pinned = nullptr;
+        }
+        state.pageable.reset();
+    }
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_suspend_release") == 0) {
+        return (void *)ggml_backend_cuda_suspend_release;
+    }
     if (strcmp(name, "ggml_backend_cuda_suspend_configure") == 0) {
         return (void *)ggml_backend_cuda_suspend_configure;
     }

@@ -707,6 +707,7 @@ struct common_params {
     std::string suspend_devices = "CUDA0";
     std::string resume_hook;
     int resume_hook_timeout = 120;
+    size_t suspend_free_ram = 0; // bytes of the MoE stream's RAM expert cache released while suspended, 0 = none
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
     std::vector<std::string> api_keys;

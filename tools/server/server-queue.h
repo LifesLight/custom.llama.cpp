@@ -46,6 +46,8 @@ private:
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
+    std::function<bool(void)>                 callback_idle;
+    int64_t                                   idle_after_ms = -1;
 
 public:
     ~server_queue() { worker_stop(); }
@@ -139,6 +141,14 @@ public:
     // note: caller will hold mutex_tasks while calling the callbacks
     void on_sleeping_state(std::function<void(bool)> callback) {
         callback_sleeping_state.push_back(std::move(callback));
+    }
+
+    // Register a function called once per idle period: after after_ms without a task and with no task in flight, on
+    // the loop thread (so never during update_slots), without mutex_tasks held. It returns false to be called again
+    // (about every second) in the same idle period. A new task starts a new idle period
+    void on_idle(std::function<bool(void)> callback, int64_t after_ms) {
+        callback_idle = std::move(callback);
+        idle_after_ms = after_ms;
     }
 
 private:
