@@ -22,8 +22,8 @@ static constexpr double HOT_MIN_GAIN = 2.0;
 static constexpr double MiB = 1024.0*1024.0;
 
 struct llama_moe_hot::impl {
-    // the slots of one weight layout on one device: a bank per weight tensor of the layout, [ne0, ne1, n_slots + 2],
-    // the slots, then a zero expert that the routes of the other experts read, then a padding expert
+    // the slots of one weight layout on one device: a bank per weight tensor of the layout, [ne0, ne1, n_slots + 1],
+    // the slots, then a trailing padding expert
     struct group {
         std::vector<const ggml_tensor *> refs; // the tensors of the first layer with the layout, per bank
         std::vector<ggml_tensor *>       banks;
@@ -37,7 +37,8 @@ struct llama_moe_hot::impl {
     };
 
     struct device {
-        ggml_backend_t backend = nullptr;
+        ggml_backend_t     backend = nullptr;
+        ggml_backend_dev_t dev     = nullptr;
         size_t budget  = 0;
         size_t used    = 0; // planned, then allocated bytes
         size_t payload = 0; // bytes of the expert slots
@@ -59,6 +60,7 @@ struct llama_moe_hot::impl {
         std::vector<const ggml_tensor *> refs; // the streamed expert tensors, sorted by name
         std::string key;                       // their layout, empty if the layer cannot be in the tier
         size_t      bytes = 0;                 // of an expert, all its tensors
+        int         home_dev = -1;             // index in devices of model.dev_layer(il), -1 if none
 
         std::vector<int32_t> owner;    // [n_expert] device, -1 if not in the tier
         std::vector<int32_t> slot;     // [n_expert] slot in the group of its device
@@ -115,7 +117,7 @@ struct llama_moe_hot::impl {
         size_t res = 0;
         for (const ggml_tensor * ref : refs) {
             ggml_tensor t = *ref;
-            t.ne[2] = n_slots + 2;
+            t.ne[2] = n_slots + 1;
             t.nb[3] = t.nb[2]*t.ne[2];
             res += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, &t), alignment);
         }
@@ -139,6 +141,7 @@ struct llama_moe_hot::impl {
 
             device d;
             d.backend = backend;
+            d.dev     = dev;
             d.budget  = free > params.headroom ? free - params.headroom : 0;
             LLAMA_LOG_INFO("moe_hot: %s: %.0f MiB free, %.0f MiB headroom, budget %.0f MiB\n",
                     ggml_backend_name(backend), free/MiB, params.headroom/MiB, d.budget/MiB);
@@ -157,6 +160,13 @@ struct llama_moe_hot::impl {
             for (const ggml_tensor * t : l.refs) {
                 uniform = uniform && t->ne[2] == n_expert;
                 l.bytes += t->nb[2];
+            }
+            ggml_backend_dev_t ldev = model.dev_layer((int) il);
+            for (size_t id = 0; id < n_dev; ++id) {
+                if (devices[id].dev == ldev) {
+                    l.home_dev = (int) id;
+                    break;
+                }
             }
             l.key = uniform && n_expert > 0 ? layout(l.refs) : std::string();
             l.owner   .assign(n_expert, -1);
@@ -209,19 +219,38 @@ struct llama_moe_hot::impl {
         std::vector<placement> plan;
         for (const auto & sd : seeds) {
             auto & l = layers[sd.il];
-
-            int    best      = -1;
-            size_t best_cost = 0;
-            size_t best_left = 0;
-            for (size_t id = 0; id < n_dev; ++id) {
+            auto fits = [&](int id, size_t & cost_out) -> bool {
                 const auto & d = devices[id];
                 const auto it = d.groups.find(l.key);
                 const int32_t n = it == d.groups.end() ? 0 : it->second.n_slots;
                 const size_t cost = group_size(d, l.refs, n + 1) - group_size(d, l.refs, n);
-                if (d.used + cost <= d.budget && (best < 0 || d.budget - d.used - cost > best_left)) {
-                    best      = (int) id;
-                    best_cost = cost;
-                    best_left = d.budget - d.used - cost;
+                if (d.used + cost <= d.budget) {
+                    cost_out = cost;
+                    return true;
+                }
+                return false;
+            };
+
+            // place on the layer's home GPU first so secondary GPUs (e.g. PCIe 3.0 x4) stay local to their own layers
+            int    best      = -1;
+            size_t best_cost = 0;
+            if (l.home_dev >= 0 && fits(l.home_dev, best_cost)) {
+                best = l.home_dev;
+            } else {
+                size_t best_left = 0;
+                for (size_t id = 0; id < n_dev; ++id) {
+                    if ((int) id == l.home_dev) {
+                        continue;
+                    }
+                    size_t cost = 0;
+                    if (fits((int) id, cost)) {
+                        const size_t left = devices[id].budget - devices[id].used - cost;
+                        if (best < 0 || left > best_left) {
+                            best      = (int) id;
+                            best_cost = cost;
+                            best_left = left;
+                        }
+                    }
                 }
             }
             if (best < 0) {
@@ -254,7 +283,7 @@ struct llama_moe_hot::impl {
             for (auto & [key, g] : d.groups) {
                 g.owner.assign(g.n_slots, { -1, -1 });
                 for (const ggml_tensor * ref : g.refs) {
-                    ggml_tensor * t = ggml_new_tensor_3d(d.ctx.get(), ref->type, ref->ne[0], ref->ne[1], g.n_slots + 2);
+                    ggml_tensor * t = ggml_new_tensor_3d(d.ctx.get(), ref->type, ref->ne[0], ref->ne[1], g.n_slots + 1);
                     if (t->nb[1] != ref->nb[1] || t->nb[2] != ref->nb[2]) {
                         throw std::runtime_error("moe_hot: nonstandard expert layout");
                     }
@@ -330,7 +359,7 @@ struct llama_moe_hot::impl {
             for (const auto & [key, g] : d.groups) {
                 n_slots += g.n_slots;
             }
-            LLAMA_LOG_INFO("moe_hot: %s: %d experts in %zu layouts, %.0f MiB (%.0f MiB zero/padding)\n",
+            LLAMA_LOG_INFO("moe_hot: %s: %d experts in %zu layouts, %.0f MiB (%.0f MiB padding)\n",
                     ggml_backend_name(d.backend), n_slots, d.groups.size(), d.used/MiB, (d.used - d.payload)/MiB);
         }
         LLAMA_LOG_INFO("moe_hot: %zu experts filled in %.0f ms (%.0f MiB read from the model file)\n",
@@ -346,8 +375,6 @@ struct llama_moe_hot::impl {
         const auto & c = *static_cast<const op_ctx *>(user_data);
         auto & d = c.self->devices[c.device];
         const auto & l = c.self->layers[c.il];
-        const group * g = l.group_of[c.device];
-        const int32_t zero = g ? g->n_slots : 0;
 
         const ggml_tensor * selected = dst->src[0];
         int32_t * out = static_cast<int32_t *>(dst->data);
@@ -356,7 +383,7 @@ struct llama_moe_hot::impl {
                 const int32_t e = *(const int32_t *) ((const char *) selected->data + i0*selected->nb[0] + i1*selected->nb[1]);
                 GGML_ASSERT(e >= 0 && e < (int32_t) l.owner.size());
                 const bool hit = l.owner[e] == c.device;
-                out[i1*selected->ne[0] + i0] = hit ? l.slot[e] : zero;
+                out[i1*selected->ne[0] + i0] = hit ? l.slot[e] : -1;
                 d.hits += hit;
             }
         }
@@ -528,16 +555,34 @@ struct llama_moe_hot::impl {
             }
             int    best      = -1;
             double best_heat = std::min(c.heat/HOT_MARGIN, c.heat - HOT_MIN_GAIN); // the most a victim can have
-            for (size_t id = 0; id < devices.size(); ++id) {
+            auto consider = [&](size_t id) {
                 const group * g = l.group_of[id];
                 if (g == nullptr || g->next >= g->victims.size()) {
-                    continue;
+                    return;
                 }
                 const auto & [heat, s] = g->victims[g->next];
                 const size_t cost = g->owner[s].first < 0 ? l.bytes : 2*l.bytes;
                 if (heat < best_heat && spent + cost <= update_bytes) {
                     best      = (int) id;
                     best_heat = heat;
+                }
+            };
+
+            // prefer the layer's home GPU; only spill onto another GPU if the home GPU has no eligible victim,
+            // and never open a new remote branch on a smaller-budget GPU (avoids spraying CUDA0 layers onto CUDA1)
+            if (l.home_dev >= 0) {
+                consider((size_t) l.home_dev);
+            }
+            if (best < 0) {
+                for (size_t id = 0; id < devices.size(); ++id) {
+                    if ((int) id == l.home_dev) {
+                        continue;
+                    }
+                    if (l.home_dev >= 0 && l.n_owned[id] == 0 && l.group_of[l.home_dev] != nullptr &&
+                            devices[id].budget < devices[l.home_dev].budget) {
+                        continue;
+                    }
+                    consider(id);
                 }
             }
             if (best < 0) {
@@ -608,6 +653,14 @@ int llama_moe_hot::n_devices() const {
 
 ggml_backend_t llama_moe_hot::backend(int device) const {
     return pimpl->devices.at(device).backend;
+}
+
+ggml_backend_t llama_moe_hot::home_backend(int il) const {
+    if (il < 0 || il >= (int) pimpl->layers.size()) {
+        return nullptr;
+    }
+    const int id = pimpl->layers[il].home_dev;
+    return id >= 0 && id < (int) pimpl->devices.size() ? pimpl->devices[id].backend : nullptr;
 }
 
 bool llama_moe_hot::has_layer(int il, int device) const {

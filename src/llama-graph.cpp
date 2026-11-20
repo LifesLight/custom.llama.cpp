@@ -2944,34 +2944,66 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the CPU part, for the profile mark below
     ggml_tensor * experts_cpu = experts;
 
-    if (hot) {
-        // one routed row per logical token on the GPUs, [n_embd, 1, n_expert_used*n_tokens], so that the routes of
-        // the experts a device does not hold all read its single zero expert
-        const int64_t n_sel = selected_experts->ne[0];
-        ggml_tensor * flat_selected = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts), 1, n_sel*n_tokens);
-        ggml_backend_sched_set_tensor_backend(sched, flat_selected->view_src, backend_cpu);
-        ggml_build_forward_expand(gf, flat_selected);
+    // reduce (weight + sum over experts) locally on each backend before merging on the layer's home GPU:
+    // shrinks cross-device PCIe transfers by n_expert_used and eliminates CUDA0 <-> CUDA1 round-trips
+    const bool hot_reduce = hot && down_exps_b == nullptr && post_exp_norm == nullptr;
+    ggml_tensor * hot_moe_out = nullptr;
 
-        for (int device = 0; device < moe_hot->n_devices(); ++device) {
+    if (hot) {
+        auto reduce_experts = [&](ggml_tensor * t, ggml_backend_t b) -> ggml_tensor * {
+            if (!weight_before_ffn) {
+                t = ggml_mul(ctx0, t, weights);
+                ggml_backend_sched_set_tensor_backend(sched, t, b);
+            }
+            const int64_t n_out = t->ne[0];
+            // the per-layer count bounds the sum, as in the path below (ref: https://github.com/ggml-org/llama.cpp/pull/14753)
+            const int64_t n_exp = std::min<int64_t>(t->ne[1], hparams.n_expert_used(il));
+            ggml_tensor * out = ggml_view_2d(ctx0, t, n_out, n_tokens, t->nb[2], 0);
+            for (int64_t i = 1; i < n_exp; ++i) {
+                ggml_tensor * slice = ggml_view_2d(ctx0, t, n_out, n_tokens, t->nb[2], i*t->nb[1]);
+                out = ggml_add(ctx0, out, slice);
+                ggml_backend_sched_set_tensor_backend(sched, out, b);
+            }
+            return out;
+        };
+
+        // the weights are expanded with the router above; expand the pre-weighted input before the per-device
+        // branches as well, so that the backend-pinning loop below does not pull it onto a remote device
+        if (weight_before_ffn) {
+            ggml_build_forward_expand(gf, cur);
+        }
+
+        // build all devices' hot_ids on the CPU up front so they share one CPU split with ensure_op/prefetch_op;
+        // routes for experts not held by a device are mapped to -1 and skipped directly in mul_mat_id (zero output)
+        const int n_dev = moe_hot->n_devices();
+        std::vector<ggml_tensor *> hot_ids_dev(n_dev, nullptr);
+        for (int device = 0; device < n_dev; ++device) {
             if (!moe_hot->has_layer(il, device)) {
                 continue;
             }
-            ggml_backend_t backend = moe_hot->backend(device);
-
-            ggml_tensor * hot_ids = moe_hot->build_ids(ctx0, flat_selected, il, device);
+            ggml_tensor * hot_ids = moe_hot->build_ids(ctx0, selected_experts, il, device);
             ggml_backend_sched_set_tensor_backend(sched, hot_ids, backend_cpu);
             ggml_build_forward_expand(gf, hot_ids);
+            hot_ids_dev[device] = hot_ids;
+        }
 
-            // per device, so that each branch only copies cur
-            ggml_tensor * input = cur;
-            if (input->ne[1] == 1 && n_sel > 1) {
-                input = ggml_repeat_4d(ctx0, input, n_embd, n_sel, n_tokens, 1);
+        // launch every active GPU branch (and its local reduction) before the CPU part so they overlap with it
+        ggml_backend_t merge_backend = moe_hot->home_backend(il);
+        std::vector<ggml_tensor *> hot_parts(n_dev, nullptr);
+        for (int device = 0; device < n_dev; ++device) {
+            if (hot_ids_dev[device] == nullptr) {
+                continue;
             }
-            input = ggml_reshape_3d(ctx0, ggml_cont(ctx0, input), n_embd, 1, n_sel*n_tokens);
-            ggml_tensor * part = build_experts(input, flat_selected, hot_ids, true, device);
-            part = ggml_reshape_3d(ctx0, part, part->ne[0], n_sel, n_tokens);
+            ggml_backend_t backend = moe_hot->backend(device);
+            if (merge_backend == nullptr) {
+                merge_backend = backend;
+            }
 
-            // the branches are added before the CPU part, so that the scheduler starts them first
+            ggml_tensor * part = build_experts(cur, selected_experts, hot_ids_dev[device], true, device);
+            if (hot_reduce) {
+                part = reduce_experts(part, backend);
+            }
+
             const int i_begin = ggml_graph_n_nodes(gf);
             ggml_build_forward_expand(gf, part);
             for (int i = i_begin; i < ggml_graph_n_nodes(gf); ++i) {
@@ -2985,70 +3017,112 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
                 ggml_backend_sched_set_tensor_backend(sched, node, backend);
             }
-            experts = ggml_add(ctx0, experts, part);
-            ggml_backend_sched_set_tensor_backend(sched, experts, backend);
+            hot_parts[device] = part;
         }
-    }
 
-    // the end of the expert matmuls of a layer computed on the CPU from the MoE stream cache, for its profile
-    // (of the CPU part: the merge with the GPU tier is on a GPU, a mark after it would synchronize every layer)
-    if (slots != nullptr && moe_cache == nullptr && moe_stream != nullptr) {
+        // expand the CPU part (and its profile mark) after the GPU branches were queued, then reduce on CPU
+        if (slots != nullptr && moe_cache == nullptr && moe_stream != nullptr) {
+            if (ggml_tensor * mark = moe_stream->build_profile_mark(ctx0, experts_cpu, il)) {
+                ggml_backend_sched_set_tensor_backend(sched, mark, backend_cpu);
+                ggml_build_forward_expand(gf, mark);
+            }
+        }
+
+        ggml_tensor * cpu_part = hot_reduce ? reduce_experts(experts_cpu, backend_cpu) : experts_cpu;
+        if (hot_reduce) {
+            ggml_build_forward_expand(gf, cpu_part);
+        }
+
+        // merge directly on merge_backend (the layer's home GPU): local GPU part first (0 copies), then any remote, then CPU
+        ggml_tensor * merged = nullptr;
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int device = 0; device < n_dev; ++device) {
+                if (hot_parts[device] == nullptr) {
+                    continue;
+                }
+                const bool is_home = moe_hot->backend(device) == merge_backend;
+                if ((pass == 0) != is_home) {
+                    continue;
+                }
+                if (merged == nullptr) {
+                    merged = hot_parts[device];
+                } else {
+                    merged = ggml_add(ctx0, merged, hot_parts[device]);
+                    ggml_backend_sched_set_tensor_backend(sched, merged, merge_backend);
+                }
+            }
+        }
+        merged = ggml_add(ctx0, merged, cpu_part);
+        ggml_backend_sched_set_tensor_backend(sched, merged, merge_backend);
+
+        if (hot_reduce) {
+            ggml_build_forward_expand(gf, merged);
+            hot_moe_out = merged;
+        } else {
+            experts = merged;
+        }
+    } else if (slots != nullptr && moe_cache == nullptr && moe_stream != nullptr) {
+        // the end of the expert matmuls of a layer computed on the CPU from the MoE stream cache, for its profile
+        // (of the CPU part: the merge with the GPU tier is on a GPU, a mark after it would synchronize every layer)
         if (ggml_tensor * mark = moe_stream->build_profile_mark(ctx0, experts_cpu, il)) {
             ggml_backend_sched_set_tensor_backend(sched, mark, backend_cpu);
             ggml_build_forward_expand(gf, mark);
         }
     }
 
-    if (down_exps_s) {
-        cb(experts, "ffn_moe_down_scaled", il);
-    }
+    ggml_tensor * moe_out = hot_moe_out;
+    if (moe_out == nullptr) {
+        if (down_exps_s) {
+            cb(experts, "ffn_moe_down_scaled", il);
+        }
 
-    if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
-        cb(experts, "ffn_moe_down_biased", il);
-    }
+        if (down_exps_b) {
+            experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+            cb(experts, "ffn_moe_down_biased", il);
+        }
 
-    // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
-    if (post_exp_norm) {
-        experts = ggml_mul(ctx0, experts, post_exp_norm);
-        experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
-        cb(experts, "ffn_moe_post_exp_norm", il);
-    }
+        // an expert output can be scaled by a norm weight, then normalized, before the router weights apply
+        if (post_exp_norm) {
+            experts = ggml_mul(ctx0, experts, post_exp_norm);
+            experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
+            cb(experts, "ffn_moe_post_exp_norm", il);
+        }
 
-    if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
-    }
+        if (!weight_before_ffn) {
+            experts = ggml_mul(ctx0, experts, weights);
+            cb(experts, "ffn_moe_weighted", il);
+        }
 
-    ggml_build_forward_expand(gf, experts);
+        ggml_build_forward_expand(gf, experts);
 
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+        ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
-    assert(n_expert_used > 0);
+        assert(n_expert_used > 0);
 
-    // order the views before the adds
-    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
-    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
-    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
-    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        // order the views before the adds
+        // Use per-layer n_expert_used to bound the graph even during warmup (avoids
+        // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
+        // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
+        const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
 
-    // aggregate experts
-    ggml_tensor * moe_out = cur_experts[0];
+        // aggregate experts
+        moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
-        ggml_build_forward_expand(gf, moe_out);
-    }
+            ggml_build_forward_expand(gf, moe_out);
+        }
 
-    if (n_expert_used_il == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
+        if (n_expert_used_il == 1) {
+            // avoid returning a non-contiguous tensor
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
     }
 
     cb(moe_out, "ffn_moe_out", il);

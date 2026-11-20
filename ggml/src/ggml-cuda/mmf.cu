@@ -70,6 +70,10 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         nchannels_y      = ids->ne[0];
     }
 
+    if (ids) {
+        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), ctx.stream()));
+    }
+
     if (ids && ncols_dst > 16) {
         const int64_t n_expert_used = ids->ne[0];
         const int64_t n_experts     = ne02;
@@ -80,6 +84,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         ids_src_compact_dev.alloc(ctx.pool(), ne_get_rows);
         ids_dst_compact_dev.alloc(ctx.pool(), ne_get_rows);
         tile_spec_dev.alloc(ctx.pool(), max_tiles);
+        CUDA_CHECK(cudaMemsetAsync(tile_spec_dev.get(), 0, max_tiles * sizeof(ggml_cuda_mm_id_tile_spec), ctx.stream()));
 
         const int si1  = static_cast<int>(ids_s1);
         const int sis1 = static_cast<int>(src1->nb[2] / src1->nb[1]);

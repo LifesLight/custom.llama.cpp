@@ -325,6 +325,11 @@ void ggml_cuda_mul_mat_q(
     const int ntj = (ne_get_rows + J_best - 1) / J_best + ne02;
     ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), ntj);
 
+    // negative ids are skipped (zero output row): initialize maps/tiles and zero dst so skipped slots stay clean
+    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(),  0xFF, ne_get_rows * sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(tile_spec.get(), 0,    ntj * sizeof(ggml_cuda_mm_id_tile_spec), stream));
+    CUDA_CHECK(cudaMemsetAsync(dst_d,           0,    ggml_nbytes(dst), stream));
+
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;

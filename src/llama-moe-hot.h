@@ -30,6 +30,8 @@ public:
     bool empty() const;
     int  n_devices() const;
     ggml_backend_t backend(int device) const;
+    // the GPU backend that owns layer il, nullptr if the layer is not on a GPU in the tier
+    ggml_backend_t home_backend(int il) const;
 
     // the layer has experts in the tier, on the device or on any device (-1)
     bool has_layer(int il, int device = -1) const;
@@ -39,8 +41,7 @@ public:
     // the bank of the device with the layout of the expert tensor w, nullptr if none
     ggml_tensor * bank(const ggml_tensor * w, int device) const;
 
-    // the bank slots on the device of the selected experts [1, n]: the slot of the experts it holds, the zero
-    // expert for the others
+    // the bank slots on the device of the selected experts [k, n]: the slot of the experts it holds, -1 for the others
     ggml_tensor * build_ids(ggml_context * ctx, ggml_tensor * selected, int il, int device) const;
 
     // routing observations from the CPU path of the stream

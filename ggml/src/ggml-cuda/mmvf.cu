@@ -48,6 +48,18 @@ static __global__ void mul_mat_vec_f(
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
 
+    if (ids && channel_x < 0) {
+        ggml_cuda_pdl_lc();
+        dst += int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
+        if constexpr (is_multi_token_id) {
+            dst += token_idx*stride_col_dst;
+        }
+        if (tid < ncols_dst) {
+            dst[tid*stride_col_dst + row] = 0.0f;
+        }
+        return;
+    }
+
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
     const int sample_y    = sample_dst;
 
