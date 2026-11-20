@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -35,6 +36,12 @@ namespace {
 
 // O_DIRECT needs the file offset, the length and the buffer aligned to the logical block size of the device
 constexpr size_t STREAM_ALIGN = 4096;
+// the size of a transparent huge page (x86-64, arm64 with 4 KiB pages)
+constexpr size_t THP_SIZE = 2ull*1024*1024;
+
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
 
 // size of one read request into a staging buffer, large enough to be efficient, small enough to be spread over the IO threads
 constexpr size_t STREAM_CHUNK = 4ull*1024*1024;
@@ -334,6 +341,17 @@ struct llama_moe_stream::impl {
     ggml_backend_buffer_t bank_buf = nullptr;
     ggml_context * bank_ctx   = nullptr;
     std::vector<std::pair<void *, size_t>> bank_ranges; // the parts of the arena that are cache slots
+
+    // transparent huge pages for the cache slots (LLAMA_MOE_STREAM_THP=1): the arena and its regions are aligned to
+    // 2 MiB, and after the fill a background thread collapses the slots into huge pages (MADV_COLLAPSE, Linux 6.1+)
+    // while no graph is computed. the pages are faulted in as small pages first, so that the startup never waits for
+    // the compaction that huge page faults may need (MADV_HUGEPAGE with the default defrag setting)
+    bool                 thp = false;
+    std::thread          thp_thread;
+    std::atomic<bool>    thp_stop { false };
+    std::atomic<int>     graphs_running { 0 };
+    std::atomic<int64_t> graph_end_us { 0 };
+    bool                 thp_fault = true; // advise the next chunks of the cache for huge pages at the fault
     bool           pinned     = false;
 
     // staging buffers
@@ -547,6 +565,13 @@ struct llama_moe_stream::impl {
         if (const char * env = getenv("LLAMA_MOE_STREAM_PROFILE")) {
             prof = atoi(env) != 0;
         }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_THP")) {
+            thp = atoi(env) != 0;
+        }
+        if (thp && page_size != 4096) {
+            LLAMA_LOG_WARN("moe_stream: THP: needs 4 KiB pages (page size %zu), disabled\n", page_size);
+            thp = false;
+        }
         if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH")) {
             pf_k = std::max(0, atoi(env));
         }
@@ -625,6 +650,20 @@ struct llama_moe_stream::impl {
         check_offload();
 
         is_active = true;
+
+        size_t bank_bytes = 0;
+        for (const auto & r : bank_ranges) {
+            bank_bytes += r.second;
+        }
+        // with all of the slots in huge pages (up to the unaligned ends), there is nothing to collapse
+        if (thp && !bank_ranges.empty() && arena_huge_bytes() + bank_ranges.size()*2*THP_SIZE < bank_bytes) {
+            if (pinned) {
+                LLAMA_LOG_WARN("moe_stream: THP: the cache is pinned (LLAMA_MOE_STREAM_PIN), pinned pages cannot be collapsed, disabled\n");
+            } else {
+                LLAMA_LOG_INFO("moe_stream: THP: collapsing the cache into huge pages in the background while idle\n");
+                thp_thread = std::thread([this] { thp_collapse(); });
+            }
+        }
 #endif
     }
 
@@ -647,6 +686,10 @@ struct llama_moe_stream::impl {
         cv_jobs.notify_all();
         for (auto & w : workers) {
             w.join();
+        }
+        thp_stop = true;
+        if (thp_thread.joinable()) {
+            thp_thread.join();
         }
 
 #ifdef __linux__
@@ -1130,6 +1173,204 @@ struct llama_moe_stream::impl {
         return true;
     }
 
+    // free 2 MiB blocks of the buddy allocator, in all zones (/proc/buddyinfo), -1 if unknown
+    int64_t free_huge_blocks() const {
+        int hp_order = 0;
+        while ((page_size << hp_order) < THP_SIZE) {
+            hp_order++;
+        }
+        std::ifstream f("/proc/buddyinfo");
+        std::string line;
+        int64_t n = 0;
+        bool  any = false;
+        while (std::getline(f, line)) {
+            std::istringstream ss(line);
+            std::string node, node_id, zone, zone_name;
+            if (!(ss >> node >> node_id >> zone >> zone_name)) {
+                continue;
+            }
+            int64_t cnt = 0;
+            for (int order = 0; ss >> cnt; ++order) {
+                if (order >= hp_order) {
+                    n += cnt << (order - hp_order);
+                }
+                any = true;
+            }
+        }
+        return any ? n : -1;
+    }
+
+    // the bytes of the cache that the kernel maps with huge pages (/proc/self/smaps)
+    size_t arena_huge_bytes() const {
+        size_t huge = 0;
+        std::ifstream f("/proc/self/smaps");
+        std::string line;
+        bool in = false;
+        const uintptr_t a0 = (uintptr_t) arena;
+        const uintptr_t a1 = a0 + arena_size;
+        while (std::getline(f, line)) {
+            unsigned long b = 0, e = 0;
+            if (!line.empty() && line[0] != ' ' && sscanf(line.c_str(), "%lx-%lx", &b, &e) == 2 && line.find('-') < line.find(' ')) {
+                in = b >= a0 && e <= a1;
+            } else if (in && line.compare(0, 14, "AnonHugePages:") == 0) {
+                huge += (size_t) strtoull(line.c_str() + 14, nullptr, 10) * 1024;
+            }
+        }
+        return huge;
+    }
+
+    // fault in and lock the cache slots [p, p + n). with LLAMA_MOE_STREAM_THP, each 64 MiB is advised for huge pages
+    // before its fault if the buddy allocator has free 2 MiB blocks for it: the faults then take free blocks, without
+    // compaction and without a copy. the other chunks stay in small pages (collapsed later, if blocks free up), so
+    // that the faults never wait for the compaction of fragmented memory (MADV_HUGEPAGE with the default defrag
+    // setting compacts synchronously), and a chunk whose faults took long stops the advice for the rest
+    bool lock_pages(uint8_t * p, size_t n) {
+        if (!thp) {
+            return mlock(p, n) == 0;
+        }
+        constexpr size_t  STEP    = 32*THP_SIZE;
+        constexpr int64_t MARGIN  = 256;    // free blocks left to the others (512 MiB)
+        constexpr int64_t SLOW_US = 200000; // a chunk that took longer had to compact
+        for (size_t off = 0; off < n; off += STEP) {
+            const size_t len = std::min(STEP, n - off);
+            bool huge = thp_fault && len % THP_SIZE == 0 && ((uintptr_t) (p + off)) % THP_SIZE == 0;
+            if (huge) {
+                huge = free_huge_blocks() >= (int64_t) (len/THP_SIZE) + MARGIN;
+            }
+            if (huge && madvise(p + off, len, MADV_HUGEPAGE) != 0) {
+                huge = false;
+            }
+            const int64_t t = ggml_time_us();
+            if (mlock(p + off, len) != 0) {
+                return false;
+            }
+            if (huge && ggml_time_us() - t > SLOW_US) {
+                thp_fault = false;
+            }
+        }
+        return true;
+    }
+
+    // the collapse of the cache slots into huge pages (LLAMA_MOE_STREAM_THP), on its own thread: a few huge pages per
+    // call, only while no graph has been computed for a second, so that the copies and the compaction they may need
+    // neither delay the startup nor take memory bandwidth from a batch. the kernel keeps the contents.
+    // MADV_COLLAPSE fails a range for many transient or local reasons (pages being read or migrated: EAGAIN, but also
+    // EINVAL for a part it cannot collapse), and it still collapses the rest of the range: such chunks are retried in
+    // later passes. only a probe on a private test mapping decides whether the kernel supports it at all
+    void thp_collapse() {
+        constexpr size_t  CHUNK   = 8*THP_SIZE;
+        constexpr int64_t IDLE_US = 1000000;
+        constexpr int     PASSES  = 4;
+
+        auto thp_setting = [](const char * name) {
+            std::ifstream f(std::string("/sys/kernel/mm/transparent_hugepage/") + name);
+            std::string s;
+            std::getline(f, s);
+            return s.empty() ? std::string("?") : s;
+        };
+
+        // probe: one touched, aligned huge page of our own
+        {
+            void * p = mmap(nullptr, 2*THP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) {
+                return;
+            }
+            uint8_t * a = (uint8_t *) align_up((size_t) p, THP_SIZE);
+            memset(a, 1, THP_SIZE);
+            const int rc  = madvise(a, THP_SIZE, MADV_COLLAPSE);
+            const int err = errno;
+            munmap(p, 2*THP_SIZE);
+            if (rc != 0 && err != EAGAIN && err != ENOMEM && err != EBUSY) {
+                LLAMA_LOG_WARN("moe_stream: THP: MADV_COLLAPSE does not work here (%s; enabled: %s), the cache stays in small pages\n",
+                        strerror(err), thp_setting("enabled").c_str());
+                return;
+            }
+        }
+
+        const double t0 = t_now();
+        double t_work   = 0.0;
+
+        auto idle = [&]() {
+            while (!thp_stop) {
+                if (graphs_running.load() == 0 && ggml_time_us() - graph_end_us.load() >= IDLE_US) {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            return false;
+        };
+
+        std::vector<std::pair<size_t, size_t>> todo; // aligned [begin, end)
+        size_t total = 0;
+        for (const auto & r : bank_ranges) {
+            const size_t b = align_up((size_t) r.first, THP_SIZE);
+            const size_t e = ((size_t) r.first + r.second) / THP_SIZE * THP_SIZE;
+            for (size_t c = b; c < e; c += CHUNK) {
+                todo.emplace_back(c, std::min(c + CHUNK, e));
+                total += std::min(c + CHUNK, e) - c;
+            }
+        }
+
+        // ENOMEM: no free 2 MiB block, even after compaction. with nearly all of the RAM locked, freeing the small
+        // pages of a collapsed range rarely makes a new block, so a run of them ends the pass, and a pass that
+        // collapses nothing ends the work, instead of compacting in vain for minutes
+        constexpr int MAX_NOMEM_RUN = 32;
+
+        std::map<int, int64_t> n_err; // errno -> chunks that failed in the last pass
+        bool out_of_blocks = false;
+        for (int pass = 0; pass < PASSES && !todo.empty() && !out_of_blocks; ++pass) {
+            std::vector<std::pair<size_t, size_t>> again;
+            n_err.clear();
+            int    nomem_run = 0;
+            size_t n_ok      = 0;
+            for (size_t i = 0; i < todo.size(); ++i) {
+                const auto & c = todo[i];
+                if (nomem_run >= MAX_NOMEM_RUN) {
+                    again.insert(again.end(), todo.begin() + i, todo.end());
+                    n_err[ENOMEM] += (int64_t) (todo.size() - i);
+                    break;
+                }
+                if (!idle()) {
+                    return;
+                }
+                const double t  = t_now();
+                const int    rc = madvise((void *) c.first, c.second - c.first, MADV_COLLAPSE);
+                const int    err = errno;
+                t_work += t_now() - t;
+                if (rc != 0) {
+                    again.push_back(c);
+                    n_err[err]++;
+                    nomem_run = err == ENOMEM ? nomem_run + 1 : 0;
+                } else {
+                    n_ok++;
+                    nomem_run = 0;
+                }
+            }
+            out_of_blocks = n_ok == 0 && n_err.count(ENOMEM) > 0;
+            todo.swap(again);
+            if (!todo.empty() && pass + 1 < PASSES && !out_of_blocks) {
+                // give the compaction and the reads in flight time before the next pass
+                for (int i = 0; i < 50 && !thp_stop; ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+        }
+
+        const size_t huge = arena_huge_bytes();
+
+        std::string fails;
+        for (const auto & [err, n] : n_err) {
+            fails += (fails.empty() ? "" : ", ") + std::to_string(n) + " x " + strerror(err);
+        }
+        LLAMA_LOG_INFO("moe_stream: THP: %.2f of %.2f GiB of the cache in huge pages after %.1f s of work (%.1f s since the start)%s%s%s\n",
+                huge/GiB, total/GiB, t_work, t_now() - t0,
+                fails.empty() ? "" : "; chunks still failing: ", fails.c_str(), fails.empty() ? "" : (" (defrag: " + thp_setting("defrag") + ")").c_str());
+        if (out_of_blocks) {
+            LLAMA_LOG_INFO("moe_stream: THP: no free 2 MiB blocks are left: physical memory was fragmented when the cache was allocated."
+                    " Compacting it right before the start (as root: sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory) lets more of it collapse\n");
+        }
+    }
+
     // the cache: for each role of each pool its slots, ending at a page boundary, followed by its overflow window if any
     bool alloc_cache() {
         struct region {
@@ -1144,6 +1385,11 @@ struct llama_moe_stream::impl {
         size_t total = 0;
         size_t total_banks = 0;
         int    n_windows = 0;
+
+        // with huge pages each region starts at a 2 MiB boundary: the slots are padded at their front, and the address
+        // space after a window is rounded up (left unmapped from the memfd and never touched)
+        const size_t align   = thp ? THP_SIZE : page_size;
+        const size_t win_len = thp ? align_up(slot_size, THP_SIZE) : slot_size;
 
         for (size_t pi = 0; pi < pools.size(); ++pi) {
             auto & p = pools[pi];
@@ -1162,12 +1408,12 @@ struct llama_moe_stream::impl {
                 r.role   = ti.role;
                 r.t      = idx;
                 r.bank   = p.n_slots*ti.expert_size;
-                r.padded = align_up(r.bank, page_size);
+                r.padded = align_up(r.bank, align);
                 r.window = p.window;
                 if (r.bank == 0 && !r.window) {
                     continue;
                 }
-                total       += r.padded + (r.window ? slot_size : 0);
+                total       += r.padded + (r.window ? win_len : 0);
                 total_banks += r.bank;
                 n_windows   += r.window;
                 regions.push_back(r);
@@ -1180,11 +1426,26 @@ struct llama_moe_stream::impl {
         const double t_start = t_now();
 
         arena_size = total;
-        arena = mmap(nullptr, arena_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (arena == MAP_FAILED) {
-            arena = nullptr;
-            LLAMA_LOG_ERROR("moe_stream: failed to allocate %.2f GiB for the expert cache: %s\n", total_banks/GiB, strerror(errno));
-            return false;
+        {
+            // with huge pages: map 2 MiB more and trim it to an aligned arena
+            const size_t extra = thp ? THP_SIZE : 0;
+            void * p = mmap(nullptr, arena_size + extra, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (p == MAP_FAILED) {
+                LLAMA_LOG_ERROR("moe_stream: failed to allocate %.2f GiB for the expert cache: %s\n", total_banks/GiB, strerror(errno));
+                return false;
+            }
+            uint8_t * base = (uint8_t *) p;
+            if (extra > 0) {
+                uint8_t * aligned = (uint8_t *) align_up((size_t) base, THP_SIZE);
+                if (aligned > base) {
+                    munmap(base, aligned - base);
+                }
+                if (aligned + arena_size < base + arena_size + extra) {
+                    munmap(aligned + arena_size, (base + arena_size + extra) - (aligned + arena_size));
+                }
+                base = aligned;
+            }
+            arena = base;
         }
 
         const char * env_pin = getenv("LLAMA_MOE_STREAM_PIN");
@@ -1200,7 +1461,7 @@ struct llama_moe_stream::impl {
 
             if (r.padded > 0) {
                 // locking also allocates all the pages now
-                if (!lock_failed && mlock(cur, r.padded) != 0) {
+                if (!lock_failed && !lock_pages(cur, r.padded)) {
                     lock_failed = true;
                     LLAMA_LOG_WARN("moe_stream: failed to lock the expert cache (%s), it may be swapped out\n", strerror(errno));
                     LLAMA_LOG_WARN("moe_stream: raise the limit with 'ulimit -l unlimited' (or LimitMEMLOCK=infinity for a systemd service)\n");
@@ -1219,7 +1480,7 @@ struct llama_moe_stream::impl {
                     LLAMA_LOG_ERROR("moe_stream: failed to map an overflow window: %s\n", strerror(errno));
                     return false;
                 }
-                cur += slot_size;
+                cur += win_len;
             }
         }
 
@@ -1271,6 +1532,10 @@ struct llama_moe_stream::impl {
 
         LLAMA_LOG_INFO("moe_stream: cache: %.2f GiB %s in %.1f s, %d overflow windows\n",
                 total_banks/GiB, pinned ? "pinned" : "locked", t_now() - t_start, n_windows);
+        if (thp) {
+            LLAMA_LOG_INFO("moe_stream: THP: %.2f of %.2f GiB of the cache faulted in huge pages%s\n", arena_huge_bytes()/GiB, total_banks/GiB,
+                    thp_fault ? "" : " (stopped advising: free memory needed compaction)");
+        }
 
         return true;
     }
@@ -3410,6 +3675,7 @@ struct llama_moe_stream::impl {
     //
 
     void begin_graph(ggml_backend_sched_t sched, ggml_cgraph * gf, int64_t n_tok, bool more) {
+        graphs_running.fetch_add(1);
         if (hot_observer) {
             hot_observer->begin_batch();
         }
@@ -3780,6 +4046,8 @@ struct llama_moe_stream::impl {
     }
 
     void end_graph(bool success) {
+        graph_end_us = ggml_time_us();
+        graphs_running.fetch_sub(1);
         // a failed or aborted graph: its reads are finished, so that the next graph starts from a clean state
         if (!success) {
             drain_prefetch(true);
