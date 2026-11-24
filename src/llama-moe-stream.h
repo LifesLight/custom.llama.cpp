@@ -88,18 +88,40 @@ public:
     size_t grow_cache();
 
     using expert_writer = std::function<void(const ggml_tensor *, const void *, size_t)>;
-    using expert_reader = std::function<void(const ggml_tensor *, void *, size_t)>;
     // the tensors of an expert, from the RAM cache or read from the model file, false if not streamed
     bool with_expert(int il, int expert, const expert_writer & writer);
     // the tensors of the experts (il, expert) for writer(index, ...): from the RAM cache, the others read from the
     // model file in parallel, while the previous ones are written. false if one is not streamed
     using expert_batch_writer = std::function<void(size_t, const ggml_tensor *, const void *, size_t)>;
     bool with_experts(const std::vector<std::pair<int, int>> & experts, const expert_batch_writer & writer);
-    // admit an expert to the RAM cache, its tensors written by reader, false if no slot can take it. the RAM copies
-    // of the experts of the tier are evicted first (a decode miss takes them)
-    bool restore_expert(int il, int expert, const expert_reader & reader);
     // the experts of the tier changed
     void hot_changed();
+    // expert e of layer il joined or left the tier: its RAM copy, if any, changes place in the eviction order
+    void hot_changed(int il, int expert);
+
+    // asynchronous transfers of the tier
+    struct hold_t {
+        int     pool = -1;
+        int32_t slot = -1;
+    };
+    struct expert_part {
+        const ggml_tensor * t;
+        void *              data; // in the RAM slot, or in the buffer of read_expert
+        size_t              size;
+    };
+    // between graphs: the RAM copy of the expert, held (not evicted) until release_hold, false if it is not cached
+    // or its slot is being read into
+    bool hold_expert(int il, int expert, std::vector<expert_part> & parts, hold_t & hold);
+    // any thread
+    void release_hold(hold_t & hold);
+    // between graphs: a RAM slot for the expert, written by any thread (parts) before commit_ram: the slot that the
+    // policy evicts first, its expert is evicted now. false if the expert is cached or no slot can take it
+    bool reserve_ram(int il, int expert, std::vector<expert_part> & parts, hold_t & hold);
+    // between graphs: the reserved slot holds the expert
+    void commit_ram(int il, int expert, hold_t & hold);
+    // any thread: read the tensors of the expert from the model file into buf, at the lowest priority of the IO
+    // threads, false on a read error
+    bool read_expert(int il, int expert, std::vector<uint8_t> & buf, std::vector<expert_part> & parts);
 
     // true if src is an expert tensor handled by the stream
     bool is_streamed(const ggml_tensor * src) const;

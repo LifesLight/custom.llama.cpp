@@ -692,6 +692,8 @@ llama_context::llama_context(
                 moe_hot_params.headroom        = env_uint("LLAMA_MOE_HOT_HEADROOM_MIB", 256, SIZE_MAX/MiB)*MiB;
                 moe_hot_params.update_interval = env_uint("LLAMA_MOE_HOT_UPDATE",       32,  UINT32_MAX);
                 moe_hot_params.update_bytes    = env_uint("LLAMA_MOE_HOT_UPDATE_MIB",   256, SIZE_MAX/MiB)*MiB;
+                moe_hot_params.inflight_bytes  = env_uint("LLAMA_MOE_HOT_INFLIGHT_MIB", 2048, SIZE_MAX/MiB)*MiB;
+                moe_hot_params.verify          = env_uint("LLAMA_MOE_HOT_VERIFY",       0,   1) != 0;
             }
         } else if (hot_requested) {
             LLAMA_LOG_WARN("moe_hot: disabled: requires decode workspace switching\n");
@@ -941,12 +943,13 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
             }
         }
 
-        if (moe_hot && moe_hot->update_due() && moe_stream->cpu_batch(n_tokens)) {
-            const int64_t t_start_us = ggml_time_us();
-            synchronize();
-            const double sync_ms = (ggml_time_us() - t_start_us)/1000.0;
+        // the transfers of the tier run in the background, between batches only their results are published
+        if (moe_hot && moe_stream->cpu_batch(n_tokens)) {
             try {
-                if (moe_hot->update(*moe_stream, sync_ms)) {
+                if (moe_hot->update_due()) {
+                    moe_hot->update(*moe_stream);
+                }
+                if (moe_hot->tick(*moe_stream)) {
                     sched_need_reserve = true;
                     sched_reserve();
                 }
@@ -966,11 +969,17 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
 
 size_t llama_context::moe_stream_shrink(size_t bytes) {
     synchronize();
+    if (moe_hot && moe_stream && moe_hot->drain(*moe_stream)) {
+        sched_need_reserve = true;
+    }
     return moe_stream ? moe_stream->shrink_cache(bytes) : 0;
 }
 
 size_t llama_context::moe_stream_grow() {
     synchronize();
+    if (moe_hot && moe_stream && moe_hot->drain(*moe_stream)) {
+        sched_need_reserve = true;
+    }
     return moe_stream ? moe_stream->grow_cache() : 0;
 }
 

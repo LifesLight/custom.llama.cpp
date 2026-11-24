@@ -13,16 +13,25 @@ class llama_moe_stream;
 struct llama_moe_hot_params {
     size_t   headroom;        // VRAM left free on each GPU after the banks are allocated
     uint64_t update_interval; // processed tokens between replacement checks, 0 = contents fixed for the phase
-    size_t   update_bytes;    // GPU upload + download bytes per replacement check
+    size_t   update_bytes;    // GPU upload + download bytes planned per replacement check
+    size_t   inflight_bytes;  // bytes of the transfers in progress at a time
+    bool     verify;          // read every upload back and compare it with its source
 };
 
 // a GPU tier for the experts of the MoE stream during decode: the most used streamed experts are executed from
 // banks on the GPUs, the others keep the CPU path of the stream. the banks are allocated once per small-batch
-// phase, one bank per weight layout (role, type, shape) and device; their contents change only between
-// synchronized batches, and the GGUF stays the backing store of every expert: the banks are released without copies
+// phase, one bank per weight layout (role, type, shape) and device, and the GGUF stays the backing store of every
+// expert: the banks are released without copies
+//
+// the contents change without stopping decode: a thread per GPU copies the experts on its own stream while the
+// batches are computed, and the maps of the graph (which expert is in which slot) only change between batches:
+// - an expert is published once its upload completed
+// - an expert that leaves keeps its slot until it was downloaded into the RAM slot reserved for it (if it has no RAM
+//   copy); its slot is written again once the graphs computed before it left are done (an event of the compute stream)
 class llama_moe_hot {
 public:
-    // seeded with the most used experts of the stream; call between synchronized graphs
+    // the banks and the GPU branches of each layer are planned with the most used experts of the stream, which are
+    // then uploaded in the background; call between graphs
     llama_moe_hot(const llama_model & model, const std::vector<ggml_backend_t> & backends,
             llama_moe_stream & stream, const llama_moe_hot_params & params);
     ~llama_moe_hot();
@@ -33,7 +42,7 @@ public:
     // the GPU backend that owns layer il, nullptr if the layer is not on a GPU in the tier
     ggml_backend_t home_backend(int il) const;
 
-    // the layer has experts in the tier, on the device or on any device (-1)
+    // the layer has a GPU branch, on the device or on any device (-1). a branch stays once opened
     bool has_layer(int il, int device = -1) const;
     // the expert is in the tier (on any device)
     bool contains(int il, int expert) const;
@@ -51,9 +60,15 @@ public:
     void abort_batch();
     void end_batch(int64_t tokens, int64_t interval);
 
-    // between synchronized batches
+    // between batches: publish the completed transfers, retire the slots of the downloaded experts and start new
+    // transfers. true if a GPU branch was opened (the graph topology changed)
+    bool tick(llama_moe_stream & stream);
+    // between batches: finish the transfers in progress, drop the planned ones. true if the topology changed
+    bool drain(llama_moe_stream & stream);
+
+    // between batches: plan the replacements (started by the next ticks)
     bool update_due() const;
-    bool update(llama_moe_stream & stream, double synchronize_ms); // true if the graph topology changed
+    void update(llama_moe_stream & stream);
 
 private:
     struct impl;
