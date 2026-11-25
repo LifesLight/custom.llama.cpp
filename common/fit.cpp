@@ -4,10 +4,13 @@
 #include "json.h"
 #include "llama-cpp.h"
 #include "log.h"
+#include "speculative.h"
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
@@ -1225,4 +1228,383 @@ void common_fit_print(
     printf("%zu ", dmd.back().mb.context/1024/1024);
     printf("%zu ", dmd.back().mb.compute/1024/1024);
     printf("\n");
+}
+
+
+//
+// --ts-search
+//
+
+namespace {
+
+struct ts_search_row {
+    int k = 0;                       // layers on the first GPU
+    bool ok = false;                 // measured
+    std::vector<uint32_t> ub;        // ubatch per prompt size, 0 if even 256 does not fit
+    std::vector<int> limit;          // index of the device that limits the ubatch per prompt size, -1 if none
+    bool extra_ok = true;            // the extra memory fits next to the decode state
+    std::vector<int64_t> spare_full; // per GPU: budget left at the full context with the ubatch chosen there, MiB
+};
+
+} // namespace
+
+bool common_ts_search(const common_params & params, const std::map<ggml_backend_dev_t, size_t> & extra_mem) {
+    constexpr int64_t MiB = 1024*1024;
+
+    common_fit_log_scope log_scope(params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+    llama_model_params   mparams = common_model_params_to_llama(const_cast<common_params &>(params));
+    llama_context_params cparams = common_context_params_to_llama(params);
+    mparams.no_alloc  = true;
+    mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    cparams.ubatch_auto = true;
+
+    const uint32_t ub_max = std::min(cparams.n_ubatch, cparams.n_batch);
+    const int64_t  margin = (int64_t) cparams.ubatch_auto_margin;
+
+    // the draft / MTP context takes memory next to the target for the whole session
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    common_params params_dft = common_base_params_to_speculative(params);
+    llama_model_params   mparams_dft = common_model_params_to_llama(params_dft);
+    llama_context_params cparams_dft = common_context_params_to_llama(params_dft);
+    mparams_dft.no_alloc  = true;
+    mparams_dft.load_mode = LLAMA_LOAD_MODE_NONE;
+    cparams_dft.ubatch_auto = false;
+    cparams_dft.n_rs_seq    = 0;
+    if (spec_mtp) {
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    }
+
+    // the GPUs of the model and their free memory, from a first dry load with the configured split
+    std::vector<ggml_backend_dev_t> devs;
+    std::vector<int64_t> free_mem;
+    uint32_t n_ctx = 0;
+    {
+        llama_model_ptr model(common_model_load(params.model.get_paths(), mparams));
+        if (!model) {
+            LOG_ERR("%s: failed to load the model\n", __func__);
+            return false;
+        }
+        for (int i = 0; i < llama_model_n_devices(model.get()); ++i) {
+            ggml_backend_dev_t dev = llama_model_get_device(model.get(), i);
+            const auto type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                devs.push_back(dev);
+                free_mem.push_back((int64_t) free);
+            }
+        }
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
+        if (!ctx) {
+            LOG_ERR("%s: failed to create the context\n", __func__);
+            return false;
+        }
+        n_ctx = llama_n_ctx(ctx.get());
+    }
+    if (devs.size() < 2) {
+        LOG_ERR("%s: needs at least two GPUs, the model has %zu\n", __func__, devs.size());
+        return false;
+    }
+    if (devs.size() > 2) {
+        LOG_WRN("%s: only the split between the first two GPUs is searched, the others keep their share\n", __func__);
+    }
+
+    // the layers to split: the configured -ts in layers when it sums to an integer (e.g. -ts 34,14), else -ngl
+    float ts_cur[128] = {0};
+    std::copy(params.tensor_split, params.tensor_split + 128, ts_cur);
+    float ts_sum = 0.0f;
+    for (size_t i = 0; i < devs.size(); ++i) {
+        ts_sum += ts_cur[i];
+    }
+    int n_split = 0;
+    if (ts_sum > 0.0f && std::fabs(ts_sum - std::round(ts_sum)) < 1e-3f && ts_sum >= 2.0f) {
+        n_split = (int) std::lround(ts_sum);
+    } else if (params.n_gpu_layers > 0) {
+        n_split = params.n_gpu_layers;
+    } else {
+        LOG_ERR("%s: needs -ngl or a -ts in layers (e.g. -ts 34,14) to know the number of layers to split\n", __func__);
+        return false;
+    }
+    const float ts_other = ts_sum > 0.0f ? ts_sum - ts_cur[0] - ts_cur[1] : 0.0f;
+    const int n_pair = n_split - (int) std::lround(ts_other);
+    const int k_cur = ts_sum > 0.0f ? (int) std::lround(ts_cur[0]) :
+        (int) std::lround((double) n_pair * free_mem[0] / (double) (free_mem[0] + free_mem[1]));
+
+    // the prompt sizes: as --ubatch-auto plans them, in steps of 4096 cells, and the full context
+    std::vector<uint32_t> cells;
+    for (uint32_t c : { 4096u, 32768u }) {
+        if (c < n_ctx) {
+            cells.push_back(c);
+        }
+    }
+    cells.push_back(n_ctx);
+
+    const uint32_t step = 256;
+
+    auto measure = [&](int k) {
+        ts_search_row row;
+        row.k = k;
+
+        float ts[128] = {0};
+        std::copy(ts_cur, ts_cur + 128, ts);
+        ts[0] = (float) k;
+        ts[1] = (float) (n_pair - k);
+        // a separate draft model keeps its own placement (-devd, -otd, -tsd), only the target is split
+        mparams.tensor_split = ts;
+
+        llama_model_ptr model(common_model_load(params.model.get_paths(), mparams));
+        if (!model) {
+            return row;
+        }
+        llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
+        if (!ctx) {
+            return row;
+        }
+        if (spec_mtp) {
+            // the target keeps the hidden rows of a batch on the device for the MTP head
+            llama_set_embeddings_nextn(ctx.get(), true, /*masked*/ false);
+            llama_set_embeddings_nextn_dev(ctx.get(), true);
+        }
+
+        // the memory that stays next to the prompt buffers: weights, context and the draft context
+        std::vector<int64_t> fixed(devs.size(), 0);
+        auto add = [&](const llama_context * c, bool weights, bool compute) {
+            for (const auto & [buft, mb] : llama_get_memory_breakdown(c)) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    if (!ggml_backend_buft_is_host(buft) && dev == devs[i]) {
+                        fixed[i] += (int64_t) ((weights ? mb.model : 0) + mb.context + (compute ? mb.compute : 0));
+                    }
+                }
+            }
+        };
+        llama_model_ptr model_dft;
+        llama_context_ptr ctx_dft;
+        cparams_dft.n_ctx     = n_ctx;
+        cparams_dft.ctx_other = ctx.get(); // as the speculative setup: DFlash/DSpark decoders need their target
+        if (has_draft) {
+            model_dft.reset(common_model_load(params_dft.model.get_paths(), mparams_dft));
+            if (model_dft) {
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams_dft));
+            }
+            if (ctx_dft && llama_supports_embd_row(ctx_dft.get())) {
+                // the target keeps the inputs of the draft's target layers on the device for the decoder
+                const int32_t * ids = llama_model_target_layer_ids(model_dft.get());
+                for (uint32_t j = 0; j < llama_model_target_layer_ids_n(model_dft.get()); ++j) {
+                    llama_set_embeddings_layer_inp(ctx.get(), (uint32_t) ids[j], true);
+                }
+                llama_set_embeddings_layer_inp_dev(ctx.get(), true);
+            }
+            if (ctx_dft) {
+                add(ctx_dft.get(), true, true);
+            }
+        } else if (spec_mtp) {
+            ctx_dft.reset(llama_init_from_model(model.get(), cparams_dft));
+            if (ctx_dft) {
+                add(ctx_dft.get(), false, true); // the MTP context runs on the weights of the target
+            }
+        }
+        // after the draft setup, which may add device rows to the target
+        add(ctx.get(), true, false);
+
+        std::vector<ggml_backend_dev_t> mdevs(16);
+        std::vector<size_t> msizes(16);
+        // the compute sizes per GPU of a prompt of n cells at ubatch u
+        auto sizes = [&](uint32_t n, uint32_t u, std::vector<int64_t> & out) {
+            out.assign(devs.size(), 0);
+            const int32_t nm = llama_ubatch_measure(ctx.get(), n, u, mdevs.data(), msizes.data(), (int32_t) mdevs.size());
+            for (int32_t j = 0; j < nm; ++j) {
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    if (mdevs[j] == devs[i]) {
+                        out[i] += (int64_t) msizes[j];
+                    }
+                }
+            }
+            return nm >= 0;
+        };
+        std::vector<int64_t> sz;
+        auto limit_of = [&](uint32_t n, uint32_t u) {
+            if (!sizes(n, u, sz)) {
+                return -2;
+            }
+            if (getenv("LLAMA_TS_SEARCH_DEBUG")) {
+                std::string str;
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    str += string_format(" %s fixed %" PRId64 " compute %" PRId64 " free %" PRId64, ggml_backend_dev_name(devs[i]),
+                        fixed[i]/MiB, sz[i]/MiB, free_mem[i]/MiB);
+                }
+                LOG_INF("%s: k=%d cells=%u ub=%u:%s\n", __func__, k, n, u, str.c_str());
+            }
+            for (size_t i = 0; i < devs.size(); ++i) {
+                if (fixed[i] + sz[i] + margin > free_mem[i]) {
+                    return (int) i;
+                }
+            }
+            return -1;
+        };
+
+        for (const uint32_t n : cells) {
+            uint32_t best = 0;
+            int lim = -1;
+            if ((lim = limit_of(n, ub_max)) == -1) {
+                best = ub_max;
+            } else if (lim == -2) {
+                return row;
+            } else {
+                uint32_t lo = 1, hi = (ub_max - 1)/step;
+                while (lo <= hi) {
+                    const uint32_t mid = (lo + hi)/2;
+                    const int l = limit_of(n, mid*step);
+                    if (l == -1) {
+                        best = mid*step;
+                        lo = mid + 1;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+            }
+            // the device that the next step does not fit on
+            if (best < ub_max) {
+                lim = limit_of(n, std::min(ub_max, best + step));
+            }
+            row.ub.push_back(best);
+            row.limit.push_back(best == ub_max ? -1 : lim);
+        }
+
+        // what is left at the full context with its ubatch, per GPU
+        sizes(n_ctx, std::max<uint32_t>(row.ub.back(), 1), sz);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            row.spare_full.push_back((free_mem[i] - fixed[i] - sz[i] - margin)/MiB);
+        }
+
+        // the extra memory (a projector) next to the decode state: a small workspace at the full context
+        if (!extra_mem.empty()) {
+            sizes(n_ctx, 32, sz);
+            for (size_t i = 0; i < devs.size(); ++i) {
+                const auto it = extra_mem.find(devs[i]);
+                const int64_t extra = it != extra_mem.end() ? (int64_t) it->second : 0;
+                if (fixed[i] + sz[i] + extra + margin > free_mem[i]) {
+                    row.extra_ok = false;
+                }
+            }
+        }
+
+        if (k == k_cur) {
+            std::string str;
+            for (size_t i = 0; i < devs.size(); ++i) {
+                str += string_format(" %s %" PRId64, ggml_backend_dev_name(devs[i]), fixed[i]/MiB);
+            }
+            LOG_INF("%s: configured split: weights, context and draft:%s MiB (draft %s)\n", __func__, str.c_str(),
+                has_draft ? (ctx_dft ? "measured" : "failed to load") : spec_mtp ? (ctx_dft ? "MTP measured" : "MTP failed") : "none");
+        }
+
+        row.ok = true;
+        return row;
+    };
+
+    const int64_t t_start = ggml_time_us();
+
+    LOG_INF("%s: splitting %d layers between %s (%" PRId64 " MiB free) and %s (%" PRId64 " MiB free), -c %u, ubatch up to %u, margin %" PRId64 " MiB\n",
+        __func__, n_pair, ggml_backend_dev_name(devs[0]), free_mem[0]/MiB, ggml_backend_dev_name(devs[1]), free_mem[1]/MiB,
+        n_ctx, ub_max, margin/MiB);
+
+    // from the configured split outwards, until a split does not fit any more
+    std::vector<ts_search_row> rows;
+    auto fits = [](const ts_search_row & r) { return r.ok && r.ub.back() > 0 && r.extra_ok; };
+    {
+        const int k0 = std::clamp(k_cur, 1, n_pair - 1);
+        rows.push_back(measure(k0));
+        for (int k = k0 - 1; k >= 1; --k) {
+            rows.push_back(measure(k));
+            if (!fits(rows.back())) {
+                break;
+            }
+        }
+        for (int k = k0 + 1; k <= n_pair - 1; ++k) {
+            rows.push_back(measure(k));
+            if (!fits(rows.back())) {
+                break;
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const ts_search_row & a, const ts_search_row & b) { return a.k < b.k; });
+    }
+
+    auto fmt_ts = [&](int k) {
+        std::string s = std::to_string(k) + "," + std::to_string(n_pair - k);
+        for (size_t i = 2; i < devs.size(); ++i) {
+            s += "," + string_format("%g", ts_cur[i]);
+        }
+        return s;
+    };
+
+    std::string head = string_format("%-10s", "-ts");
+    for (const uint32_t n : cells) {
+        head += string_format(" %14s", (std::to_string(n) + " cells").c_str());
+    }
+    head += "   spare at -c [MiB]";
+    LOG_INF("%s:   %s\n", __func__, head.c_str());
+
+    // the recommendation: the largest ubatch at the middle prompt size, then at the full context, then at the
+    // smallest, then the most memory left on the tighter GPU at the full context
+    const size_t i_mid = cells.size() > 1 ? cells.size() - 2 : 0;
+    const ts_search_row * best = nullptr;
+    auto better = [&](const ts_search_row & a, const ts_search_row & b) {
+        for (size_t i : { i_mid, cells.size() - 1, (size_t) 0 }) {
+            if (a.ub[i] != b.ub[i]) {
+                return a.ub[i] > b.ub[i];
+            }
+        }
+        const int64_t sa = *std::min_element(a.spare_full.begin(), a.spare_full.end());
+        const int64_t sb = *std::min_element(b.spare_full.begin(), b.spare_full.end());
+        return sa > sb;
+    };
+    const ts_search_row * cur = nullptr;
+    for (const auto & r : rows) {
+        std::string line = string_format("%c %-8s", r.k == k_cur ? '*' : ' ', fmt_ts(r.k).c_str());
+        if (!r.ok) {
+            line += "  failed to load";
+        } else {
+            for (size_t i = 0; i < cells.size(); ++i) {
+                std::string cell = r.ub[i] == 0 ? "-" : std::to_string(r.ub[i]);
+                if (r.limit[i] >= 0) {
+                    cell += string_format(" (%s)", ggml_backend_dev_name(devs[r.limit[i]]));
+                }
+                line += string_format(" %14s", cell.c_str());
+            }
+            line += "  ";
+            for (size_t i = 0; i < devs.size(); ++i) {
+                line += string_format(" %6" PRId64, r.spare_full[i]);
+            }
+            if (!r.extra_ok) {
+                line += "  (projector does not fit)";
+            }
+        }
+        LOG_INF("%s: %s\n", __func__, line.c_str());
+        if (fits(r) && (!best || better(r, *best))) {
+            best = &r;
+        }
+        if (r.k == k_cur) {
+            cur = &r;
+        }
+    }
+    LOG_INF("%s: ubatch that --ubatch-auto would select per prompt size (the device that limits it); * = the configured split\n", __func__);
+    LOG_INF("%s: measured %zu splits in %.1f s\n", __func__, rows.size(), (ggml_time_us() - t_start)/1e6);
+
+    if (!best) {
+        LOG_ERR("%s: no split fits the full context\n", __func__);
+        return false;
+    }
+    if (cur && best->k == cur->k) {
+        LOG_INF("%s: recommended: -ts %s (the configured split)\n", __func__, fmt_ts(best->k).c_str());
+    } else {
+        LOG_INF("%s: recommended: -ts %s (ubatch %u at %u cells", __func__, fmt_ts(best->k).c_str(), best->ub[i_mid], cells[i_mid]);
+        if (cur && cur->ok) {
+            LOG_CNT(", the configured -ts %s: %u", fmt_ts(cur->k).c_str(), cur->ub[i_mid]);
+        }
+        LOG_CNT(")\n");
+    }
+    return true;
 }

@@ -459,6 +459,7 @@ public:
     void set_n_ubatch_min_embd(uint32_t n) { ubatch_min_embd = n; }
     uint32_t n_ubatch_max() const { return ubatch_auto ? ubatch_max : cparams.n_ubatch; }
     uint32_t ubatch_prepare(uint32_t n_tokens, bool media);
+    int32_t  ubatch_measure(uint32_t n_cells, uint32_t n_ubatch, ggml_backend_dev_t * devs, size_t * sizes, int32_t n_max);
 
 private:
 

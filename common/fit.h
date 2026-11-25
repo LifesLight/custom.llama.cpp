@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,13 @@ std::vector<common_memory_breakdown_row> common_fit_measure(
                      ggml_log_level   log_level);
 
 struct common_params;
+
+// --ts-search: for layer splits between the first two GPUs, the ubatch --ubatch-auto would select at a few prompt
+// sizes, from dry loads (nothing is allocated); prints a table and a recommended -ts
+//   - extra_mem: device memory that something else takes while the prompt buffers are not allocated (the projector
+//     with projector first), checked next to the weights, the context and a decode workspace
+//   - returns false if no split could be measured
+bool common_ts_search(const common_params & params, const std::map<ggml_backend_dev_t, size_t> & extra_mem);
 
 // measure min and max without allocating, params may be modified as with --fit; throws on failure
 common_memory_reports common_measure_memory(common_params & params);

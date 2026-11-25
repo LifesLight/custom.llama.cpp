@@ -1680,6 +1680,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH_AUTO_MARGIN"));
     add_opt(common_arg(
+        {"--ts-search"},
+        "measure layer splits between the first two GPUs without loading the model and print the ubatch "
+        "--ubatch-auto would select for each at a few prompt sizes, then exit. needs -ngl, or -ts in layers",
+        [](common_params & params) {
+            params.ts_search = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

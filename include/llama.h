@@ -616,6 +616,11 @@ extern "C" {
     // cut its batches at multiples of the ubatch (every ubatch costs a pass over the streamed experts)
     // returns the ubatch, or 0 when nothing was reserved (ubatch_auto off, or a batch of the decode workspace)
     LLAMA_API uint32_t llama_ubatch_prepare(struct llama_context * ctx, uint32_t n_tokens, bool media);
+    // the compute buffer sizes of the prompt workspace for a prompt of n_cells (0: the full context) at n_ubatch, from a
+    // dry run (nothing is allocated, also with a no_alloc model). fills devs/sizes with up to n_max backend devices of
+    // the context (the CPU included) and returns how many, or -1 without memory
+    LLAMA_API int32_t llama_ubatch_measure(struct llama_context * ctx, uint32_t n_cells, uint32_t n_ubatch,
+                                           ggml_backend_dev_t * devs, size_t * sizes, int32_t n_max);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

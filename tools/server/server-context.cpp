@@ -1745,6 +1745,18 @@ private:
             }
         }
 
+        // --ts-search: the layer splits measured without loading the model, then exit. with projector first, the
+        // projector only has to fit next to the decode state
+        if (params_base.ts_search) {
+            std::map<ggml_backend_dev_t, size_t> extra_mem;
+            if (has_mmproj && !mmproj_usage.backend_mem_usage.empty()) {
+                extra_mem = mmproj_usage.backend_mem_usage;
+            }
+            const bool ok = common_ts_search(params_base, extra_mem);
+            common_log_pause(common_log_main());
+            exit(ok ? 0 : 1);
+        }
+
         // note: the draft / MTP context is fitted together with the target model, see common_fit_extra_model
 
         // attach a progress callback

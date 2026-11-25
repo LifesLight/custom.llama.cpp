@@ -893,6 +893,27 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
+int32_t llama_context::ubatch_measure(uint32_t n_cells, uint32_t n_ubatch, ggml_backend_dev_t * devs, size_t * sizes, int32_t n_max) {
+    if (!memory || !sched) {
+        return -1;
+    }
+    std::vector<size_t> sz;
+    {
+        llama_memory_reserve_scope scope(n_cells >= cparams.n_ctx ? 0 : n_cells);
+        const auto mctx = memory->init_full();
+        if (!mctx) {
+            return -1;
+        }
+        ubatch_sizes(mctx.get(), cparams.n_seq_max, std::max<uint32_t>(1, std::min(n_ubatch, cparams.n_ctx)), sz);
+    }
+    int32_t n = 0;
+    for (size_t i = 0; i < backend_ptrs.size() && n < n_max; ++i, ++n) {
+        devs[n]  = ggml_backend_get_device(backend_ptrs[i]);
+        sizes[n] = sz[i];
+    }
+    return n;
+}
+
 uint32_t llama_context::ubatch_prepare(uint32_t n_tokens, bool media) {
     // a batch of the decode workspace has no prompt ubatch, and must not count as a small batch of the GPU tier
     if (!ubatch_auto || cparams.training || n_tokens == 0 || (sched_decode_workspace > 0 && n_tokens <= sched_decode_workspace)) {
@@ -4706,6 +4727,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    // the device rows of the draft features (MTP h_nextn, DFlash layer inputs), sized for n_batch
+    for (const ggml_backend_buffer * buf : { buf_h_nextn_dev.get(), buf_layer_inp_dev.get() }) {
+        if (buf) {
+            ret[ggml_backend_buffer_get_type(const_cast<ggml_backend_buffer *>(buf))].context += ggml_backend_buffer_get_size(const_cast<ggml_backend_buffer *>(buf));
+        }
+    }
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
@@ -5189,6 +5216,10 @@ uint32_t llama_n_ubatch_cur(const llama_context * ctx) {
 
 uint32_t llama_ubatch_prepare(llama_context * ctx, uint32_t n_tokens, bool media) {
     return ctx->ubatch_prepare(n_tokens, media);
+}
+
+int32_t llama_ubatch_measure(llama_context * ctx, uint32_t n_cells, uint32_t n_ubatch, ggml_backend_dev_t * devs, size_t * sizes, int32_t n_max) {
+    return ctx->ubatch_measure(n_cells, n_ubatch, devs, sizes, n_max);
 }
 
 void llama_set_prompt_hint(llama_context * ctx, uint32_t n_tokens) {

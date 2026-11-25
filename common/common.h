@@ -483,6 +483,7 @@ struct common_params {
     bool    ubatch_auto           = false; // n_ubatch is the maximum, each prompt takes the largest that fits
     int32_t ubatch_auto_margin    =   256; // MiB of device memory left free by the prompt compute buffers
     bool    n_ubatch_set          = false; // -ub given: with --ubatch-auto, the maximum ubatch is -b otherwise
+    bool    ts_search             = false; // --ts-search: print the ubatch of layer splits and exit
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
