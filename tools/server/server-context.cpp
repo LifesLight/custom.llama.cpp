@@ -341,6 +341,10 @@ struct server_slot {
     mtmd_context * mctx = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
 
+    // projector first: the media of the prompt encoded before its first batch, in order, and whether they are all
+    std::deque<mtmd::batch_ptr> mbatch_pre;
+    bool media_pre_encoded = false;
+
     struct tts_ctx {
         mtmd_helper::gen_audio ctx;
         std::vector<float> h_state_prompt; // the first h_state after step_prompt done
@@ -541,6 +545,8 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+        mbatch_pre.clear();
+        media_pre_encoded = false;
 
         tts.reset();
 
@@ -1421,7 +1427,7 @@ private:
     // a media chunk of the prompt of the slot is not processed yet, so it may need the projector
     static bool slot_has_media_ahead(const server_slot & slot) {
         if (slot.state == SLOT_STATE_IDLE || slot.state == SLOT_STATE_DONE_PROMPT || slot.state == SLOT_STATE_GENERATING ||
-                !slot.task || !slot.task->tokens.has_mtmd) {
+                !slot.task || !slot.task->tokens.has_mtmd || slot.media_pre_encoded) {
             return false;
         }
         // before the prompt is processed, the cached prefix is not known yet
@@ -1484,6 +1490,94 @@ private:
                 SRV_ERR("%s", "failed to restore the mmproj weights\n");
             }
         }
+    }
+
+    // projector first (LLAMA_SERVER_MTMD_PREENCODE, default 1): at the start of a prompt, all its media after the cached
+    // prefix are encoded, their embeddings wait in host memory, and the projector releases its device memory before
+    // the compute buffers of the prompt are reserved, instead of sharing the device with them during the prompt
+    bool mtmd_preencode = true;
+
+    // returns false on error, the caller releases the slot
+    bool preencode_media(server_slot & slot) {
+        const auto & tokens = slot.task->tokens;
+        const size_t n_past = slot.prompt.n_tokens();
+
+        // the first media chunk at or after n_past
+        size_t first = 0;
+        if (n_past < tokens.size() && tokens[n_past] == LLAMA_TOKEN_NULL) {
+            first = n_past;
+        } else {
+            const auto [c, i] = tokens.find_next_media_chunk(n_past);
+            if (c == nullptr) {
+                slot.media_pre_encoded = true;
+                return true;
+            }
+            first = i;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        restore_mmproj();
+
+        int n_batches = 0;
+        for (;;) {
+            mtmd::batch_ptr b;
+            int32_t res = 0;
+            queue_tasks.yield_to_queue([&]() {
+                res = encode_mtmd_chunk(slot, b, first);
+            });
+            if (res != 0) {
+                return false;
+            }
+            n_batches++;
+
+            // the next media chunk that the batch does not hold
+            bool more = false;
+            size_t cur = first;
+            for (;;) {
+                const auto [c, i] = tokens.find_next_media_chunk(cur);
+                if (c == nullptr) {
+                    break;
+                }
+                if (mtmd_batch_get_output_embd(b.get(), c->get()) == nullptr) {
+                    first = i;
+                    more  = true;
+                    break;
+                }
+                cur = i;
+            }
+            slot.mbatch_pre.push_back(std::move(b));
+            if (!more) {
+                break;
+            }
+        }
+        slot.media_pre_encoded = true;
+
+        if (!mmproj_resident && !std::any_of(slots.begin(), slots.end(), slot_has_media_ahead)) {
+            if (!mtmd_release_device_memory(mctx)) {
+                mmproj_resident = true;
+            }
+        }
+        SLT_INF(slot, "projector first: media encoded in %d batches in %.0f ms\n", n_batches, (ggml_time_us() - t_start)/1000.0);
+        return true;
+    }
+
+    // the embeddings of a media chunk encoded before the prompt: its batch becomes slot.mbatch
+    static bool take_pre_encoded(server_slot & slot, const mtmd_input_chunk * chunk) {
+        while (!slot.mbatch_pre.empty()) {
+            if (mtmd_batch_get_output_embd(slot.mbatch_pre.front().get(), chunk) != nullptr) {
+                slot.mbatch = std::move(slot.mbatch_pre.front());
+                slot.mbatch_pre.pop_front();
+                return true;
+            }
+            // the batches are in prompt order: one without the chunk holds chunks already processed
+            slot.mbatch_pre.pop_front();
+        }
+        return false;
+    }
+
+    // the embeddings of the media chunk are in slot.mbatch (encoded with an earlier chunk, or before the prompt)
+    static bool have_embd(server_slot & slot, const mtmd_input_chunk * chunk) {
+        return (slot.mbatch && mtmd_batch_get_output_embd(slot.mbatch.get(), chunk) != nullptr) || take_pre_encoded(slot, chunk);
     }
 
     // Called by the inference loop after all active slots have drained.
@@ -1736,6 +1830,10 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            if (const char * env = getenv("LLAMA_SERVER_MTMD_PREENCODE")) {
+                mtmd_preencode = atoi(env) != 0;
+            }
 
             // causal model with a memory: encoded media chunks can share a batch with the text tokens (see can_mix_mtmd_chunk())
             {
@@ -4814,6 +4912,16 @@ private:
                         slot.prompt.tokens.keep_first(n_past);
                         slot.n_tokens_input = input_tokens.size();
 
+                        if (mctx != nullptr && mtmd_preencode && input_tokens.has_mtmd) {
+                            if (!preencode_media(slot)) {
+                                SLT_ERR(slot, "%s", "failed to encode the media of the prompt\n");
+                                send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                                slot.release();
+                                return;
+                            }
+                            update_ubatch_hints();
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4927,7 +5035,9 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
-                        restore_mmproj();
+                        if (!have_embd(slot, input_tokens.find_chunk(cur_token_idx).get())) {
+                            restore_mmproj();
+                        }
                         queue_tasks.yield_to_queue([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
@@ -5131,7 +5241,7 @@ private:
     bool add_mtmd_chunk_causal(server_slot & slot, size_t idx) {
         const auto & chunk = slot.task->tokens.find_chunk(idx);
 
-        float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+        float * embd = have_embd(slot, chunk.get()) ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
         if (!embd) {
             int32_t res = 0;
             restore_mmproj();
@@ -5179,7 +5289,7 @@ private:
 
             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
 
-            float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            float * embd = have_embd(slot, chunk.get()) ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
             if (!embd) {
                 // encode on the worker thread, so we can still handle metrics tasks
                 int32_t res = 0;
