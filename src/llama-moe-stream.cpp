@@ -430,6 +430,9 @@ struct llama_moe_stream::impl {
     // layer that its router is predicted to select are read ahead first, instead of the most used ones
     bool fc_on           = false;
     int  pf_max_inflight = 1; // prefetch reads in progress at most (LLAMA_MOE_STREAM_PREFETCH_INFLIGHT)
+    int  pf_inflight_env = 1;
+    int  n_slots_env     = 3; // staging buffers (LLAMA_MOE_STREAM_SLOTS)
+    bool pin_env         = false; // LLAMA_MOE_STREAM_PIN
     bool pf_norm         = true;
 
     struct pf_target {
@@ -546,6 +549,27 @@ struct llama_moe_stream::impl {
         n_expert_used = model.hparams.n_expert_used_max();
         page_size     = sysconf(_SC_PAGESIZE);
 
+        // the settings first: a bad value throws before any file, memory or thread is taken
+        n_slots_env       = (int) llama_env_uint("LLAMA_MOE_STREAM_SLOTS", 3, 2, 256);
+        cpu_max           = (int64_t) llama_env_uint("LLAMA_MOE_STREAM_CPU_MAX", cpu_max, 0, INT32_MAX);
+        halflife          = llama_env_double("LLAMA_MOE_STREAM_HALFLIFE", halflife, 1.0, 1e12);
+        prompt_weight     = llama_env_double("LLAMA_MOE_STREAM_PROMPT_WEIGHT", prompt_weight, 0.0, 1e12);
+        overlap_mode      = llama_env_uint("LLAMA_MOE_STREAM_OVERLAP", overlap_mode, 0, 1) != 0;
+        prof              = llama_env_uint("LLAMA_MOE_STREAM_PROFILE", prof, 0, 1) != 0;
+        thp               = llama_env_uint("LLAMA_MOE_STREAM_THP", thp, 0, 1) != 0;
+        if (thp && page_size != 4096) {
+            LLAMA_LOG_WARN("moe_stream: THP: needs 4 KiB pages (page size %zu), disabled\n", page_size);
+            thp = false;
+        }
+        pf_k              = (int) llama_env_uint("LLAMA_MOE_STREAM_PREFETCH", pf_k, 0, 1024);
+        pf_norm           = llama_env_uint("LLAMA_MOE_STREAM_PREFETCH_NORM", pf_norm, 0, 1) != 0;
+        fc_on             = llama_env_uint("LLAMA_MOE_STREAM_FORECAST", fc_on, 0, 1) != 0;
+        overlap_down_mode = llama_env_uint("LLAMA_MOE_STREAM_OVERLAP_DOWN", overlap_down_mode, 0, 1) != 0;
+        alloc_min         = llama_env_double("LLAMA_MOE_STREAM_ALLOC_MIN", alloc_min, 0.0, 1.0);
+        stats_interval    = (int64_t) llama_env_uint("LLAMA_MOE_STREAM_INTERVAL", stats_interval, 1, INT64_MAX);
+        pin_env           = llama_env_uint("LLAMA_MOE_STREAM_PIN", 0, 0, 1) != 0;
+        pf_inflight_env   = (int) llama_env_uint("LLAMA_MOE_STREAM_PREFETCH_INFLIGHT", std::max(1, params.n_threads/2), 1, 1024);
+
         // the experts are offloaded to the first GPU (see ggml_backend_sched_backend_id_from_cur)
         for (auto * backend : backends) {
             auto * dev = ggml_backend_get_device(backend);
@@ -571,58 +595,14 @@ struct llama_moe_stream::impl {
         }
         make_pools();
 
-        int n_slots = 3;
-        if (const char * env = getenv("LLAMA_MOE_STREAM_SLOTS")) {
-            n_slots = std::max(2, atoi(env));
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_CPU_MAX")) {
-            cpu_max = std::max(0, atoi(env));
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_HALFLIFE")) {
-            halflife = std::max(1.0, atof(env));
-        }
         if (const char * env = getenv("LLAMA_MOE_STREAM_TRACE")) {
             trace = fopen(env, "ab");
             if (!trace) {
                 LLAMA_LOG_WARN("moe_stream: cannot open the trace file %s\n", env);
             }
         }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_PROMPT_WEIGHT")) {
-            prompt_weight = std::max(0.0, atof(env));
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_OVERLAP")) {
-            overlap_mode = atoi(env) != 0;
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_PROFILE")) {
-            prof = atoi(env) != 0;
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_THP")) {
-            thp = atoi(env) != 0;
-        }
-        if (thp && page_size != 4096) {
-            LLAMA_LOG_WARN("moe_stream: THP: needs 4 KiB pages (page size %zu), disabled\n", page_size);
-            thp = false;
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH")) {
-            pf_k = std::max(0, atoi(env));
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH_NORM")) {
-            pf_norm = atoi(env) != 0;
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_FORECAST")) {
-            fc_on = atoi(env) != 0;
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_OVERLAP_DOWN")) {
-            overlap_down_mode = atoi(env) != 0;
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_ALLOC_MIN")) {
-            alloc_min = std::clamp(atof(env), 0.0, 1.0);
-        }
-        if (const char * env = getenv("LLAMA_MOE_STREAM_INTERVAL")) {
-            stats_interval = std::max<int64_t>(1, atoll(env));
-        }
         t_start_all = t_now();
-        slots.resize(n_slots);
+        slots.resize(n_slots_env);
         for (auto & sl : slots) {
             sl.off  .assign(max_n_expert, SIZE_MAX);
             sl.state.assign(max_n_expert, EXP_NONE);
@@ -677,7 +657,7 @@ struct llama_moe_stream::impl {
             rep_io_busy = io_busy;
         }
 
-        setup_prefetch(model, params.n_threads);
+        setup_prefetch(model);
 
         check_offload();
 
@@ -2181,8 +2161,7 @@ struct llama_moe_stream::impl {
             arena = base;
         }
 
-        const char * env_pin = getenv("LLAMA_MOE_STREAM_PIN");
-        const bool want_pin = env_pin && atoi(env_pin) != 0;
+        const bool want_pin = pin_env;
 
         bool lock_failed = false;
         cache_locked = true;
@@ -2769,7 +2748,7 @@ struct llama_moe_stream::impl {
 
     // the routers of the next layers, and the ratios of the norm weights that turn the input of the router of a
     // layer into an estimate of the input of the next one
-    void setup_prefetch(const llama_model & model, int n_threads) {
+    void setup_prefetch(const llama_model & model) {
         if (pf_k > 0 && memfd < 0) {
             LLAMA_LOG_WARN("moe_stream: prefetch needs the overflow windows (memfd), disabled\n");
             pf_k = 0;
@@ -2778,10 +2757,7 @@ struct llama_moe_stream::impl {
             return;
         }
 
-        pf_max_inflight = std::max(1, n_threads/2);
-        if (const char * env = getenv("LLAMA_MOE_STREAM_PREFETCH_INFLIGHT")) {
-            pf_max_inflight = std::max(1, atoi(env));
-        }
+        pf_max_inflight = pf_inflight_env;
 
         pf_cnt.assign(max_n_expert, 0);
         pf_targets.assign(layers.size(), pf_target());

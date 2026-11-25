@@ -104,6 +104,10 @@ void replace_all(std::string & s, const std::string & search, const std::string 
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
 std::string format(const char * fmt, ...);
 
+// an environment variable: the fallback if unset, otherwise a number from lo to hi, or an exception that names it
+uint64_t llama_env_uint(const char * name, uint64_t fallback, uint64_t lo, uint64_t hi);
+double   llama_env_double(const char * name, double fallback, double lo, double hi);
+
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 

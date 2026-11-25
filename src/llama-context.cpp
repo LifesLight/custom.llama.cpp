@@ -15,7 +15,6 @@
 #include "llama.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -30,21 +29,6 @@
 //
 
 static constexpr uint64_t MiB = 1024*1024;
-
-// an unsigned integer environment variable, fallback if unset
-static uint64_t env_uint(const char * name, uint64_t fallback, uint64_t max) {
-    const char * env = getenv(name);
-    if (env == nullptr) {
-        return fallback;
-    }
-    char * end = nullptr;
-    errno = 0;
-    const unsigned long long value = strtoull(env, &end, 10);
-    if (errno != 0 || end == env || *end != '\0' || value > max) {
-        throw std::runtime_error(format("%s must be an integer from 0 to %" PRIu64, name, max));
-    }
-    return value;
-}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -676,9 +660,9 @@ llama_context::llama_context(
         }
 
         // the GPU expert tier of the MoE stream (LLAMA_MOE_HOT=1), in the VRAM that decode workspace switching frees
-        const bool hot_requested = moe_stream && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && env_uint("LLAMA_MOE_HOT", 0, 1) != 0;
+        const bool hot_requested = moe_stream && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && llama_env_uint("LLAMA_MOE_HOT", 0, 0, 1) != 0;
         {
-            const uint64_t value = env_uint("LLAMA_DECODE_WORKSPACE", hot_requested ? 32 : 0, UINT32_MAX);
+            const uint64_t value = llama_env_uint("LLAMA_DECODE_WORKSPACE", hot_requested ? 32 : 0, 0, UINT32_MAX);
             const uint32_t full  = std::min(cparams.n_ctx, cparams.n_ubatch);
             if (value > 0) {
                 if (cparams.n_seq_max != 1 || !cparams.causal_attn || !memory || llama_model_has_encoder(&model) || model.no_alloc()) {
@@ -696,11 +680,11 @@ llama_context::llama_context(
                 LLAMA_LOG_WARN("moe_hot: disabled: rotated experts\n");
             } else {
                 moe_hot_enabled = true;
-                moe_hot_params.headroom        = env_uint("LLAMA_MOE_HOT_HEADROOM_MIB", 256, SIZE_MAX/MiB)*MiB;
-                moe_hot_params.update_interval = env_uint("LLAMA_MOE_HOT_UPDATE",       32,  UINT32_MAX);
-                moe_hot_params.update_bytes    = env_uint("LLAMA_MOE_HOT_UPDATE_MIB",   256, SIZE_MAX/MiB)*MiB;
-                moe_hot_params.inflight_bytes  = env_uint("LLAMA_MOE_HOT_INFLIGHT_MIB", 2048, SIZE_MAX/MiB)*MiB;
-                moe_hot_params.verify          = env_uint("LLAMA_MOE_HOT_VERIFY",       0,   1) != 0;
+                moe_hot_params.headroom        = llama_env_uint("LLAMA_MOE_HOT_HEADROOM_MIB", 256, 0, SIZE_MAX/MiB)*MiB;
+                moe_hot_params.update_interval = llama_env_uint("LLAMA_MOE_HOT_UPDATE",       32, 0, UINT32_MAX);
+                moe_hot_params.update_bytes    = llama_env_uint("LLAMA_MOE_HOT_UPDATE_MIB",   256, 0, SIZE_MAX/MiB)*MiB;
+                moe_hot_params.inflight_bytes  = llama_env_uint("LLAMA_MOE_HOT_INFLIGHT_MIB", 2048, 0, SIZE_MAX/MiB)*MiB;
+                moe_hot_params.verify          = llama_env_uint("LLAMA_MOE_HOT_VERIFY",       0, 0, 1) != 0;
             }
         } else if (hot_requested) {
             LLAMA_LOG_WARN("moe_hot: disabled: requires decode workspace switching\n");

@@ -6,10 +6,13 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 struct llama_logger_state {
@@ -128,6 +131,34 @@ std::string format(const char * fmt, ...) {
     va_end(ap2);
     va_end(ap);
     return std::string(buf.data(), size);
+}
+
+uint64_t llama_env_uint(const char * name, uint64_t fallback, uint64_t lo, uint64_t hi) {
+    const char * env = getenv(name);
+    if (env == nullptr) {
+        return fallback;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long long value = strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || *env == '-' || value < lo || value > hi) {
+        throw std::runtime_error(format("%s must be an integer from %" PRIu64 " to %" PRIu64 ", got '%s'", name, lo, hi, env));
+    }
+    return value;
+}
+
+double llama_env_double(const char * name, double fallback, double lo, double hi) {
+    const char * env = getenv(name);
+    if (env == nullptr) {
+        return fallback;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const double value = strtod(env, &end);
+    if (errno != 0 || end == env || *end != '\0' || !(value >= lo && value <= hi)) {
+        throw std::runtime_error(format("%s must be a number from %g to %g, got '%s'", name, lo, hi, env));
+    }
+    return value;
 }
 
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne) {
