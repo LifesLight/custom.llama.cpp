@@ -1229,9 +1229,11 @@ static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) 
     if (strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
         return false;
     }
+    // the CUDA MUL_MAT_ID of this fork skips them (moe-hot), its HIP and MUSA builds are not tested
+    const bool skips_mul_mat_id = strcmp(name, "CUDA") == 0;
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
-        if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_ADD_ID) {
+        if ((node->op != GGML_OP_MUL_MAT_ID || skips_mul_mat_id) && node->op != GGML_OP_ADD_ID) {
             continue;
         }
         const ggml_tensor * ids = node->src[2];
