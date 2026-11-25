@@ -66,6 +66,7 @@ struct llama_context {
     void moe_hot_release();
     size_t moe_stream_shrink(size_t bytes);
     size_t moe_stream_grow();
+    size_t moe_stream_fill(size_t bytes);
     bool moe_hot_is_enabled() const { return moe_hot_enabled; }
 
     const llama_model   & get_model()   const;

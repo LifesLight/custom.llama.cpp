@@ -1407,8 +1407,10 @@ private:
         }
         gpu_suspended = false;
         if (params_base.suspend_free_ram > 0) {
-            // the backups are not needed once restored; the RAM lent out comes back when idle (on_idle)
+            // the backups are not needed once restored; the RAM lent out comes back in the background, the expert
+            // misses fill it, and the most used experts fill the rest when idle (on_idle)
             gpu_suspend_release();
+            llama_moe_stream_grow(ctx_tgt);
         }
         return nullptr;
     }
@@ -2195,10 +2197,11 @@ private:
             handle_sleeping_state(sleeping);
         });
         if (params_base.can_suspend && params_base.suspend_free_ram > 0) {
-            // the RAM lent out while suspended comes back when the server has been idle for a moment, not at the
-            // resume: the first request after a resume does not wait for it, and requests in a row (an automated
-            // loop of suspends) do not refill what the next suspend releases again
+            // the RAM taken back at the resume is filled with the most used experts once the server has been idle
+            // for a moment, a chunk at a time, so that a new request waits for one chunk at most, and requests in a
+            // row (an automated loop of suspends) do not read what the next suspend releases again
             constexpr int64_t REGROW_IDLE_MS = 3000;
+            constexpr size_t  REGROW_CHUNK   = 2ull*1024*1024*1024;
             queue_tasks.on_idle([this]() {
                 if (gpu_suspended) {
                     return true; // lent out while suspended: the resume is a task, which starts a new idle period
@@ -2208,8 +2211,7 @@ private:
                         return false; // not idle after all: again in a moment
                     }
                 }
-                llama_moe_stream_grow(ctx_tgt);
-                return true;
+                return llama_moe_stream_fill(ctx_tgt, REGROW_CHUNK) == 0;
             }, REGROW_IDLE_MS);
         }
 

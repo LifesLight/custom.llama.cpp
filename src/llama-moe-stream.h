@@ -83,9 +83,13 @@ public:
     // release about bytes of the expert cache: its least used experts are evicted (each layer keeps its least
     // slots) and the memory of their slots is unlocked and dropped. returns the bytes released
     size_t shrink_cache(size_t bytes);
-    // take the released memory back, as far as the available RAM minus the reserve allows, and fill it with the most
-    // used experts that are not cached (read before this returns). returns the bytes taken back
+    // take the released memory back in a background thread, as far as the available RAM minus the reserve allows: its
+    // slots are free as soon as they are faulted in, and the misses take them before they evict. returns the bytes
+    // released at the call
     size_t grow_cache();
+    // read the most used experts that are not cached into up to bytes of the free slots. returns the bytes of the
+    // free slots left, and of the released ones while they are taken back (0: nothing more to fill)
+    size_t fill_free(size_t bytes);
 
     using expert_writer = std::function<void(const ggml_tensor *, const void *, size_t)>;
     // the tensors of an expert, from the RAM cache or read from the model file, false if not streamed

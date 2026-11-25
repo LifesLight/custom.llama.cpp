@@ -1188,9 +1188,13 @@ extern "C" {
     // suspended for another program. Returns the bytes released. Call between decodes, after llama_moe_hot_release
     LLAMA_API size_t llama_moe_stream_shrink(struct llama_context * ctx, size_t bytes);
 
-    // Take the released RAM back, as far as the available RAM minus --moe-stream-reserve allows, filled with the most
-    // used experts that are not cached. Returns the bytes taken back. Call between decodes
+    // Take the released RAM back in the background, as far as the available RAM minus --moe-stream-reserve allows, without
+    // waiting: the expert misses fill it before they evict. Returns the bytes released at the call. Call between decodes
     LLAMA_API size_t llama_moe_stream_grow(struct llama_context * ctx);
+
+    // Read the most used experts that are not cached into up to bytes of the RAM taken back, e.g. while idle. Returns
+    // the bytes still to fill (0: done). Call between decodes
+    LLAMA_API size_t llama_moe_stream_fill(struct llama_context * ctx, size_t bytes);
 
     // The GPU expert tier is enabled (LLAMA_MOE_HOT=1): VRAM freed during decode is used by it
     LLAMA_API bool llama_moe_hot_enabled(const struct llama_context * ctx);

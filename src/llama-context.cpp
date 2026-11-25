@@ -1064,11 +1064,18 @@ size_t llama_context::moe_stream_shrink(size_t bytes) {
 }
 
 size_t llama_context::moe_stream_grow() {
+    return moe_stream ? moe_stream->grow_cache() : 0;
+}
+
+size_t llama_context::moe_stream_fill(size_t bytes) {
+    if (!moe_stream) {
+        return 0;
+    }
     synchronize();
-    if (moe_hot && moe_stream && moe_hot->drain(*moe_stream)) {
+    if (moe_hot && moe_hot->drain(*moe_stream)) {
         sched_need_reserve = true;
     }
-    return moe_stream ? moe_stream->grow_cache() : 0;
+    return moe_stream->fill_free(bytes);
 }
 
 void llama_context::moe_hot_release() {
@@ -5303,6 +5310,10 @@ size_t llama_moe_stream_shrink(llama_context * ctx, size_t bytes) {
 
 size_t llama_moe_stream_grow(llama_context * ctx) {
     return ctx->moe_stream_grow();
+}
+
+size_t llama_moe_stream_fill(llama_context * ctx, size_t bytes) {
+    return ctx->moe_stream_fill(bytes);
 }
 
 bool llama_moe_hot_enabled(const llama_context * ctx) {
