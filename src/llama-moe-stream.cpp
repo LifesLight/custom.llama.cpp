@@ -291,6 +291,9 @@ struct llama_moe_stream::impl {
 
     // half-life of the usage scores in tokens (LLAMA_MOE_STREAM_HALFLIFE)
     double halflife = 512.0;
+    // LLAMA_MOE_STREAM_TRACE: the selected experts of each layer of the CPU batches are appended to this file
+    // (int32 il, k, n, then the k*n ids), for offline studies of the routing
+    FILE * trace = nullptr;
 
     // the weight of a prompt token in the generation scores, relative to a decode token (LLAMA_MOE_STREAM_PROMPT_WEIGHT):
     // with it, a long prompt on another topic moves the eviction order (and the GPU tier) before decode does
@@ -568,6 +571,12 @@ struct llama_moe_stream::impl {
         if (const char * env = getenv("LLAMA_MOE_STREAM_HALFLIFE")) {
             halflife = std::max(1.0, atof(env));
         }
+        if (const char * env = getenv("LLAMA_MOE_STREAM_TRACE")) {
+            trace = fopen(env, "ab");
+            if (!trace) {
+                LLAMA_LOG_WARN("moe_stream: cannot open the trace file %s\n", env);
+            }
+        }
         if (const char * env = getenv("LLAMA_MOE_STREAM_PROMPT_WEIGHT")) {
             prompt_weight = std::max(0.0, atof(env));
         }
@@ -681,6 +690,9 @@ struct llama_moe_stream::impl {
     }
 
     ~impl() {
+        if (trace) {
+            fclose(trace);
+        }
 #ifdef __linux__
         if (is_active) {
             log_gpu();
@@ -3084,6 +3096,16 @@ struct llama_moe_stream::impl {
         if (hot_observer) {
             hot_observer->record_routes(l.il, ids);
         }
+        if (trace) {
+            const int32_t hdr[3] = { l.il, (int32_t) k, (int32_t) n };
+            fwrite(hdr, sizeof(hdr), 1, trace);
+            for (int64_t i1 = 0; i1 < n; ++i1) {
+                for (int64_t i0 = 0; i0 < k; ++i0) {
+                    const int32_t e = *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
+                    fwrite(&e, sizeof(e), 1, trace);
+                }
+            }
+        }
 
         auto id_at = [&](int64_t i0, int64_t i1) {
             return *(const int32_t *) ((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
@@ -4460,6 +4482,9 @@ struct llama_moe_stream::impl {
             cpu_tokens   += n_tokens;
             cpu_batches  += 1;
             state_tokens += n_tokens;
+            if (trace) {
+                fflush(trace);
+            }
             if (hot_observer) {
                 hot_observer->end_batch(n_tokens, stats_interval);
             }
