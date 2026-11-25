@@ -873,6 +873,11 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
     plan.n_kv = kv_size;
 
+    // a reservation for fewer cells (ubatch_auto): the graphs attend to the rows visible after them, padded like the runtime plan
+    if (const uint32_t n_cells = llama_memory_reserve_n_cells(); n_cells > 0) {
+        plan.n_kv = std::min<int64_t>(kv_size, std::max<int64_t>(256, GGML_PAD((n_cells + ratio - 1)/ratio, 256u)));
+    }
+
     if (ubatch.n_tokens == 0) {
         return plan;
     }
