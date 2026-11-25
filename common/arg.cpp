@@ -1660,12 +1660,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("physical maximum batch size (default: %d)", params.n_ubatch),
         [](common_params & params, int value) {
             params.n_ubatch = value;
+            params.n_ubatch_set = true;
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
         {"--ubatch-auto"},
         "choose the ubatch of each prompt from the free device memory and the context the prompt needs, up to -ub "
-        "(-b stays the logical batch), instead of reserving the compute buffers of -ub for the full context [EXPERIMENTAL]",
+        "(-b without -ub), instead of reserving the compute buffers of -ub for the full context. the server cuts the "
+        "prompt batches at multiples of the chosen ubatch [EXPERIMENTAL]",
         [](common_params & params) {
             params.ubatch_auto = true;
         }

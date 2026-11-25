@@ -612,6 +612,10 @@ extern "C" {
     LLAMA_API void llama_set_n_ubatch_min_embd(struct llama_context * ctx, uint32_t n_ubatch);
     // the ubatch of the last prompt reservation (n_ubatch without ubatch_auto)
     LLAMA_API uint32_t llama_n_ubatch_cur(const struct llama_context * ctx);
+    // reserves the prompt compute buffers for a prompt batch of n_tokens before it is built, so that the caller can
+    // cut its batches at multiples of the ubatch (every ubatch costs a pass over the streamed experts)
+    // returns the ubatch, or 0 when nothing was reserved (ubatch_auto off, or a batch of the decode workspace)
+    LLAMA_API uint32_t llama_ubatch_prepare(struct llama_context * ctx, uint32_t n_tokens, bool media);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 

@@ -893,6 +893,18 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
+uint32_t llama_context::ubatch_prepare(uint32_t n_tokens, bool media) {
+    // a batch of the decode workspace has no prompt ubatch, and must not count as a small batch of the GPU tier
+    if (!ubatch_auto || cparams.training || n_tokens == 0 || (sched_decode_workspace > 0 && n_tokens <= sched_decode_workspace)) {
+        return 0;
+    }
+    n_tokens = std::min(n_tokens, cparams.n_batch);
+    if (!sched_reserve_for_batch(n_tokens, media, false)) {
+        return 0;
+    }
+    return cparams.n_ubatch;
+}
+
 bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe) {
     const bool small = !startup_probe && sched_decode_workspace > 0 && !cparams.training && n_tokens <= sched_decode_workspace;
     if (!small) {
@@ -5173,6 +5185,10 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch_cur(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+uint32_t llama_ubatch_prepare(llama_context * ctx, uint32_t n_tokens, bool media) {
+    return ctx->ubatch_prepare(n_tokens, media);
 }
 
 void llama_set_prompt_hint(llama_context * ctx, uint32_t n_tokens) {

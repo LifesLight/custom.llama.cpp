@@ -3204,6 +3204,8 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (params_spec.n_ubatch > 0) {
         result.n_ubatch = params_spec.n_ubatch;
     }
+    // the draft context keeps its fixed ubatch (-ub, not the -b default of --ubatch-auto)
+    result.ubatch_auto = false;
 
     // the MoE cache is only used by the target context
     result.moe_cache_size = 0;

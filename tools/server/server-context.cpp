@@ -1482,6 +1482,33 @@ private:
         }
     }
 
+    // ubatch_auto: the size of the prompt batches, a multiple of the ubatch the prompt runs with. every ubatch costs
+    // a pass over the streamed experts, so a batch of -b cut into [ub][rest] would cost two passes for one ub and a
+    // remainder. the ubatch is selected here, before the batch is built (after the media of a new prompt are encoded)
+    int32_t n_batch_prompt(bool starting) {
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+        if (!params_base.ubatch_auto) {
+            return n_batch;
+        }
+        int64_t n_pending = batch.size(); // the sampled and drafted tokens of the generating slots
+        bool media = false;
+        for (const auto & slot : slots) {
+            // a new prompt selects its ubatch once its cached prefix is known and its media are encoded
+            if (slot.state == SLOT_STATE_STARTED && !starting) {
+                return n_batch;
+            }
+            if (slot.is_processing() && slot.task && slot.state != SLOT_STATE_GENERATING && slot.state != SLOT_STATE_DONE_PROMPT) {
+                n_pending += std::max<int64_t>(0, (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens());
+                media = media || slot.task->tokens.has_mtmd;
+            }
+        }
+        const uint32_t n_ubatch = n_pending > 0 ? llama_ubatch_prepare(ctx_tgt, (uint32_t) std::min<int64_t>(n_pending, n_batch), media) : 0;
+        if (n_ubatch == 0 || (int32_t) n_ubatch >= n_batch) {
+            return n_batch;
+        }
+        return (n_batch / (int32_t) n_ubatch) * (int32_t) n_ubatch;
+    }
+
     // before a media encode: the tier frees its banks first, so that the projector fits where it was at load
     void restore_mmproj() {
         if (mctx != nullptr && mtmd_device_memory_released(mctx)) {
@@ -4577,9 +4604,9 @@ private:
 
         update_ubatch_hints();
 
-        // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
-        int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        // process in chunks of params.n_batch (with ubatch_auto, of the multiple of the prompt ubatch)
+        int32_t n_batch  = n_batch_prompt(false);
+        int32_t n_ubatch = params_base.ubatch_auto ? llama_n_ubatch_cur(ctx_tgt) : llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -4920,6 +4947,12 @@ private:
                                 return;
                             }
                             update_ubatch_hints();
+                        }
+
+                        // the ubatch of the new prompt, with the projector released
+                        if (params_base.ubatch_auto && batch.size() == 0) {
+                            n_batch  = n_batch_prompt(true);
+                            n_ubatch = llama_n_ubatch_cur(ctx_tgt);
                         }
 
                         // this is to signal the client that the request has started processing

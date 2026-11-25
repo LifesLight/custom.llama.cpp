@@ -458,6 +458,7 @@ public:
     void set_device_reserve(ggml_backend_dev_t dev, size_t size) { ubatch_dev_reserve[dev] = size; }
     void set_n_ubatch_min_embd(uint32_t n) { ubatch_min_embd = n; }
     uint32_t n_ubatch_max() const { return ubatch_auto ? ubatch_max : cparams.n_ubatch; }
+    uint32_t ubatch_prepare(uint32_t n_tokens, bool media);
 
 private:
 
