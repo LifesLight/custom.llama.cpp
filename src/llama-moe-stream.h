@@ -4,7 +4,6 @@
 
 #include "ggml-backend.h"
 
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -73,8 +72,6 @@ public:
     bool cpu_batch(int64_t tokens) const;
     // the CPU path takes batches of up to that many tokens, if the cache allows, true if it changed
     bool set_hot_cpu_max(int64_t tokens);
-    // finish the prefetches, so that the cache can change
-    void quiesce_hot();
 
     //
     // lending RAM out, e.g. while the GPUs are suspended for another program: between synchronized graphs
@@ -91,13 +88,6 @@ public:
     // free slots left, and of the released ones while they are taken back (0: nothing more to fill)
     size_t fill_free(size_t bytes);
 
-    using expert_writer = std::function<void(const ggml_tensor *, const void *, size_t)>;
-    // the tensors of an expert, from the RAM cache or read from the model file, false if not streamed
-    bool with_expert(int il, int expert, const expert_writer & writer);
-    // the tensors of the experts (il, expert) for writer(index, ...): from the RAM cache, the others read from the
-    // model file in parallel, while the previous ones are written. false if one is not streamed
-    using expert_batch_writer = std::function<void(size_t, const ggml_tensor *, const void *, size_t)>;
-    bool with_experts(const std::vector<std::pair<int, int>> & experts, const expert_batch_writer & writer);
     // the experts of the tier changed
     void hot_changed();
     // expert e of layer il joined or left the tier: its RAM copy, if any, changes place in the eviction order
