@@ -1087,7 +1087,10 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
-    LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+    // the first reservation of the context at info, the later ones at debug: with workspace switching, ubatch_auto
+    // and the GPU tier they repeat several times per prompt, and the workspace_switch lines already show them
+    const ggml_log_level log_lvl = sched_reserved ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_INFO;
+    llama_log_internal(log_lvl, "%s: reserving ...\n", __func__);
 
     synchronize();
 
@@ -1312,7 +1315,7 @@ void llama_context::sched_reserve() {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
-            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+            llama_log_internal(log_lvl, "%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
@@ -1333,7 +1336,7 @@ void llama_context::sched_reserve() {
             return diff ? format("%d / %d", v_pp, v_tg) : format("%d", v_pp);
         };
 
-        LLAMA_LOG_INFO("%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s\n",
+        llama_log_internal(log_lvl, "%s: graph%s: nodes = %s, splits = %s, input objects = %s, input tensors = %s\n",
                 __func__,
                 diff ? format(" (pp bs=%d, tg bs=%d)", n_tokens, n_seqs).c_str() : "",
                 val(n_nodes_pp, n_nodes_tg).c_str(),
@@ -1344,8 +1347,9 @@ void llama_context::sched_reserve() {
 
     const int64_t t_end_us = ggml_time_us();
 
-    LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
+    llama_log_internal(log_lvl, "%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    sched_reserved = true;
     if (switching) {
         LLAMA_LOG_INFO("workspace_switch: context=%p mode=%s ready in %.2f ms\n",
                 (void *) this, sched_workspace_small ? "small" : "large", (t_end_us - t_start_us)/1000.0);

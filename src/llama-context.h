@@ -433,6 +433,7 @@ private:
     sched_params sched_params_cur;
 
     bool sched_need_reserve = true;
+    bool sched_reserved     = false; // a reservation was logged at info
 
     // decode workspace switching (LLAMA_DECODE_WORKSPACE): batches of up to that many tokens use a small workspace
     uint32_t sched_decode_workspace   = 0;

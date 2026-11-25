@@ -33,7 +33,7 @@ server_prompt_reuse server_prompt::get_reuse(int32_t n_prefix, bool has_new_toke
         [&](const auto & ckpt) {
             const auto & cur = *ckpt;
             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-            SRV_TRC("checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+            SRV_DBG("checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
             if (cur.pos_max > res.pos_next) {
                 return false;
