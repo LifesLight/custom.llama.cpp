@@ -370,6 +370,9 @@ struct llama_moe_stream::impl {
     std::thread          grow_thread;
     std::atomic<bool>    grow_stop    { false };
     std::atomic<bool>    grow_running { false };
+    std::atomic<bool>    grow_waiting { false }; // grow_thread waits for RAM above the reserve
+    std::mutex              grow_mtx;
+    std::condition_variable grow_cv;               // wakes grow_thread up for grow_stop
     size_t               filled       = 0;   // bytes of free slots filled by fill_free since the last grow
     size_t               taken        = 0;   // bytes of free slots taken by misses since the last grow, swapped by fill_free
     double               t_filled     = 0.0;
@@ -723,10 +726,7 @@ struct llama_moe_stream::impl {
         if (thp_thread.joinable()) {
             thp_thread.join();
         }
-        grow_stop = true;
-        if (grow_thread.joinable()) {
-            grow_thread.join();
-        }
+        stop_grow();
 
 #ifdef __linux__
         for (auto & s : slots) {
@@ -1577,7 +1577,11 @@ struct llama_moe_stream::impl {
     }
 
     void stop_grow() {
-        grow_stop = true;
+        {
+            std::lock_guard<std::mutex> lk(grow_mtx);
+            grow_stop = true;
+        }
+        grow_cv.notify_all();
         if (grow_thread.joinable()) {
             grow_thread.join();
         }
@@ -1764,11 +1768,15 @@ struct llama_moe_stream::impl {
     }
 
     // grow_thread: fault in the released slots chunk by chunk (no read), each chunk free for the misses as soon as it
-    // is in, as far as the available RAM minus the reserve allows
+    // is in. while the available RAM is down to the reserve (e.g. the buffers of a prompt) it waits for RAM to come
+    // back, until all of it is taken back or a shrink stops it
     void regrow() {
-        constexpr size_t CHUNK = 256u*1024*1024;
+        constexpr size_t CHUNK   = 256u*1024*1024;
+        constexpr int    POLL_MS = 1000;
         const double t0 = t_now();
-        size_t grown = 0;
+        size_t grown    = 0;
+        double t_waited = 0.0;
+        bool   logged   = false;
         std::string why;
         for (size_t pi = 0; pi < pools.size() && !grow_stop && why.empty(); ++pi) {
             const auto & p = pools[pi];
@@ -1782,9 +1790,21 @@ struct llama_moe_stream::impl {
                 const int64_t b = std::min(p.n_phys, a + step);
                 const size_t avail = mem_available() + arc_evictable();
                 if (avail < ram_reserve + (size_t) (b - a)*sb) {
-                    why = "the available RAM is down to the reserve";
-                    break;
+                    if (!logged) {
+                        logged = true;
+                        LLAMA_LOG_INFO("moe_stream: grow: took back %.2f GiB, the available RAM is down to the reserve (%.2f GiB available), waiting for it to take back %.2f GiB more\n",
+                                grown/GiB, avail/GiB, lent_bytes()/GiB);
+                    }
+                    grow_waiting = true;
+                    const double tw = t_now();
+                    {
+                        std::unique_lock<std::mutex> lk(grow_mtx);
+                        grow_cv.wait_for(lk, std::chrono::milliseconds(POLL_MS), [this] { return grow_stop.load(); });
+                    }
+                    t_waited += t_now() - tw;
+                    continue;
                 }
+                grow_waiting = false;
                 bool ok = true;
                 for (int idx : roles) {
                     const auto & ti = tensors[idx];
@@ -1819,13 +1839,14 @@ struct llama_moe_stream::impl {
             }
         }
         const size_t lent = lent_bytes();
-        if (lent > 0 && !grow_stop) {
+        if (!why.empty()) {
             LLAMA_LOG_WARN("moe_stream: grow: took back %.2f GiB in %.2f s, %.2f GiB stay released: %s (%.2f GiB available)%s\n",
                     grown/GiB, t_now() - t0, lent/GiB, why.c_str(), mem_available()/GiB, thp_note().c_str());
         } else {
-            LLAMA_LOG_INFO("moe_stream: grow: took back %.2f GiB of the expert cache in %.2f s in the background (%.2f GiB still released), %.2f GiB available%s\n",
-                    grown/GiB, t_now() - t0, lent/GiB, mem_available()/GiB, thp_note().c_str());
+            LLAMA_LOG_INFO("moe_stream: grow: took back %.2f GiB of the expert cache in %.2f s in the background (%.2f s of it waiting for RAM, %.2f GiB still released), %.2f GiB available%s\n",
+                    grown/GiB, t_now() - t0, t_waited, lent/GiB, mem_available()/GiB, thp_note().c_str());
         }
+        grow_waiting = false;
         grow_running = false;
     }
 
@@ -1861,7 +1882,8 @@ struct llama_moe_stream::impl {
         if (policy != LLAMA_MOE_STREAM_POLICY_LFU) {
             taken = 0;
         }
-        const auto left = [&] { return free_bytes() + (grow_running ? lent_bytes() : 0) + taken; };
+        // the RAM the thread waits for is filled by the misses, or by the next idle period, once it is in
+        const auto left = [&] { return free_bytes() + (grow_running && !grow_waiting ? lent_bytes() : 0) + taken; };
         if ((free_bytes() == 0 && taken == 0) || !cache_quiet()) {
             return left();
         }
