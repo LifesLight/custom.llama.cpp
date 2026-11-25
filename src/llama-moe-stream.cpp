@@ -1019,6 +1019,86 @@ struct llama_moe_stream::impl {
         return size > c_min ? (size_t) (size - c_min) : 0;
     }
 
+    // the RAM that the cgroup v2 memory limits of the process (its cgroup and the parents) still allow, SIZE_MAX if
+    // none. MemAvailable does not see them: in a container, a cache sized from it alone is OOM-killed
+    static size_t cgroup_available() {
+        std::string path;
+        if (FILE * f = fopen("/proc/self/cgroup", "r")) {
+            char line[4096];
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "0::", 3) == 0) {
+                    path = line + 3;
+                    while (!path.empty() && (path.back() == '\n' || path.back() == '/')) {
+                        path.pop_back();
+                    }
+                    break;
+                }
+            }
+            fclose(f);
+        }
+        if (!path.empty() && path[0] != '/') {
+            return SIZE_MAX;
+        }
+        // the value of a key of a cgroup file (the first word without key), false if absent or not a number ("max")
+        auto read_value = [](const std::string & file, const char * key, uint64_t & value) {
+            FILE * f = fopen(file.c_str(), "r");
+            if (!f) {
+                return false;
+            }
+            char line[256];
+            bool found = false;
+            const size_t n = key ? strlen(key) : 0;
+            while (!found && fgets(line, sizeof(line), f)) {
+                if (key && (strncmp(line, key, n) != 0 || line[n] != ' ')) {
+                    continue;
+                }
+                char * end = nullptr;
+                const char * p = line + (key ? n + 1 : 0);
+                const unsigned long long v = strtoull(p, &end, 10);
+                found = end != p;
+                value = v;
+                if (!key) {
+                    break;
+                }
+            }
+            fclose(f);
+            return found;
+        };
+        size_t res = SIZE_MAX;
+        for (;;) {
+            const std::string dir = "/sys/fs/cgroup" + path;
+            uint64_t limit = UINT64_MAX;
+            for (const char * name : { "/memory.max", "/memory.high" }) {
+                uint64_t v = 0;
+                if (read_value(dir + name, nullptr, v)) {
+                    limit = std::min(limit, v);
+                }
+            }
+            uint64_t current = 0;
+            if (limit != UINT64_MAX && read_value(dir + "/memory.current", nullptr, current)) {
+                // the inactive page cache is reclaimed before the limit is hit
+                uint64_t inactive_file = 0;
+                read_value(dir + "/memory.stat", "inactive_file", inactive_file);
+                const uint64_t used = current - std::min(current, inactive_file);
+                res = std::min<uint64_t>(res, limit - std::min(limit, used));
+            }
+            if (path.empty()) {
+                break;
+            }
+            path.resize(path.rfind('/'));
+        }
+        return res;
+    }
+
+    // the RAM the cache can still take: MemAvailable with the evictable ZFS ARC, within the cgroup limits
+    static size_t ram_available(size_t * arc_out = nullptr) {
+        const size_t arc = arc_evictable();
+        if (arc_out) {
+            *arc_out = arc;
+        }
+        return std::min(mem_available() + arc, cgroup_available());
+    }
+
     // the size of a staging buffer for the experts of a tensor that are not cached: each is read as its own
     // aligned range of the file, which can need up to 2 alignment blocks more
     size_t max_slot_bytes(const tensor & ti, int64_t n_cached) const {
@@ -1052,15 +1132,19 @@ struct llama_moe_stream::impl {
         if (resident == SIZE_MAX) {
             // what is available, minus the reserve, the staging buffers (which shrink as more experts are cached)
             // and the bounce buffers of the IO threads
-            const size_t arc    = arc_evictable();
-            const size_t avail  = mem_available() + arc;
+            size_t arc = 0;
+            const size_t avail  = ram_available(&arc);
+            const size_t cg     = cgroup_available();
             const size_t bounce = n_threads*(BOUNCE_CHUNK + 2*STREAM_ALIGN);
             frac = 0.0;
             for (int i = 0; i < 8; ++i) {
                 const double budget = (double) avail - (double) reserve - (double) staging_size(frac) - (double) bounce;
                 frac = std::clamp(budget / (double) total, 0.0, 1.0);
             }
-            if (arc > 0) {
+            if (cg != SIZE_MAX && cg <= avail) {
+                LLAMA_LOG_INFO("moe_stream: auto size: %.2f GiB available (cgroup memory limit), %.2f GiB reserved\n",
+                        avail/GiB, reserve/GiB);
+            } else if (arc > 0) {
                 LLAMA_LOG_INFO("moe_stream: auto size: %.2f GiB available (%.2f GiB of it ZFS ARC), %.2f GiB reserved\n",
                         avail/GiB, arc/GiB, reserve/GiB);
             } else {
@@ -1788,7 +1872,7 @@ struct llama_moe_stream::impl {
             const int64_t step = std::max<int64_t>(1, (int64_t) (CHUNK/sb));
             for (int64_t a = ready[pi].load(); a < p.n_phys && !grow_stop; ) {
                 const int64_t b = std::min(p.n_phys, a + step);
-                const size_t avail = mem_available() + arc_evictable();
+                const size_t avail = ram_available();
                 if (avail < ram_reserve + (size_t) (b - a)*sb) {
                     if (!logged) {
                         logged = true;
