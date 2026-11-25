@@ -1252,6 +1252,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
 
     auto mparams_dft = common_model_params_to_llama(params_dft);
     auto cparams_dft = common_context_params_to_llama(params_dft);
+    cparams_dft.ubatch_auto = false;
     if (spec_mtp) {
         cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
@@ -1747,6 +1748,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+    cparams.ubatch_auto       = params.ubatch_auto;
+    cparams.ubatch_auto_margin = (size_t) std::max(params.ubatch_auto_margin, 0)*1024*1024;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

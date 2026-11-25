@@ -1452,6 +1452,30 @@ private:
     // the projector cannot be released, see mtmd_release_device_memory()
     bool mmproj_resident = false;
 
+    // ubatch_auto: the memory of the projector on its devices (weights and compute buffers), and the ubatch an image
+    // needs to stay in one ubatch
+    std::map<ggml_backend_dev_t, size_t> mmproj_dev_mem;
+    uint32_t mmproj_ubatch_min = 0;
+
+    // ubatch_auto: before the batches of the prompts, the cells they end at, and the device memory the projector
+    // takes back when it is restored for a media chunk of a prompt
+    void update_ubatch_hints() {
+        uint32_t n_hint = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing() && slot.task) {
+                n_hint += (uint32_t) std::max<size_t>(slot.task->n_tokens(), slot.prompt.n_tokens());
+            }
+        }
+        llama_set_prompt_hint(ctx_tgt, n_hint);
+
+        if (mctx != nullptr && !mmproj_resident) {
+            const bool restore_ahead = mtmd_device_memory_released(mctx) && std::any_of(slots.begin(), slots.end(), slot_has_media_ahead);
+            for (const auto & [dev, size] : mmproj_dev_mem) {
+                llama_set_device_reserve(ctx_tgt, dev, restore_ahead ? size : 0);
+            }
+        }
+    }
+
     // before a media encode: the tier frees its banks first, so that the projector fits where it was at load
     void restore_mmproj() {
         if (mctx != nullptr && mtmd_device_memory_released(mctx)) {
@@ -1565,7 +1589,10 @@ private:
         int64_t mmproj_usage_t_us = 0;
         if (has_mmproj) {
             int64_t t_start = ggml_time_us();
-            mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+            // the compute buffers of the projector are only measured with the warmup reservation (nothing is allocated)
+            mtmd_context_params mparams_usage = mparams;
+            mparams_usage.warmup = true;
+            mmproj_usage = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_usage);
             mmproj_usage_t_us = ggml_time_us() - t_start;
         }
 
@@ -1694,8 +1721,14 @@ private:
                         mparams.video_image_max_tokens = n_max;
                         mparams.video_image_min_tokens = std::min(mparams.video_image_min_tokens > 0 ? mparams.video_image_min_tokens : mparams.image_min_tokens, n_max);
                     }
+
+                    // ubatch_auto: the ubatch of a batch with media stays large enough for the largest image
+                    const int n_img = std::min(n_max, std::max(mmproj_usage.image_max_tokens, mmproj_usage.video_image_max_tokens));
+                    mmproj_ubatch_min = n_img > 0 ? (uint32_t) (is_mixed ? 2*n_img : n_img) : (uint32_t) n_ubatch;
                 }
+                llama_set_n_ubatch_min_embd(ctx_tgt, mmproj_ubatch_min);
             }
+            mmproj_dev_mem = mmproj_usage.backend_mem_usage;
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
             if (mctx == nullptr) {
@@ -4443,6 +4476,8 @@ private:
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+
+        update_ubatch_hints();
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);

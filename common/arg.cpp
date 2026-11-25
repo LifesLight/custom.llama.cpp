@@ -1663,6 +1663,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--ubatch-auto"},
+        "choose the ubatch of each prompt from the free device memory and the context the prompt needs, up to -ub "
+        "(-b stays the logical batch), instead of reserving the compute buffers of -ub for the full context [EXPERIMENTAL]",
+        [](common_params & params) {
+            params.ubatch_auto = true;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_AUTO"));
+    add_opt(common_arg(
+        {"--ubatch-auto-margin"}, "MiB",
+        string_format("with --ubatch-auto, device memory left free by the compute buffers of a prompt (default: %d)", params.ubatch_auto_margin),
+        [](common_params & params, int value) {
+            params.ubatch_auto_margin = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_AUTO_MARGIN"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

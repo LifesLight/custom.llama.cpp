@@ -159,3 +159,18 @@ struct llama_memory_i {
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
+
+// the number of cells of a sequence that the graphs reserved with init_full() plan for, instead of the full cache
+// (ubatch_auto), 0 = the full cache. the KV caches whose graphs attend to the used cells only respect it, set for the
+// current thread while the scope lives
+uint32_t llama_memory_reserve_n_cells();
+
+struct llama_memory_reserve_scope {
+    explicit llama_memory_reserve_scope(uint32_t n_cells);
+    ~llama_memory_reserve_scope();
+
+    llama_memory_reserve_scope(const llama_memory_reserve_scope &) = delete;
+    llama_memory_reserve_scope & operator=(const llama_memory_reserve_scope &) = delete;
+
+    uint32_t prev;
+};

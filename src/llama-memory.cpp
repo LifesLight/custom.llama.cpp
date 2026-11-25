@@ -8,6 +8,20 @@
 #include <string>
 #include <vector>
 
+static thread_local uint32_t g_reserve_n_cells = 0;
+
+uint32_t llama_memory_reserve_n_cells() {
+    return g_reserve_n_cells;
+}
+
+llama_memory_reserve_scope::llama_memory_reserve_scope(uint32_t n_cells) : prev(g_reserve_n_cells) {
+    g_reserve_n_cells = n_cells;
+}
+
+llama_memory_reserve_scope::~llama_memory_reserve_scope() {
+    g_reserve_n_cells = prev;
+}
+
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
     bool has_update = false;
 

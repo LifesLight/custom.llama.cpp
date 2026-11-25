@@ -374,6 +374,13 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // the ubatch of the prompts adapts to the free device memory, n_ubatch is its maximum. not for the contexts that
+    // depend on another one (MTP, draft models), they keep their small fixed ubatch
+    ubatch_auto   = params.ubatch_auto && cparams.causal_attn && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+                    params.ctx_other == nullptr;
+    ubatch_max    = cparams.n_ubatch;
+    ubatch_margin = params.ubatch_auto_margin;
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -466,7 +473,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
-    LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
+    LLAMA_LOG_INFO("%s: n_ubatch              = %u%s\n", __func__, cparams.n_ubatch, ubatch_auto ? " (maximum, ubatch_auto)" : "");
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -699,7 +706,10 @@ llama_context::llama_context(
             LLAMA_LOG_WARN("moe_hot: disabled: requires decode workspace switching\n");
         }
 
+        ubatch_startup = ubatch_auto;
+        ubatch_need    = ubatch_auto ? std::min<uint32_t>(cparams.n_ctx, 4096) : 0;
         sched_reserve();
+        ubatch_startup = false;
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -910,6 +920,51 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
         sched_need_reserve = true;
     }
 
+    // ubatch_auto: the prompt workspace plans for the cells after this batch (or the hint of the whole prompt),
+    // rounded up so that the next batches of the prompt fit too. reserved again when it no longer covers them
+    if (ubatch_auto && !small && !cparams.training) {
+        uint32_t need = ubatch_hint;
+        if (memory) {
+            uint64_t used = 0;
+            for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
+                const llama_pos p0 = memory->seq_pos_min(s);
+                const llama_pos p1 = memory->seq_pos_max(s);
+                if (p1 >= 0 && p0 >= 0) {
+                    used += (uint64_t) (p1 - p0) + 1;
+                }
+            }
+            // with several positions per embedding (M-RoPE), the positions can count fewer cells than the tokens
+            const bool pos_cells = model.hparams.n_pos_per_embd() == 1 || ubatch_hint > 0;
+            need = pos_cells ? (uint32_t) std::min<uint64_t>(std::max<uint64_t>(need, used + n_tokens), UINT32_MAX) : UINT32_MAX;
+        }
+        const uint32_t step = 4096;
+        need = need >= cparams.n_ctx ? 0 : std::min(GGML_PAD(need, step), cparams.n_ctx);
+        if (need >= cparams.n_ctx) {
+            need = 0;
+        }
+
+        // a non-causal batch must stay in one ubatch
+        uint32_t need_min = media ? ubatch_min_embd : 0;
+        if (!cparams.causal_attn) {
+            need_min = std::max(need_min, n_tokens);
+        }
+
+        const bool covered = ubatch_res_valid && (ubatch_res_cells == 0 || (need > 0 && need <= ubatch_res_cells)) &&
+            cparams.n_ubatch >= std::min(need_min, ubatch_max);
+        if (sched_need_reserve || !covered) {
+            if (!sched_need_reserve) {
+                LLAMA_LOG_INFO("%s: ubatch_auto: the prompt needs %s cells (reserved: %s), reserving again\n", __func__,
+                        need > 0 ? std::to_string(need).c_str() : "all",
+                        ubatch_res_cells > 0 ? std::to_string(ubatch_res_cells).c_str() : "all");
+                // with workspace switching, the old buffers are freed first, so that the new ones can take their memory
+                sched_workspace_recreate = sched_workspace_recreate || sched_decode_workspace > 0;
+                sched_need_reserve = true;
+            }
+            ubatch_need     = need;
+            ubatch_need_min = need_min;
+        }
+    }
+
     // falls back to the streamed experts: the tier is released with the workspace
     auto drop_hot = [&](const char * what, const std::exception & e) {
         LLAMA_LOG_WARN("moe_hot: %s failed (%s), using the streamed experts\n", what, e.what());
@@ -1015,8 +1070,12 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx,
-            sched_workspace_small && !cparams.training ? sched_decode_workspace : cparams.n_ubatch);
+
+    // ubatch_auto: the prompt workspace takes the largest ubatch that fits, for the cells the prompt needs
+    const bool ub_sel = ubatch_auto && !sched_workspace_small && !cparams.training;
+
+    uint32_t n_tokens = std::min(cparams.n_ctx,
+            sched_workspace_small && !cparams.training ? sched_decode_workspace : (ub_sel ? ubatch_max : cparams.n_ubatch));
 
     const bool switching = sched_workspace_recreate;
     std::vector<size_t> old_sizes;
@@ -1066,6 +1125,10 @@ void llama_context::sched_reserve() {
         /*.op_offload =*/ cparams.op_offload,
     });
 
+    // ubatch_auto: the graphs of the prompt workspace attend to the cells the prompt needs, not to the full context
+    const uint32_t n_cells_res = ub_sel ? ubatch_need : 0;
+    llama_memory_reserve_scope reserve_scope(n_cells_res);
+
     llama_memory_context_ptr mctx;
     if (memory) {
         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
@@ -1078,9 +1141,53 @@ void llama_context::sched_reserve() {
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
 
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
-
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    // debug: the compute buffer sizes of a grid of cells and ubatches, once (LLAMA_UBATCH_AUTO_PROBE=c1,c2,..:u1,u2,..)
+    static bool probed = false;
+    if (ub_sel && !ubatch_startup && !probed && memory && getenv("LLAMA_UBATCH_AUTO_PROBE")) {
+        probed = true;
+        const std::string spec = getenv("LLAMA_UBATCH_AUTO_PROBE");
+        auto parse = [](const std::string & str) {
+            std::vector<uint32_t> v;
+            size_t p = 0;
+            while (p < str.size()) {
+                const size_t q = std::min(str.find(',', p), str.size());
+                v.push_back((uint32_t) std::stoul(str.substr(p, q - p)));
+                p = q + 1;
+            }
+            return v;
+        };
+        const size_t colon = spec.find(':');
+        for (const uint32_t c : parse(spec.substr(0, colon))) {
+            llama_memory_reserve_scope scope_probe(c >= cparams.n_ctx ? 0 : c);
+            const auto mctx_probe = memory->init_full();
+            for (const uint32_t u : parse(colon == std::string::npos ? "" : spec.substr(colon + 1))) {
+                const int64_t t0 = ggml_time_us();
+                std::vector<size_t> sz;
+                ubatch_sizes(mctx_probe.get(), n_seqs, std::min(u, cparams.n_ctx), sz);
+                std::string str;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    str += format(" %s=%.2f", ggml_backend_name(backend_ptrs[i]), sz[i]/1048576.0);
+                }
+                LLAMA_LOG_INFO("%s: ubatch_auto probe: cells=%u ubatch=%u MiB:%s (%.0f ms)\n", __func__, c, u, str.c_str(), (ggml_time_us() - t0)/1000.0);
+            }
+        }
+    }
+
+    const uint32_t ub_min = std::min(n_tokens, std::max<uint32_t>(ubatch_need_min, 1));
+    if (ub_sel && ubatch_startup) {
+        // at load, before the other allocations of the device memory (draft contexts, projector, ...): a small
+        // provisional workspace, the first prompt reserves its own
+        n_tokens = std::min(n_tokens, 512u);
+    } else if (ub_sel) {
+        n_tokens = ubatch_select(mctx.get(), n_seqs, ub_min);
+    }
+    if (ub_sel) {
+        cparams.n_ubatch = n_tokens;
+    }
+
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     // reserve worst-case graph
     int n_splits_pp        = -1;
@@ -1093,12 +1200,21 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
                 model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+        // ubatch_auto: the free memory was not enough after all (fragmentation, another process), a smaller ubatch
+        while (!gf && ub_sel && n_tokens > ub_min) {
+            const uint32_t n_prev = n_tokens;
+            n_tokens = std::max(ub_min, n_tokens > 256 ? (n_tokens - 1)/256*256 : ub_min);
+            n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+            cparams.n_ubatch = n_tokens;
+            LLAMA_LOG_WARN("%s: ubatch_auto: the compute buffers of n_ubatch = %u failed to allocate, trying %u\n", __func__, n_prev, n_tokens);
+            gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+        }
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -1161,6 +1277,9 @@ void llama_context::sched_reserve() {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
     }
+
+    ubatch_res_cells = n_cells_res;
+    ubatch_res_valid = ub_sel && !ubatch_startup;
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
@@ -1330,6 +1449,9 @@ bool llama_context::memory_update(bool optimize) {
         sched_workspace_recreate = true;
         sched_reserve();
     } else {
+        // ubatch_auto: the cells of the prompt reservation
+        llama_memory_reserve_scope reserve_scope(ubatch_res_valid ? ubatch_res_cells : 0);
+
         const auto mctx = memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");
@@ -3376,6 +3498,86 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+void llama_context::ubatch_sizes(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_ubatch, std::vector<size_t> & sizes) {
+    sizes.assign(backend_ptrs.size(), 0);
+    const uint32_t n_outputs = std::min(n_ubatch, cparams.n_outputs_max);
+    graph_reserve(n_ubatch, n_seqs, n_outputs, mctx, true, sizes.data());
+}
+
+uint32_t llama_context::ubatch_select(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_min) {
+    const int64_t t_start_us = ggml_time_us();
+
+    // the memory the compute buffers may take on each device: what is free, plus the buffers of this scheduler
+    // (replaced by the reservation), minus the margin and the memory reserved for others
+    std::vector<int64_t> budget(backend_ptrs.size(), INT64_MAX);
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        const auto it = ubatch_dev_reserve.find(dev);
+        budget[i] = (int64_t) free + (int64_t) ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) -
+            (int64_t) ubatch_margin - (int64_t) (it != ubatch_dev_reserve.end() ? it->second : 0);
+    }
+
+    std::vector<size_t> sizes;
+    int n_tries = 0;
+    auto fits = [&](uint32_t n_ubatch) {
+        n_tries++;
+        ubatch_sizes(mctx, n_seqs, n_ubatch, sizes);
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if ((int64_t) sizes[i] > budget[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // multiples of 256 (the flash attention kernels like them), and the maximum itself
+    const uint32_t step  = 256;
+    const uint32_t n_max = std::min(ubatch_max, cparams.n_ctx);
+    n_min = std::min(n_min, n_max);
+
+    uint32_t res = n_min;
+    if (fits(n_max)) {
+        res = n_max;
+    } else if (n_min < n_max && fits(n_min)) {
+        // the largest fitting multiple of step in (n_min, n_max)
+        uint32_t lo = (n_min + step - 1)/step; // in units of step, lo*step may equal n_min
+        uint32_t hi = (n_max - 1)/step;        // hi*step < n_max
+        res = n_min;
+        while (lo <= hi) {
+            const uint32_t mid = (lo + hi)/2;
+            if (mid*step > n_min && fits(mid*step)) {
+                res = mid*step;
+                lo  = mid + 1;
+            } else if (mid*step <= n_min) {
+                lo  = mid + 1;
+            } else {
+                hi  = mid - 1;
+            }
+        }
+    } else {
+        LLAMA_LOG_WARN("%s: ubatch_auto: even n_ubatch = %u does not fit in the free device memory, trying it anyway\n", __func__, n_min);
+    }
+
+    std::string mem;
+    ubatch_sizes(mctx, n_seqs, res, sizes);
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (budget[i] != INT64_MAX) {
+            mem += format(" %s %.0f/%.0f MiB", ggml_backend_name(backend_ptrs[i]), sizes[i]/1048576.0, budget[i]/1048576.0);
+        }
+    }
+    LLAMA_LOG_INFO("%s: ubatch_auto: n_ubatch = %u for %s cells (compute/budget:%s), %d graphs in %.0f ms\n", __func__,
+            res, ubatch_need > 0 ? std::to_string(ubatch_need).c_str() : "all", mem.c_str(), n_tries + 1,
+            (ggml_time_us() - t_start_us)/1000.0);
+
+    return res;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -4785,6 +4987,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_stream_policy           =*/ LLAMA_MOE_STREAM_POLICY_LRU,
         /*.moe_stream_state            =*/ nullptr,
         /*.moe_stream_pool             =*/ -1.0f,
+        /*.ubatch_auto_margin          =*/ 256ull*1024*1024,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4792,6 +4995,7 @@ llama_context_params llama_context_default_params() {
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
+        /*.ubatch_auto                 =*/ false,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
@@ -4964,7 +5168,23 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 }
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
+    return ctx->n_ubatch_max();
+}
+
+uint32_t llama_n_ubatch_cur(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+void llama_set_prompt_hint(llama_context * ctx, uint32_t n_tokens) {
+    ctx->set_prompt_hint(n_tokens);
+}
+
+void llama_set_device_reserve(llama_context * ctx, ggml_backend_dev_t dev, size_t size) {
+    ctx->set_device_reserve(dev, size);
+}
+
+void llama_set_n_ubatch_min_embd(llama_context * ctx, uint32_t n_ubatch) {
+    ctx->set_n_ubatch_min_embd(n_ubatch);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

@@ -324,6 +324,12 @@ private:
     // switch the workspace for a batch of n_tokens (small or large), and manage the GPU expert tier, false on failure
     bool sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe);
 
+    // ubatch_auto: the largest ubatch from n_min to ubatch_max whose compute buffers fit in the free device memory,
+    // for the graphs of mctx (see ubatch_cells); n_min if none fits
+    uint32_t ubatch_select(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_min);
+    // ubatch_auto: compute buffer sizes per backend of the prompt graph of n_ubatch tokens, without allocating them
+    void ubatch_sizes(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_ubatch, std::vector<size_t> & sizes);
+
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -431,6 +437,29 @@ private:
     uint32_t sched_decode_workspace   = 0;
     bool     sched_workspace_small    = false;
     bool     sched_workspace_recreate = false; // free the scheduler before the next reservation
+
+    // ubatch_auto: each reservation of the prompt workspace takes the largest ubatch up to ubatch_max that fits in the
+    // free device memory, with the graphs attending to the cells the prompt needs (ubatch_need) instead of the full
+    // context
+    bool     ubatch_auto       = false;
+    uint32_t ubatch_max        = 0;     // n_ubatch of the params
+    size_t   ubatch_margin     = 0;     // device memory left free
+    uint32_t ubatch_min_embd   = 0;     // llama_set_n_ubatch_min_embd
+    uint32_t ubatch_hint       = 0;     // llama_set_prompt_hint
+    uint32_t ubatch_need       = 0;     // cells the next prompt reservation plans for, 0 = the full context
+    uint32_t ubatch_need_min   = 0;     // smallest ubatch of the next prompt reservation
+    uint32_t ubatch_res_cells  = 0;     // cells the current prompt reservation plans for, 0 = the full context
+    bool     ubatch_res_valid  = false; // the prompt workspace is reserved with these
+    bool     ubatch_startup    = false; // the provisional reservation at load
+    std::map<ggml_backend_dev_t, size_t> ubatch_dev_reserve; // llama_set_device_reserve
+
+public:
+    void set_prompt_hint(uint32_t n_tokens) { ubatch_hint = n_tokens; }
+    void set_device_reserve(ggml_backend_dev_t dev, size_t size) { ubatch_dev_reserve[dev] = size; }
+    void set_n_ubatch_min_embd(uint32_t n) { ubatch_min_embd = n; }
+    uint32_t n_ubatch_max() const { return ubatch_auto ? ubatch_max : cparams.n_ubatch; }
+
+private:
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

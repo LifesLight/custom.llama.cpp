@@ -3133,6 +3133,11 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
+    // a reservation for fewer cells (ubatch_auto): the graphs attend to the used cells, padded like get_n_kv()
+    if (const uint32_t n_cells = llama_memory_reserve_n_cells(); n_cells > 0) {
+        n_kv = std::min<uint32_t>(n_kv, std::max<uint32_t>(256, GGML_PAD(n_cells, 256)));
+    }
+
     // worst case for graph reservation, only a unified cache splits into per-sequence lists
     n_kv_rows = kv->get_n_stream() == 1 ? n_kv : 0;
 
