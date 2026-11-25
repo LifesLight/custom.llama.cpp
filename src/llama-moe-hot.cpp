@@ -376,21 +376,28 @@ struct llama_moe_hot::impl {
             }
         }
 
-        // the copy threads, then the seeds as transfers, most used first
-        for (auto & d : devices) {
-            if (d.groups.empty()) {
-                continue;
-            }
-            d.retire_ev = ggml_backend_event_new(d.dev);
-            for (int i = 0; i < HOT_COPIERS; ++i) {
-                d.copies.push_back(ggml_backend_dev_init(d.dev, nullptr));
-                if (!d.copies.back() || !d.retire_ev) {
-                    throw std::runtime_error("moe_hot: copy stream unavailable");
+        // the copy threads, then the seeds as transfers, most used first. the destructor does not run if the
+        // constructor throws: the threads already started must be joined here
+        try {
+            for (auto & d : devices) {
+                if (d.groups.empty()) {
+                    continue;
+                }
+                d.retire_ev = ggml_backend_event_new(d.dev);
+                for (int i = 0; i < HOT_COPIERS; ++i) {
+                    d.copies.push_back(ggml_backend_dev_init(d.dev, nullptr));
+                    if (!d.copies.back() || !d.retire_ev) {
+                        throw std::runtime_error("moe_hot: copy stream unavailable");
+                    }
+                }
+                for (ggml_backend_t copy : d.copies) {
+                    d.threads.emplace_back([this, &d, copy] { copy_thread(d, copy); });
                 }
             }
-            for (ggml_backend_t copy : d.copies) {
-                d.threads.emplace_back([this, &d, copy] { copy_thread(d, copy); });
-            }
+        } catch (...) {
+            stop_threads();
+            free_streams();
+            throw;
         }
         for (const auto & p : plan) {
             auto & l = layers[p.il];
@@ -427,7 +434,7 @@ struct llama_moe_hot::impl {
                 n_seed, seed_file_bytes/MiB, (ggml_time_us() - t_seed_start)/1000.0);
     }
 
-    ~impl() {
+    void stop_threads() {
         for (auto & d : devices) {
             {
                 std::lock_guard<std::mutex> lk(d.mtx);
@@ -437,7 +444,28 @@ struct llama_moe_hot::impl {
             for (auto & th : d.threads) {
                 th.join();
             }
+            d.threads.clear();
         }
+    }
+
+    void free_streams() {
+        for (auto & d : devices) {
+            for (ggml_backend_t copy : d.copies) {
+                if (copy) {
+                    ggml_backend_synchronize(copy);
+                    ggml_backend_free(copy);
+                }
+            }
+            d.copies.clear();
+            if (d.retire_ev) {
+                ggml_backend_event_free(d.retire_ev);
+                d.retire_ev = nullptr;
+            }
+        }
+    }
+
+    ~impl() {
+        stop_threads();
         auto drop = [&](transfer * t) {
             stream.release_hold(t->hold);
             if (t->vhold.pool >= 0) {
@@ -449,16 +477,8 @@ struct llama_moe_hot::impl {
         for (auto & d : devices) {
             for (auto * t : d.queue) { drop(t); }
             for (auto * t : d.done)  { drop(t); }
-            for (ggml_backend_t copy : d.copies) {
-                if (copy) {
-                    ggml_backend_synchronize(copy);
-                    ggml_backend_free(copy);
-                }
-            }
-            if (d.retire_ev) {
-                ggml_backend_event_free(d.retire_ev);
-            }
         }
+        free_streams();
     }
 
     //
