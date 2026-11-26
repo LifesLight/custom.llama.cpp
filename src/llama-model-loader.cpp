@@ -706,22 +706,53 @@ llama_model_loader::llama_model_loader(
             } else {
                 // an external PLE table replaces the one in the model, if any
                 allow_override_tensor = is_ple_only(ctx_gguf.get());
-                const int overlay_key = gguf_find_key(ctx_gguf.get(), "glm5-next.fp8_block_overlay");
-                if (overlay_key >= 0) {
-                    if (arch_name != "glm5-next" ||
+                // an FP8 overlay replaces dense weights with the checkpoint's E4M3 weights and their block scales
+                // (convert_glm5_flash_fp8_overlay.py, convert_deepseek41_fp8_overlay.py); a DeepSeek-V4.1 overlay can
+                // also replace weights that are BF16 in the checkpoint with their BF16 originals
+                struct fp8_overlay_arch {
+                    const char * arch;
+                    const char * fp8;  // E4M3 weight + F32 block scale pairs
+                    const char * bf16; // BF16 replacements, or nullptr
+                };
+                static const fp8_overlay_arch fp8_overlay_archs[] = {
+                    { "glm5-next",
+                      R"(blk\.\d+\.(attn_(kv_a_mqa|output|q_a|q_b)|ffn_(gate|up|down)(_shexp)?))", nullptr },
+                    { "deepseek41",
+                      R"(blk\.\d+\.(attn_(q_a|q_b|kv|output_a|output_b)|ffn_(gate|up|down)_shexp|engram_kv|indexer\.attn_q_b))",
+                      R"(token_embd|output|blk\.\d+\.(attn_compressor_(kv|gate)|indexer\.(attn_k|proj)))" },
+                };
+                const fp8_overlay_arch * overlay_arch = nullptr;
+                for (const auto & oa : fp8_overlay_archs) {
+                    const int overlay_key = gguf_find_key(ctx_gguf.get(), (std::string(oa.arch) + ".fp8_block_overlay").c_str());
+                    if (overlay_key < 0) {
+                        continue;
+                    }
+                    if (arch_name != oa.arch || overlay_arch ||
                         gguf_get_kv_type(ctx_gguf.get(), overlay_key) != GGUF_TYPE_BOOL ||
                         !gguf_get_val_bool(ctx_gguf.get(), overlay_key)) {
-                        throw std::runtime_error("invalid GLM5-Next FP8 overlay metadata");
+                        throw std::runtime_error(format("invalid %s FP8 overlay metadata", oa.arch));
                     }
+                    overlay_arch = &oa;
+                }
+                if (overlay_arch) {
                     fp8_overlay = true;
-                    static const std::regex pattern(
-                            R"(blk\.\d+\.(attn_(kv_a_mqa|output|q_a|q_b)|ffn_(gate|up|down)(_shexp)?)\.(weight|fp8_block_scale))");
+                    const char * arch = overlay_arch->arch;
+                    const std::regex fp8_pattern(std::string("(") + overlay_arch->fp8 + R"()\.(weight|fp8_block_scale))");
+                    const std::regex bf16_pattern(std::string("(") + (overlay_arch->bf16 ? overlay_arch->bf16 : "$^") + R"()\.weight)");
                     size_t n_weights = 0;
                     size_t n_scales = 0;
                     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
                         const std::string name = t->name;
-                        if (!std::regex_match(name, pattern)) {
-                            throw std::runtime_error(format("invalid GLM5-Next FP8 overlay tensor '%s'", t->name));
+                        const auto base = weights_map.find(name);
+                        if (std::regex_match(name, bf16_pattern)) {
+                            if (base == weights_map.end() || base->second.idx >= n_backbone_files ||
+                                !ggml_are_same_shape(t, base->second.tensor) || t->type != GGML_TYPE_BF16) {
+                                throw std::runtime_error(format("invalid %s FP8 overlay BF16 tensor '%s'", arch, t->name));
+                            }
+                            continue;
+                        }
+                        if (!std::regex_match(name, fp8_pattern)) {
+                            throw std::runtime_error(format("invalid %s FP8 overlay tensor '%s'", arch, t->name));
                         }
                         const auto stem = name.substr(0, name.rfind('.'));
                         if (name == stem + ".fp8_block_scale") {
@@ -729,22 +760,21 @@ llama_model_loader::llama_model_loader(
                             continue;
                         }
 
-                        const auto base = weights_map.find(name);
                         const ggml_tensor * scale = ggml_get_tensor(ctx, (stem + ".fp8_block_scale").c_str());
+                        const int64_t bs = scale && scale->ne[0] > 0 && t->ne[0] % scale->ne[0] == 0 ? t->ne[0] / scale->ne[0] : 0;
                         if (base == weights_map.end() || base->second.idx >= n_backbone_files ||
                             !ggml_are_same_shape(t, base->second.tensor) ||
                             t->type != GGML_TYPE_F8_E4M3 || !ggml_is_matrix(t) ||
-                            t->ne[0] % GGML_FP8_BLOCK_SIZE != 0 || t->ne[1] % GGML_FP8_BLOCK_SIZE != 0 ||
                             !scale || scale->type != GGML_TYPE_F32 || !ggml_is_matrix(scale) ||
-                            scale->ne[0] != t->ne[0] / GGML_FP8_BLOCK_SIZE ||
-                            scale->ne[1] != t->ne[1] / GGML_FP8_BLOCK_SIZE ||
+                            bs == 0 || bs % 32 != 0 || bs > GGML_FP8_BLOCK_SIZE ||
+                            scale->ne[1] * bs != t->ne[1] ||
                             weights_map.count(scale->name)) {
-                            throw std::runtime_error(format("invalid GLM5-Next FP8 overlay pair for '%s'", t->name));
+                            throw std::runtime_error(format("invalid %s FP8 overlay pair for '%s'", arch, t->name));
                         }
                         ++n_weights;
                     }
-                    if (!n_weights || n_weights != n_scales) {
-                        throw std::runtime_error("GLM5-Next FP8 overlay requires paired weights and block scales");
+                    if (n_weights != n_scales || (!n_weights && !overlay_arch->bf16)) {
+                        throw std::runtime_error(format("%s FP8 overlay requires paired weights and block scales", arch));
                     }
                 }
                 const bool numbered = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str()) >= 0 ||

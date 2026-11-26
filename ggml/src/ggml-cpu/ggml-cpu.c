@@ -1268,30 +1268,36 @@ static void ggml_compute_forward_mul_mat_fp8_block(
     const struct ggml_tensor * scale = dst->src[2];
     const int64_t k = weight->ne[0];
     const int64_t n = weight->ne[1];
+    const int64_t n_batch = weight->ne[2];
     const int64_t tokens = input->ne[1];
     const int64_t blocks_k = scale->ne[0];
+    const int64_t blocks_n = scale->ne[1];
+    const int64_t bs = k / blocks_k;
     const ggml_to_float_t to_float = ggml_get_type_traits(weight->type)->to_float;
-    const uint8_t * weights = weight->data;
-    const float * inputs = input->data;
-    const float * scales = scale->data;
-    float * out = dst->data;
 
-    for (int64_t row = params->ith; row < n; row += params->nth) {
+    for (int64_t ir = params->ith; ir < n_batch*n; ir += params->nth) {
+        const int64_t b = ir / n;
+        const int64_t row = ir % n;
+        const uint8_t * weights = (const uint8_t *) weight->data + (b*n + row)*k;
+        const float * inputs = (const float *) input->data + b*tokens*k;
+        const float * scales = (const float *) scale->data + (b*blocks_n + row/bs)*blocks_k;
+        float * out = (float *) dst->data + b*tokens*n;
+
         for (int64_t t = 0; t < tokens; ++t) {
             out[t*n + row] = 0.0f;
         }
         for (int64_t block = 0; block < blocks_k; ++block) {
-            const int64_t col = block * GGML_FP8_BLOCK_SIZE;
-            const float d = scales[row/GGML_FP8_BLOCK_SIZE*blocks_k + block];
+            const int64_t col = block * bs;
+            const float d = scales[block];
             float decoded[GGML_FP8_BLOCK_SIZE];
-            to_float(weights + row*k + col, decoded, GGML_FP8_BLOCK_SIZE);
-            for (int i = 0; i < GGML_FP8_BLOCK_SIZE; ++i) {
+            to_float(weights + col, decoded, bs);
+            for (int i = 0; i < bs; ++i) {
                 decoded[i] *= d;
             }
             for (int64_t t = 0; t < tokens; ++t) {
                 const float * x = inputs + t*k + col;
                 float sum = 0.0f;
-                for (int i = 0; i < GGML_FP8_BLOCK_SIZE; ++i) {
+                for (int i = 0; i < bs; ++i) {
                     sum += decoded[i] * x[i];
                 }
                 out[t*n + row] += sum;

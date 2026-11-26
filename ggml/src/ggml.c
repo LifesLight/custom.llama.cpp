@@ -3394,16 +3394,18 @@ struct ggml_tensor * ggml_mul_mat_fp8_block(
         struct ggml_tensor  * scale) {
     GGML_ASSERT(a->type == GGML_TYPE_F8_E4M3);
     GGML_ASSERT(b->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_matrix(a) && ggml_is_matrix(b) && ggml_is_matrix(scale));
+    GGML_ASSERT(a->ne[3] == 1 && b->ne[3] == 1 && scale->ne[3] == 1);
     GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(b) && ggml_is_contiguous(scale));
     // Empty token batches produce an empty result, like ggml_mul_mat.
-    GGML_ASSERT(a->ne[0] > 0 && a->ne[1] > 0);
+    GGML_ASSERT(a->ne[0] > 0 && a->ne[1] > 0 && a->ne[2] > 0);
     GGML_ASSERT(a->ne[0] == b->ne[0]);
-    GGML_ASSERT(a->ne[0] % GGML_FP8_BLOCK_SIZE == 0 && a->ne[1] % GGML_FP8_BLOCK_SIZE == 0);
-    GGML_ASSERT(scale->ne[0] == a->ne[0] / GGML_FP8_BLOCK_SIZE);
-    GGML_ASSERT(scale->ne[1] == a->ne[1] / GGML_FP8_BLOCK_SIZE);
+    GGML_ASSERT(b->ne[2] == a->ne[2] && scale->ne[2] == a->ne[2]);
+    GGML_ASSERT(scale->ne[0] > 0 && a->ne[0] % scale->ne[0] == 0);
+    const int64_t bs = a->ne[0] / scale->ne[0];
+    GGML_ASSERT(bs % 32 == 0 && bs <= GGML_FP8_BLOCK_SIZE);
+    GGML_ASSERT(scale->ne[1] * bs == a->ne[1]);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[1], b->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a->ne[1], b->ne[1], a->ne[2]);
     result->op = GGML_OP_MUL_MAT_FP8_BLOCK;
     result->src[0] = a;
     result->src[1] = b;

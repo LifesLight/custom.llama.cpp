@@ -163,18 +163,47 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {(int64_t) hparams.ple_head_dim, n_rows}, TENSOR_READ_LAZY);
     }
 
+    // an FP8 overlay (convert_deepseek41_fp8_overlay.py) gives a weight the checkpoint's E4M3 values and one F32 scale
+    // per bs x bs block (bs = 32 in DeepSeek-V4.1), computed by ggml_mul_mat_fp8_block; groups > 1: wo_a, whose
+    // [k, n/groups, groups] view takes the scales of its n/groups rows per group
+    auto create_fp8 = [&](llm_tensor tid, int i, int64_t k, int64_t n, int64_t groups = 1) {
+        ggml_tensor * w = groups > 1
+            ? create_tensor(tn(tid, "weight", i), {k, n/groups, groups}, TENSOR_ALLOW_RESHAPE)
+            : create_tensor(tn(tid, "weight", i), {k, n}, 0);
+        const auto scale_name = tn(tid, "fp8_block_scale", i);
+        const ggml_tensor * meta = ml.get_tensor_meta(scale_name.str().c_str());
+        if (!meta) {
+            return w;
+        }
+        if (split_mode() == LLAMA_SPLIT_MODE_ROW || split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+            throw std::runtime_error("DeepSeek-V4.1 block-scaled FP8 supports none and layer split modes");
+        }
+        const int64_t bs = meta->ne[0] > 0 && k % meta->ne[0] == 0 ? k / meta->ne[0] : 0;
+        if ((w && w->type != GGML_TYPE_F8_E4M3) || meta->type != GGML_TYPE_F32 ||
+            bs == 0 || bs % 32 != 0 || bs > GGML_FP8_BLOCK_SIZE || (n/groups) % bs != 0) {
+            throw std::runtime_error(format("invalid DeepSeek-V4.1 block-scaled FP8 tensor %s", scale_name.str().c_str()));
+        }
+        ggml_tensor * scale = groups > 1
+            ? create_tensor(scale_name, {k/bs, n/groups/bs, groups}, TENSOR_ALLOW_RESHAPE)
+            : create_tensor(scale_name, {k/bs, n/bs}, 0);
+        if (w && scale) {
+            fp8_block_scales.emplace(w, scale);
+        }
+        return w;
+    };
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
         layer.attn_sinks    = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,    "weight", i), {n_head}, 0);
-        layer.wq_a          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, 0);
+        layer.wq_a          = create_fp8(LLM_TENSOR_ATTN_Q_A, i, n_embd, q_lora_rank);
         layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, 0);
-        layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * n_embd_head}, 0);
-        layer.wkv           = create_tensor(tn(LLM_TENSOR_ATTN_KV,       "weight", i), {n_embd, n_embd_head}, 0);
+        layer.wq_b          = create_fp8(LLM_TENSOR_ATTN_Q_B, i, q_lora_rank, n_head * n_embd_head);
+        layer.wkv           = create_fp8(LLM_TENSOR_ATTN_KV,  i, n_embd, n_embd_head);
         layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,  "weight", i), {n_embd_head}, 0);
-        layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank, o_groups}, TENSOR_ALLOW_RESHAPE);
-        layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,    "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
+        layer.wo_a          = create_fp8(LLM_TENSOR_ATTN_OUT_A, i, n_head * n_embd_head / o_groups, o_lora_rank * o_groups, o_groups);
+        layer.wo_b          = create_fp8(LLM_TENSOR_ATTN_OUT_B, i, o_groups * o_lora_rank, n_embd);
 
         layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, 0);
         layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
@@ -193,12 +222,12 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             layer.indexer_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {n_idx_embd}, 0);
         }
         if (hparams.dsv41_topk_src[i] == i) {
-            layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, n_idx_head * n_idx_embd}, 0);
+            layer.indexer_attn_q_b = create_fp8(LLM_TENSOR_INDEXER_ATTN_Q_B, i, q_lora_rank, n_idx_head * n_idx_embd);
             layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, n_idx_head}, 0);
         }
 
         if (engram_index(i) >= 0) {
-            layer.engram_kv   = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {(int64_t) hparams.ple_n_heads * hparams.ple_head_dim, n_embd * (hc_mult + 1)}, 0);
+            layer.engram_kv   = create_fp8(LLM_TENSOR_ENGRAM_KV, i, (int64_t) hparams.ple_n_heads * hparams.ple_head_dim, n_embd * (hc_mult + 1));
             layer.engram_gate = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
         }
 
@@ -211,9 +240,9 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
 
-        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
-        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
-        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+        layer.ffn_gate_shexp = create_fp8(LLM_TENSOR_FFN_GATE_SHEXP, i, n_embd, n_ff_exp * n_expert_shared);
+        layer.ffn_down_shexp = create_fp8(LLM_TENSOR_FFN_DOWN_SHEXP, i, n_ff_exp * n_expert_shared, n_embd);
+        layer.ffn_up_shexp   = create_fp8(LLM_TENSOR_FFN_UP_SHEXP,   i, n_embd, n_ff_exp * n_expert_shared);
     }
 }
 
@@ -761,7 +790,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     cb(out, "attn_derope", il);
 
     out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, n_head/n_groups*n_embd_head, n_groups, nt), 0, 2, 1, 3);
-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    ggml_tensor * oa = nullptr;
+    if (const auto fp8 = model.fp8_block_scales.find(layer.wo_a); fp8 != model.fp8_block_scales.end()) {
+        oa = ggml_mul_mat_fp8_block(ctx0, layer.wo_a, ggml_cont(ctx0, out), fp8->second);
+    } else {
+        oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    }
     cb(oa, "attn_wo_a", il);
     oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), o_lora_rank*n_groups, nt);
 

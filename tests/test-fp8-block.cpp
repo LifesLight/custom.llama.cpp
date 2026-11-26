@@ -16,19 +16,20 @@ static float decode(uint8_t code) {
     return code & 128 ? -magnitude : magnitude;
 }
 
-static bool check(ggml_backend_t backend, int tokens, bool unit_vectors) {
-    constexpr int k = 384;
-    constexpr int n = 640;
-    constexpr int blocks_k = k / 128;
-    constexpr int blocks_n = n / 128;
+// bs x bs blocks (128: GLM-5, 32: DeepSeek-V4.1), batch > 1: grouped projections (DeepSeek-V4.1 wo_a)
+static bool check(ggml_backend_t backend, int tokens, bool unit_vectors, int bs = 128, int batch = 1) {
+    const int k = 3 * bs;
+    const int n = 5 * bs;
+    const int blocks_k = k / bs;
+    const int blocks_n = n / bs;
 
     ggml_init_params params = { 64 * 1024, nullptr, true };
     ggml_context_ptr ctx(ggml_init(params));
-    ggml_tensor * w = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F8_E4M3, k, n);
-    ggml_tensor * x = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, tokens);
-    ggml_tensor * s = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, blocks_k, blocks_n);
+    ggml_tensor * w = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F8_E4M3, k, n, batch);
+    ggml_tensor * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k, tokens, batch);
+    ggml_tensor * s = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, blocks_k, blocks_n, batch);
     ggml_tensor * y = ggml_mul_mat_fp8_block(ctx.get(), w, x, s);
-    if (y->ne[0] != n || y->ne[1] != tokens) {
+    if (y->ne[0] != n || y->ne[1] != tokens || y->ne[2] != batch) {
         std::fprintf(stderr, "unexpected FP8 matmul output shape\n");
         return false;
     }
@@ -44,23 +45,25 @@ static bool check(ggml_backend_t backend, int tokens, bool unit_vectors) {
         return false;
     }
 
-    std::vector<uint8_t> weights(n*k);
-    std::vector<float> input(tokens*k);
-    std::vector<float> scales(blocks_n*blocks_k);
-    std::vector<float> output(tokens*n);
-    for (int i = 0; i < n*k; ++i) {
+    std::vector<uint8_t> weights(batch*n*k);
+    std::vector<float> input(batch*tokens*k);
+    std::vector<float> scales(batch*blocks_n*blocks_k);
+    std::vector<float> output(batch*tokens*n);
+    for (int i = 0; i < batch*n*k; ++i) {
         weights[i] = (1 + (i*43 + i/31) % 126) | (((i + i/13) % 2) << 7);
     }
-    for (int i = 0; i < blocks_n*blocks_k; ++i) {
-        scales[i] = 0.00213f * (1 + i);
+    for (int i = 0; i < batch*blocks_n*blocks_k; ++i) {
+        scales[i] = bs == 32 ? std::ldexp(1.0f, i % 7 - 9) : 0.00213f * (1 + i); // E8M0 scales are powers of two
     }
     if (unit_vectors) {
-        const int columns[] = { 127, 128, 255, 383 };
-        for (int t = 0; t < tokens; ++t) {
-            input[t*k + columns[t]] = 1.0f;
+        const int columns[] = { bs - 1, bs, 2*bs - 1, 3*bs - 1 };
+        for (int b = 0; b < batch; ++b) {
+            for (int t = 0; t < tokens; ++t) {
+                input[(b*tokens + t)*k + columns[t]] = 1.0f;
+            }
         }
     } else {
-        for (int i = 0; i < tokens*k; ++i) {
+        for (int i = 0; i < batch*tokens*k; ++i) {
             input[i] = ((i*7 + i/17) % 29 - 14) / 17.0f;
         }
     }
@@ -77,23 +80,26 @@ static bool check(ggml_backend_t backend, int tokens, bool unit_vectors) {
         ggml_backend_tensor_get(y, output.data(), 0, ggml_nbytes(y));
     }
 
-    for (int t = 0; t < tokens; ++t) {
-        for (int row = 0; row < n; ++row) {
-            double expected = 0.0;
-            for (int col = 0; col < k; ++col) {
-                const float weight = decode(weights[row*k + col]) * scales[row/128*blocks_k + col/128];
-                expected += double(weight) * input[t*k + col];
-            }
-            const double actual = output[t*n + row];
-            const double tolerance = unit_vectors ? 0.0 : 0.0002 * (1 + std::abs(expected));
-            if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
-                std::fprintf(stderr, "%s: tokens=%d t=%d row=%d got %.9g expected %.9g\n",
-                             ggml_backend_name(backend), tokens, t, row, actual, expected);
-                return false;
+    for (int b = 0; b < batch; ++b) {
+        for (int t = 0; t < tokens; ++t) {
+            for (int row = 0; row < n; ++row) {
+                double expected = 0.0;
+                for (int col = 0; col < k; ++col) {
+                    const float weight = decode(weights[(b*n + row)*k + col]) *
+                                         scales[(b*blocks_n + row/bs)*blocks_k + col/bs];
+                    expected += double(weight) * input[(b*tokens + t)*k + col];
+                }
+                const double actual = output[(b*tokens + t)*n + row];
+                const double tolerance = unit_vectors ? 0.0 : 0.0002 * (1 + std::abs(expected));
+                if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+                    std::fprintf(stderr, "%s: bs=%d batch=%d tokens=%d b=%d t=%d row=%d got %.9g expected %.9g\n",
+                                 ggml_backend_name(backend), bs, batch, tokens, b, t, row, actual, expected);
+                    return false;
+                }
             }
         }
     }
-    std::printf("%s: %d tokens passed\n", ggml_backend_name(backend), tokens);
+    std::printf("%s: bs=%d batch=%d %d tokens passed\n", ggml_backend_name(backend), bs, batch, tokens);
     return true;
 }
 
@@ -109,6 +115,12 @@ int main() {
         ggml_backend_ptr backend(ggml_backend_dev_init(device, nullptr));
         if (!backend || !check(backend.get(), 0, false) || !check(backend.get(), 4, true) || !check(backend.get(), 13, false)) {
             return 1;
+        }
+        for (int batch : { 1, 3 }) {
+            if (!check(backend.get(), 4, true, 32, batch) || !check(backend.get(), 5, false, 32, batch) ||
+                !check(backend.get(), 40, false, 32, batch) || !check(backend.get(), 13, false, 128, batch)) {
+                return 1;
+            }
         }
         ran = true;
     }

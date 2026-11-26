@@ -1311,9 +1311,10 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-#define GGML_FP8_BLOCK_SIZE 128
-    // a: contiguous E4M3 [K, N], b: contiguous F32 [K, T].
-    // scale: contiguous F32 [K/128, N/128], in GGML dimension order.
+#define GGML_FP8_BLOCK_SIZE 128 // the largest block size, the one of GLM-5 checkpoints
+    // a: contiguous E4M3 [K, N, B], b: contiguous F32 [K, T, B], result F32 [N, T, B].
+    // scale: contiguous F32 [K/bs, N/bs, B], in GGML dimension order, one per bs x bs block:
+    // bs = K/scale->ne[0], a multiple of 32 up to GGML_FP8_BLOCK_SIZE (128 for GLM-5, 32 for DeepSeek-V4.1).
     GGML_API struct ggml_tensor * ggml_mul_mat_fp8_block(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

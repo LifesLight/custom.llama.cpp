@@ -6727,7 +6727,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_MUL_MAT_FP8_BLOCK:
             return op->src[0]->ne[0] <= 8 * 1024 * 1024 &&
                    op->src[0]->ne[1] <= INT_MAX / WARP_SIZE &&
-                   op->src[1]->ne[1] <= INT_MAX;
+                   op->src[0]->ne[2] <= 65535 &&
+                   op->src[1]->ne[1] <= INT_MAX &&
+                   (op->src[0]->ne[0] / op->src[2]->ne[0]) % WARP_SIZE == 0;
 #endif
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
