@@ -3529,7 +3529,47 @@ ggml_cgraph * llama_context::graph_reserve(
 void llama_context::ubatch_sizes(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_ubatch, std::vector<size_t> & sizes) {
     sizes.assign(backend_ptrs.size(), 0);
     const uint32_t n_outputs = std::min(n_ubatch, cparams.n_outputs_max);
-    graph_reserve(n_ubatch, n_seqs, n_outputs, mctx, true, sizes.data());
+    ggml_cgraph * gf = graph_reserve(n_ubatch, n_seqs, n_outputs, mctx, true, sizes.data());
+    if (!gf) {
+        return;
+    }
+
+    // the matrix multiplications of a GPU take their src1 copies from the scratch pool of the backend, outside of the
+    // compute buffers: the quantized rows of MMQ, or the sorted f32 rows (with the dst rows) of the other paths. the
+    // pool keeps its largest size, only the growth beyond it needs free memory
+    std::vector<size_t> scratch(backend_ptrs.size(), 0);
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        const int64_t rows = node->op == GGML_OP_MUL_MAT_ID ? ggml_nelements(node->src[2]) : ggml_nrows(src1);
+        if (rows <= 8) {
+            continue;
+        }
+        const size_t size = ggml_is_quantized(src0->type) ?
+            (size_t) rows*(GGML_PAD(src1->ne[0], 512)*9/8 + 16) :
+            (size_t) rows*(src1->ne[0] + node->ne[0])*sizeof(float);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), const_cast<ggml_tensor *>(node));
+        for (size_t b = 0; b < backend_ptrs.size(); ++b) {
+            if (backend_ptrs[b] == backend) {
+                scratch[b] = std::max(scratch[b], size);
+            }
+        }
+    }
+    for (size_t b = 0; b < backend_ptrs.size(); ++b) {
+        if (scratch[b] == 0) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ptrs[b]));
+        auto pool_size = reg ? (ggml_backend_cuda_pool_size_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_pool_size") : nullptr;
+        if (pool_size) {
+            const size_t held = pool_size(backend_ptrs[b]);
+            sizes[b] += scratch[b] > held ? scratch[b] - held : 0;
+        }
+    }
 }
 
 uint32_t llama_context::ubatch_select(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_min) {

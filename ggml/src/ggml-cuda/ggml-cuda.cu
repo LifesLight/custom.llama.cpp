@@ -464,6 +464,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
 
+    size_t reserved() const override {
+        return pool_size;
+    }
+
     ggml_cuda_pool_leg(ggml_backend_cuda_context & ctx, int device) :
         ctx(ctx),
         device(device) {
@@ -599,6 +603,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #if defined(GGML_USE_HIP)
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
 #endif
+
+    size_t reserved() const override {
+        return pool_size;
+    }
 
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
@@ -7373,6 +7381,21 @@ static void ggml_backend_cuda_suspend_release() {
 }
 #endif
 
+// the device memory held by the pools of the backend (kernel scratch, not in the compute buffers)
+static size_t ggml_backend_cuda_pool_size(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    const auto * ctx = (const ggml_backend_cuda_context *) backend->context;
+    size_t size = 0;
+    for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+        if (ctx->pools[ctx->device][stream]) {
+            size += ctx->pools[ctx->device][stream]->reserved();
+        }
+    }
+    return size;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_cuda_suspend_release") == 0) {
@@ -7395,6 +7418,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
 #endif
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_pool_size") == 0) {
+        return (void *)ggml_backend_cuda_pool_size;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

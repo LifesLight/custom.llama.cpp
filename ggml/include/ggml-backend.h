@@ -263,6 +263,9 @@ extern "C" {
     // free the host backups of the restored buffers (allocated again by the next suspend)
     typedef void (*ggml_backend_cuda_suspend_release_t)(void);
 
+    // Optional CUDA registry procedure: the device memory held by the scratch pools of a backend
+    typedef size_t (*ggml_backend_cuda_pool_size_t)(ggml_backend_t backend);
+
     // Device enumeration
     GGML_API size_t             ggml_backend_dev_count(void);
     GGML_API ggml_backend_dev_t ggml_backend_dev_get(size_t index);
