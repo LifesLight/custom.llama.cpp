@@ -1564,10 +1564,13 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
             row.spare_full.push_back((free_mem[i] - fixed[i] - sz[i] - margin)/MiB);
         }
 
-        // the extra memory (a projector) next to the decode state: a small workspace (reserved for the full context)
-        // and the KV cells, of the full context or with LLAMA_KV_GROW of the largest ranked prompt
+        // the extra memory (a projector) next to the decode state: the decode workspace (LLAMA_DECODE_WORKSPACE as the
+        // server switches to it, reserved for the full context; 32 tokens without it) and the KV cells, of the full
+        // context or with LLAMA_KV_GROW of the largest ranked prompt
         if (!extra_mem.empty()) {
-            sizes(n_ctx, 32, sz);
+            const char * dw = getenv("LLAMA_DECODE_WORKSPACE");
+            const int n_small = dw ? atoi(dw) : 0;
+            sizes(n_ctx, n_small > 0 ? (uint32_t) n_small : 32u, sz);
             auto extra_fits = [&](uint32_t n) {
                 for (size_t i = 0; i < devs.size(); ++i) {
                     const auto it = extra_mem.find(devs[i]);
