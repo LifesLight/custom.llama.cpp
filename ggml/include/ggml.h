@@ -260,7 +260,9 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
-        GGML_TYPE_COUNT   = 44,
+        // MXFP8 (E4M3, E8M0 scale per 32), gather-only (GET_ROWS on the CPU); 63 matches the unsloth fork's files
+        GGML_TYPE_MXFP8   = 63,
+        GGML_TYPE_COUNT   = 64,
     };
 
     // [TAG_GGML_PREC]
