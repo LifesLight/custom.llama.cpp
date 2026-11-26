@@ -57,6 +57,11 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    // the indexer cache uses the cells of the attention cache: both have the same cap
+    uint32_t get_cap() const override;
+    bool     set_cap(uint32_t n_cells) override;
+    void     get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

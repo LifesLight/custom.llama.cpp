@@ -70,6 +70,35 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
 
+uint32_t llama_memory_hybrid_idx::get_cap() const {
+    const uint32_t cap = llama_memory_hybrid::get_cap();
+    return mem_idx && mem_idx->get_cap() > 0 ? (cap > 0 ? std::min(cap, mem_idx->get_cap()) : mem_idx->get_cap()) : cap;
+}
+
+bool llama_memory_hybrid_idx::set_cap(uint32_t n_cells) {
+    const uint32_t old = llama_memory_hybrid::get_cap();
+    if (!llama_memory_hybrid::set_cap(n_cells)) {
+        return false;
+    }
+    // the indexer gets the cap of the attention cache (padded the same way)
+    const uint32_t cap = llama_memory_hybrid::get_cap();
+    if (mem_idx && !mem_idx->set_cap(cap > 0 ? cap : n_cells)) {
+        // back to the old cells, which only unmaps
+        if (old > 0) {
+            llama_memory_hybrid::set_cap(old);
+        }
+        return false;
+    }
+    return true;
+}
+
+void llama_memory_hybrid_idx::get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const {
+    llama_memory_hybrid::get_cell_bytes(out);
+    if (mem_idx) {
+        mem_idx->get_cell_bytes(out);
+    }
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
     do {

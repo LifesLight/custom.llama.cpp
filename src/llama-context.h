@@ -328,8 +328,9 @@ private:
     // ubatch_auto: the largest ubatch from n_min to ubatch_max whose compute buffers fit in the free device memory,
     // for the graphs of mctx (see ubatch_cells); n_min if none fits
     uint32_t ubatch_select(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_min);
-    // ubatch_auto: the memory the compute buffers may take per backend (INT64_MAX for the host)
-    std::vector<int64_t> ubatch_budget();
+    // ubatch_auto: the memory the compute buffers may take per backend (INT64_MAX for the host), for graphs attending
+    // to n_cells: a sparse KV cache maps these cells as the prompt reaches them, their memory stays free
+    std::vector<int64_t> ubatch_budget(uint32_t n_cells);
     // ubatch_auto: the largest cell count from `from` up to `end` (0 = the full context) for which the graphs of
     // n_ubatch tokens still fit, so that one reservation covers the next batches of the prompt
     uint32_t ubatch_extend(uint32_t n_seqs, uint32_t n_ubatch, uint32_t from, uint32_t end);
@@ -467,6 +468,20 @@ private:
     bool     ubatch_res_valid  = false; // the prompt workspace is reserved with these
     bool     ubatch_startup    = false; // the provisional reservation at load
     std::map<ggml_backend_dev_t, size_t> ubatch_dev_reserve; // llama_set_device_reserve
+
+    // LLAMA_KV_GROW: the sparse KV cache maps the cells in use and those of the batch (with kv_grow_ahead more) in
+    // steps of kv_grow_step cells, a prompt gives back the others. 0 = off
+    uint32_t kv_grow_step    = 0;
+    uint32_t kv_grow_ahead   = 64;
+    uint32_t kv_cap_pending  = 0; // mapped once the workspace (and the GPU tier) made room
+
+    // the MTP draft context of a target with LLAMA_KV_GROW follows the cap of the target (kv_lead), which plans the
+    // memory of both
+    llama_context * kv_lead = nullptr;
+    std::vector<llama_context *> kv_followers;
+
+    void kv_grow(uint32_t n_tokens, bool small);
+    bool kv_set_cap(uint32_t n_cells);
 
 public:
     void set_prompt_hint(uint32_t n_tokens) { ubatch_hint = n_tokens; }

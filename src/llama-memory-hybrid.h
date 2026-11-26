@@ -58,7 +58,10 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t get_cap() const override;
+    bool     set_cap(uint32_t n_cells) override;
     uint32_t get_cells_end() const override;
+    void     get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const override;
 
     void clear(bool data) override;
 

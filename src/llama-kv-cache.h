@@ -135,7 +135,10 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t get_cap() const override;
+    bool     set_cap(uint32_t n_cells) override;
     uint32_t get_cells_end() const override;
+    void     get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const override;
 
     void clear(bool data) override;
 
@@ -341,6 +344,14 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
+
+    // sparse buffers (LLAMA_KV_GROW): the memory of the cells [n_cap, size) is not mapped, and find_slot() does not
+    // use these cells
+    bool     sparse = false;
+    uint32_t n_cap  = 0;
+
+    // the ranges of the cells [0, n_cells) of the tensors in buf
+    std::vector<size_t> cap_ranges(ggml_backend_buffer_t buf, uint32_t n_cells) const;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

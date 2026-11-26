@@ -46,6 +46,17 @@ struct llama_memory_bufs {
     // allocate a single ctx buffer - for the memory instances that keep their own buffer layout
     static ggml_backend_buffer_ptr alloc_buf(ggml_context * ctx, ggml_backend_buffer_type_t buft, bool no_alloc, const char * name);
 
+    // like emplace, in a sparse buffer if the backend has these: the address range of the tensors is reserved and
+    // commit() maps their memory. nothing is mapped yet
+    ggml_backend_buffer_t emplace_sparse(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name);
+
+    // map the memory of the ranges (offset, size pairs) of a sparse buffer, unmap the rest. false if out of memory
+    static bool commit(ggml_backend_buffer_t buf, const std::vector<size_t> & ranges);
+    // the bytes of a sparse buffer that are mapped
+    static size_t committed(ggml_backend_buffer_t buf);
+
+    bool is_sparse(ggml_backend_buffer_t buf) const;
+
     bool empty() const { return bufs.empty(); }
 
     auto begin()       { return bufs.begin(); }
@@ -54,6 +65,7 @@ struct llama_memory_bufs {
     auto end()   const { return bufs.end();   }
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs;
+    std::vector<ggml_backend_buffer_t> sparse;
 
     const bool no_alloc;
 };
@@ -132,8 +144,14 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // sparse memory (LLAMA_KV_GROW): the device memory is mapped for the cells [0, cap) only, 0 = not sparse
+    virtual uint32_t get_cap() const { return 0; }
+    // map the cells [0, n_cells), at least the cells in use, and unmap the others. false if out of memory (unchanged)
+    virtual bool set_cap(uint32_t n_cells) { GGML_UNUSED(n_cells); return true; }
     // one past the last cell in use
     virtual uint32_t get_cells_end() const { return 0; }
+    // the device memory per cell of the sparse buffers, by buffer type
+    virtual void get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const { GGML_UNUSED(out); }
 
     //
     // ops
@@ -167,6 +185,19 @@ using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
 // (ubatch_auto), 0 = the full cache. the KV caches whose graphs attend to the used cells only respect it, set for the
 // current thread while the scope lives
 uint32_t llama_memory_reserve_n_cells();
+
+// the KV caches created while the scope lives allocate sparse buffers (LLAMA_KV_GROW), fully mapped until set_cap()
+bool llama_memory_sparse();
+
+struct llama_memory_sparse_scope {
+    explicit llama_memory_sparse_scope(bool sparse);
+    ~llama_memory_sparse_scope();
+
+    llama_memory_sparse_scope(const llama_memory_sparse_scope &) = delete;
+    llama_memory_sparse_scope & operator=(const llama_memory_sparse_scope &) = delete;
+
+    bool prev;
+};
 
 struct llama_memory_reserve_scope {
     explicit llama_memory_reserve_scope(uint32_t n_cells);

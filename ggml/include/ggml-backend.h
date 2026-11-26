@@ -266,6 +266,15 @@ extern "C" {
     // Optional CUDA registry procedure: the device memory held by the scratch pools of a backend
     typedef size_t (*ggml_backend_cuda_pool_size_t)(ggml_backend_t backend);
 
+    // Optional CUDA registry procedures for memory that grows (KV caches): a buffer whose address range is reserved,
+    // with the device memory mapped in chunks for the committed ranges only
+    typedef ggml_backend_buffer_t (*ggml_backend_cuda_buffer_sparse_alloc_t)(ggml_backend_buffer_type_t buft, size_t size);
+    // map the chunks of the ranges (n_ranges pairs of offset, size), zeroing the new ones, and unmap the others
+    // false if out of memory or suspended, the buffer is unchanged
+    typedef bool (*ggml_backend_cuda_buffer_sparse_commit_t)(ggml_backend_buffer_t buffer, const size_t * ranges, size_t n_ranges);
+    // the bytes mapped, the size for a buffer that is not sparse
+    typedef size_t (*ggml_backend_cuda_buffer_sparse_committed_t)(ggml_backend_buffer_t buffer);
+
     // Device enumeration
     GGML_API size_t             ggml_backend_dev_count(void);
     GGML_API ggml_backend_dev_t ggml_backend_dev_get(size_t index);

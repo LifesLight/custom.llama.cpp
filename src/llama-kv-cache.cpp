@@ -273,11 +273,29 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // LLAMA_KV_GROW: the cells of one stream are a prefix of each tensor, unless V is transposed
+    bool want_sparse = llama_memory_sparse() && n_stream == 1 && !other;
+    for (const auto & layer : layers) {
+        want_sparse = want_sparse && (!layer.v || !v_trans);
+    }
+
     // allocate the tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ctxs_bufs.emplace(std::move(ctx), buft, "kv cache");
+        ggml_backend_buffer_t buf = want_sparse ?
+            ctxs_bufs.emplace_sparse(std::move(ctx), buft, "kv cache") :
+            ctxs_bufs.emplace       (std::move(ctx), buft, "kv cache");
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
+                ctxs_bufs.is_sparse(buf) ? " (sparse)" : "");
+    }
+
+    // a sparse cache starts fully mapped, the context sets the cells it uses
+    n_cap  = kv_size;
+    sparse = !ctxs_bufs.sparse.empty();
+    for (ggml_backend_buffer_t buf : ctxs_bufs.sparse) {
+        if (!llama_memory_bufs::commit(buf, cap_ranges(buf, kv_size))) {
+            throw std::runtime_error("failed to allocate the sparse KV cache buffers");
+        }
     }
 
     {
@@ -424,12 +442,66 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
     }
 }
 
+uint32_t llama_kv_cache::get_cap() const {
+    return sparse ? n_cap : 0;
+}
+
 uint32_t llama_kv_cache::get_cells_end() const {
     uint32_t res = 0;
     for (const auto & cells : v_cells) {
         res = std::max(res, cells.used_max_p1());
     }
     return res;
+}
+
+void llama_kv_cache::get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const {
+    for (const auto & layer : layers) {
+        for (const ggml_tensor * t : { layer.k, layer.v }) {
+            if (t && ctxs_bufs.is_sparse(t->buffer)) {
+                out[ggml_backend_buffer_get_type(t->buffer)] += t->nb[1];
+            }
+        }
+    }
+}
+
+std::vector<size_t> llama_kv_cache::cap_ranges(ggml_backend_buffer_t buf, uint32_t n_cells) const {
+    std::vector<size_t> res;
+    const char * base = (const char *) ggml_backend_buffer_get_base(buf);
+    for (const auto & layer : layers) {
+        for (const ggml_tensor * t : { layer.k, layer.v }) {
+            if (t && t->buffer == buf) {
+                res.push_back((size_t) ((const char *) t->data - base));
+                res.push_back((size_t) n_cells*t->nb[1]);
+            }
+        }
+    }
+    return res;
+}
+
+bool llama_kv_cache::set_cap(uint32_t n_cells) {
+    if (!sparse) {
+        return true;
+    }
+    // the cells in use stay, padded like n_kv so that the graphs never read beyond the mapped cells
+    n_cells = std::min(get_size(), GGML_PAD(std::max(n_cells, get_cells_end()), 256u));
+    if (n_cells == n_cap) {
+        return true;
+    }
+    for (size_t i = 0; i < ctxs_bufs.sparse.size(); ++i) {
+        ggml_backend_buffer_t buf = ctxs_bufs.sparse[i];
+        if (!llama_memory_bufs::commit(buf, cap_ranges(buf, n_cells))) {
+            // back to the old cells, which only unmaps
+            for (size_t j = 0; j < i; ++j) {
+                GGML_ASSERT(llama_memory_bufs::commit(ctxs_bufs.sparse[j], cap_ranges(ctxs_bufs.sparse[j], n_cap)));
+            }
+            return false;
+        }
+    }
+    n_cap = n_cells;
+    for (auto & head : v_heads) {
+        head = head >= n_cap ? 0 : head;
+    }
+    return true;
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1048,14 +1120,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
+        // a sparse cache uses the mapped cells only
+        const uint32_t n_cells = std::min(cells.size(), n_cap);
+
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
+        if (head_cur > cells.get_used() + 2*n_tokens || head_cur >= n_cells) {
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        if (n_tokens > n_cells) {
+            if (n_tokens > cells.size()) {
+                LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+            }
             return { };
         }
 
@@ -1066,8 +1143,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+            if (head_cur + n_test > n_cells) {
+                n_tested += n_cells - head_cur;
                 head_cur = 0;
                 continue;
             }
@@ -1125,7 +1202,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= n_cells) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -2383,7 +2460,15 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
             continue;
         }
 
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, layer.k, inp->k_shift, layer.k_rot, il);
+        // a sparse cache shifts the mapped cells (one stream)
+        ggml_tensor * k     = layer.k;
+        ggml_tensor * shift = inp->k_shift;
+        if (sparse && n_cap < get_size()) {
+            k     = ggml_view_2d(ctx, layer.k, layer.k->ne[0], n_cap, layer.k->nb[1], 0);
+            shift = ggml_view_1d(ctx, inp->k_shift, n_cap, 0);
+        }
+
+        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, shift, layer.k_rot, il);
 
         ggml_build_forward_expand(gf, cur);
     }
@@ -2690,6 +2775,20 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         seq_rm(dest_seq_id, -1, -1);
 
+        // a sparse cache maps the cells first
+        if (sparse) {
+            uint32_t need = get_cells_end() + cell_count;
+            if (sinfo_in && !sinfo_in->empty()) {
+                for (const uint32_t idx : sinfo_in->idxs[0]) {
+                    need = std::max(need, idx + 1);
+                }
+            }
+            if (!set_cap(std::max(n_cap, need))) {
+                LLAMA_LOG_ERROR("%s: failed to map %u cells of the kv cache\n", __func__, need);
+                return false;
+            }
+        }
+
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
@@ -2801,6 +2900,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
+            return false;
+        }
+
+        if (sparse && !set_cap(std::max(n_cap, cell_count))) {
+            LLAMA_LOG_ERROR("%s: failed to map %u cells of the kv cache\n", __func__, cell_count);
             return false;
         }
 

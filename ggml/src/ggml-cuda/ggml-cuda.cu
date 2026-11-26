@@ -988,10 +988,13 @@ struct cuda_suspend_buffer {
     std::vector<cuda_suspend_weight> weights;
     std::unique_ptr<unsigned char[]> pageable;
     void * pinned = nullptr;
+    // a sparse buffer maps chunks of this size, only the committed ones (mapped = not suspended)
+    size_t chunk = 0;
+    std::vector<bool> committed;
 
     ~cuda_suspend_buffer() {
         if (mapped) {
-            CU_CHECK(cuMemUnmap(address, reserved));
+            unmap();
         }
         if (address) {
             CU_CHECK(cuMemAddressFree(address, reserved));
@@ -1000,6 +1003,109 @@ struct cuda_suspend_buffer {
             CUDA_CHECK(cudaFreeHost(pinned));
         }
     }
+
+    bool sparse() const {
+        return chunk > 0;
+    }
+
+    // the runs of committed chunks of a sparse buffer, f(offset, size)
+    template <typename F>
+    void for_runs(const std::vector<bool> & set, F && f) const {
+        for (size_t i = 0; i < set.size();) {
+            if (!set[i]) {
+                ++i;
+                continue;
+            }
+            size_t j = i;
+            while (j < set.size() && set[j]) {
+                ++j;
+            }
+            f(i*chunk, (j - i)*chunk);
+            i = j;
+        }
+    }
+
+    size_t committed_bytes() const {
+        size_t n = 0;
+        for (const bool c : committed) {
+            n += c ? chunk : 0;
+        }
+        return n;
+    }
+
+    // sparse buffers map each chunk on its own, so that a chunk can be unmapped alone
+    void unmap_range(size_t offset, size_t size) {
+        const size_t step = sparse() ? chunk : size;
+        for (size_t done = 0; done < size; done += step) {
+            CU_CHECK(cuMemUnmap(address + offset + done, step));
+        }
+    }
+
+    bool map_range(int device, size_t offset, size_t size) {
+        const int physical = ggml_cuda_get_physical_device(device);
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location = { CU_MEM_LOCATION_TYPE_DEVICE, physical };
+        const size_t step = sparse() ? chunk : size;
+        size_t done = 0;
+        for (; done < size; done += step) {
+            CUmemGenericAllocationHandle handle;
+            if (cuMemCreate(&handle, step, &prop, 0) != CUDA_SUCCESS) {
+                break;
+            }
+            const auto result = cuMemMap(address + offset + done, step, 0, handle, 0);
+            CU_CHECK(cuMemRelease(handle));
+            if (result != CUDA_SUCCESS) {
+                break;
+            }
+        }
+        if (done == size) {
+            CUmemAccessDesc access[GGML_CUDA_MAX_DEVICES];
+            size_t count = 0;
+            for (int peer = 0; peer < ggml_cuda_info().physical_device_count; ++peer) {
+                int can_access = peer == physical;
+                if (!can_access) {
+                    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, peer, physical));
+                }
+                if (can_access) {
+                    access[count++] = { { CU_MEM_LOCATION_TYPE_DEVICE, peer }, CU_MEM_ACCESS_FLAGS_PROT_READWRITE };
+                }
+            }
+            if (cuMemSetAccess(address + offset, size, access, count) == CUDA_SUCCESS) {
+                return true;
+            }
+        }
+        unmap_range(offset, done);
+        return false;
+    }
+
+    void unmap() {
+        if (sparse()) {
+            for_runs(committed, [&](size_t offset, size_t size) { unmap_range(offset, size); });
+        } else {
+            unmap_range(0, reserved);
+        }
+        mapped = false;
+    }
+
+    // copy the mapped memory to or from the backup
+    bool copy_backup(bool to_host) const {
+        bool ok = true;
+        auto copy = [&](size_t offset, size_t size) {
+            unsigned char * host = static_cast<unsigned char *>(backup()) + offset;
+            void * dev = reinterpret_cast<void *>(address + offset);
+            ok = ok && cudaMemcpy(to_host ? (void *) host : dev, to_host ? (const void *) dev : host, size,
+                                  to_host ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice) == cudaSuccess;
+        };
+        if (sparse()) {
+            for_runs(committed, copy);
+        } else {
+            copy(0, bytes);
+        }
+        return ok;
+    }
+
+    size_t bytes = 0; // the size of the buffer
 
     void * backup() const {
         return pinned ? pinned : pageable.get();
@@ -1012,36 +1118,24 @@ struct cuda_suspend_buffer {
     }
 
     bool map(int device) {
-        const int physical = ggml_cuda_get_physical_device(device);
-        CUmemAllocationProp prop = {};
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location = { CU_MEM_LOCATION_TYPE_DEVICE, physical };
-        CUmemGenericAllocationHandle handle;
-        if (cuMemCreate(&handle, reserved, &prop, 0) != CUDA_SUCCESS) {
-            return false;
+        if (!sparse()) {
+            mapped = map_range(device, 0, reserved);
+            return mapped;
         }
-        const auto result = cuMemMap(address, reserved, 0, handle, 0);
-        CU_CHECK(cuMemRelease(handle));
-        if (result != CUDA_SUCCESS) {
+        std::vector<std::pair<size_t, size_t>> done;
+        bool ok = true;
+        for_runs(committed, [&](size_t offset, size_t size) {
+            if (ok && (ok = map_range(device, offset, size))) {
+                done.emplace_back(offset, size);
+            }
+        });
+        if (!ok) {
+            for (const auto & [offset, size] : done) {
+                unmap_range(offset, size);
+            }
             return false;
         }
         mapped = true;
-        CUmemAccessDesc access[GGML_CUDA_MAX_DEVICES];
-        size_t count = 0;
-        for (int peer = 0; peer < ggml_cuda_info().physical_device_count; ++peer) {
-            int can_access = peer == physical;
-            if (!can_access) {
-                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, peer, physical));
-            }
-            if (can_access) {
-                access[count++] = { { CU_MEM_LOCATION_TYPE_DEVICE, peer }, CU_MEM_ACCESS_FLAGS_PROT_READWRITE };
-            }
-        }
-        if (cuMemSetAccess(address, reserved, access, count) != CUDA_SUCCESS) {
-            CU_CHECK(cuMemUnmap(address, reserved));
-            mapped = false;
-            return false;
-        }
         return true;
     }
 };
@@ -1305,6 +1399,15 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (ctx->suspend && ctx->suspend->sparse()) {
+        ctx->suspend->for_runs(ctx->suspend->committed, [&](size_t offset, size_t size) {
+            CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + offset, value, size, cudaStreamPerThread));
+        });
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        return;
+    }
+#endif
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1355,6 +1458,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
             return nullptr;
         }
         state->reserved = GGML_PAD(size, granularity);
+        state->bytes = size;
         if (cuMemAddressReserve(&state->address, state->reserved, 0, 0, 0) != CUDA_SUCCESS ||
                 !state->map(buft_ctx->device)) {
             GGML_LOG_ERROR("%s: cannot allocate %.2f MiB of suspendable CUDA memory on device %d\n",
@@ -1383,6 +1487,124 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
+
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_sparse_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    if (!ggml_backend_buft_is_cuda(buft) || size == 0) {
+        return nullptr;
+    }
+    const int device = ((ggml_backend_cuda_buffer_type_context *) buft->context)->device;
+    if (!ggml_cuda_info().devices[device].vmm) {
+        return nullptr;
+    }
+    ggml_cuda_set_device(device);
+
+    auto state = std::make_unique<cuda_suspend_buffer>();
+    state->chunk = ggml_cuda_info().devices[device].vmm_granularity;
+    if (size > SIZE_MAX - state->chunk) {
+        return nullptr;
+    }
+    state->reserved = GGML_PAD(size, state->chunk);
+    state->bytes = size;
+    state->committed.assign(state->reserved/state->chunk, false);
+    if (cuMemAddressReserve(&state->address, state->reserved, 0, 0, 0) != CUDA_SUCCESS) {
+        state->address = 0;
+        return nullptr;
+    }
+    state->mapped = true;
+    auto * ctx = new ggml_backend_cuda_buffer_context(device, reinterpret_cast<void *>(state->address));
+    ctx->suspend = std::move(state);
+    auto * buffer = ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    if (cuda_suspend_devices[device]) {
+        std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+        cuda_suspend_buffers.insert(buffer);
+    }
+    return buffer;
+}
+
+static bool ggml_backend_cuda_buffer_sparse_commit(ggml_backend_buffer_t buffer, const size_t * ranges, size_t n_ranges) {
+    if (!ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->suspend || !ctx->suspend->sparse()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+    auto & state = *ctx->suspend;
+    if (!state.mapped) {
+        return false;
+    }
+
+    std::vector<bool> want(state.committed.size(), false);
+    for (size_t i = 0; i < n_ranges; ++i) {
+        const size_t offset = ranges[2*i + 0];
+        const size_t size   = ranges[2*i + 1];
+        if (size == 0) {
+            continue;
+        }
+        GGML_ASSERT(offset <= buffer->size && size <= buffer->size - offset);
+        for (size_t c = offset/state.chunk; c <= (offset + size - 1)/state.chunk; ++c) {
+            want[c] = true;
+        }
+    }
+    std::vector<bool> add(want.size()), drop(want.size());
+    bool any_drop = false;
+    for (size_t c = 0; c < want.size(); ++c) {
+        add[c]  = want[c] && !state.committed[c];
+        drop[c] = !want[c] && state.committed[c];
+        any_drop = any_drop || drop[c];
+    }
+
+    ggml_cuda_set_device(ctx->device);
+    // map the new chunks first, a failure leaves the buffer as it was
+    std::vector<std::pair<size_t, size_t>> added;
+    bool ok = true;
+    state.for_runs(add, [&](size_t offset, size_t size) {
+        if (ok && (ok = state.map_range(ctx->device, offset, size))) {
+            added.emplace_back(offset, size);
+        }
+    });
+    if (!ok) {
+        for (const auto & [offset, size] : added) {
+            state.unmap_range(offset, size);
+        }
+        return false;
+    }
+    // new memory is zeroed, like a cleared buffer
+    for (const auto & [offset, size] : added) {
+        CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + offset, 0, size, cudaStreamPerThread));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    if (any_drop) {
+        // the work queued on the chunks that leave must be done
+        CUDA_CHECK(cudaDeviceSynchronize());
+        state.for_runs(drop, [&](size_t offset, size_t size) { state.unmap_range(offset, size); });
+    }
+    state.committed = std::move(want);
+    if (state.backup()) {
+        // a backup of the old layout is not read again
+        if (state.pinned) {
+            CUDA_CHECK(cudaFreeHost(state.pinned));
+            state.pinned = nullptr;
+        }
+        state.pageable.reset();
+    }
+    return true;
+}
+
+static size_t ggml_backend_cuda_buffer_sparse_committed(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_cuda(buffer)) {
+        return 0;
+    }
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (!ctx->suspend || !ctx->suspend->sparse()) {
+        return buffer->size;
+    }
+    std::lock_guard<std::mutex> lock(cuda_suspend_mutex);
+    return ctx->suspend->committed_bytes();
+}
+#endif
 
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return 128;
@@ -7154,7 +7376,7 @@ static bool ggml_backend_cuda_suspend_target(const char * name, unsigned char uu
         for (const auto * buffer : cuda_suspend_buffers) {
             const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(buffer->context);
             if (ctx->device == device && !ctx->suspend->mapped) {
-                *restore_bytes += ctx->suspend->reserved;
+                *restore_bytes += ctx->suspend->sparse() ? ctx->suspend->committed_bytes() : ctx->suspend->reserved;
             }
         }
         return true;
@@ -7192,7 +7414,16 @@ static bool cuda_suspend_prepare_buffers() {
                 continue;
             }
             ggml_cuda_set_device(ctx->device);
-            if (cudaMallocHost(&state.pinned, buffer->size) != cudaSuccess) {
+            if (state.sparse()) {
+                // the range of the buffer, the pages of the committed chunks only become resident
+                state.pageable.reset(new unsigned char[state.reserved]);
+                volatile unsigned char * pages = state.pageable.get();
+                state.for_runs(state.committed, [&](size_t offset, size_t size) {
+                    for (size_t page = offset; page < offset + size; page += 4096) {
+                        pages[page] = 0;
+                    }
+                });
+            } else if (cudaMallocHost(&state.pinned, buffer->size) != cudaSuccess) {
                 (void)cudaGetLastError();
                 state.pinned = nullptr;
                 state.pageable.reset(new unsigned char[buffer->size]);
@@ -7294,8 +7525,7 @@ static bool ggml_backend_cuda_suspend_set(bool suspend) {
             auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
             auto & state = *ctx->suspend;
             ggml_cuda_set_device(ctx->device);
-            if (state.mapped && state.backup() &&
-                    cudaMemcpy(state.backup(), ctx->dev_ptr, buffer->size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            if (state.mapped && state.backup() && !state.copy_backup(true)) {
                 return false;
             }
         }
@@ -7305,10 +7535,9 @@ static bool ggml_backend_cuda_suspend_set(bool suspend) {
             auto * ctx = static_cast<ggml_backend_cuda_buffer_context *>(buffer->context);
             auto & state = *ctx->suspend;
             ggml_cuda_set_device(ctx->device);
-            if (state.mapped && cuMemUnmap(state.address, state.reserved) != CUDA_SUCCESS) {
-                return false;
+            if (state.mapped) {
+                state.unmap();
             }
-            state.mapped = false;
         }
         return true;
     }
@@ -7332,8 +7561,7 @@ static bool ggml_backend_cuda_suspend_set(bool suspend) {
             }
             restored.push_back(ctx);
             if (state.backup()) {
-                success = cudaMemcpy(ctx->dev_ptr, state.backup(), buffer->size, cudaMemcpyHostToDevice) == cudaSuccess &&
-                          cudaStreamSynchronize(nullptr) == cudaSuccess;
+                success = state.copy_backup(false) && cudaStreamSynchronize(nullptr) == cudaSuccess;
             } else if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 if (staging.empty()) {
                     staging.resize(8 * 1024 * 1024);
@@ -7352,8 +7580,7 @@ static bool ggml_backend_cuda_suspend_set(bool suspend) {
         for (auto * ctx : restored) {
             ggml_cuda_set_device(ctx->device);
             (void)cudaStreamSynchronize(nullptr);
-            CU_CHECK(cuMemUnmap(ctx->suspend->address, ctx->suspend->reserved));
-            ctx->suspend->mapped = false;
+            ctx->suspend->unmap();
         }
     }
     return success;
@@ -7415,6 +7642,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_suspend_weight") == 0) {
         return (void *)ggml_backend_cuda_suspend_weight;
+    }
+    if (strcmp(name, "ggml_backend_cuda_buffer_sparse_alloc") == 0) {
+        return (void *)ggml_backend_cuda_buffer_sparse_alloc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_buffer_sparse_commit") == 0) {
+        return (void *)ggml_backend_cuda_buffer_sparse_commit;
+    }
+    if (strcmp(name, "ggml_backend_cuda_buffer_sparse_committed") == 0) {
+        return (void *)ggml_backend_cuda_buffer_sparse_committed;
     }
 #endif
     GGML_UNUSED(reg);

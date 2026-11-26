@@ -3,6 +3,10 @@
 #include "llama-ext.h"
 #include "llama-io.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -20,6 +24,25 @@ llama_memory_reserve_scope::llama_memory_reserve_scope(uint32_t n_cells) : prev(
 
 llama_memory_reserve_scope::~llama_memory_reserve_scope() {
     g_reserve_n_cells = prev;
+}
+
+static thread_local bool g_sparse = false;
+
+bool llama_memory_sparse() {
+    return g_sparse;
+}
+
+llama_memory_sparse_scope::llama_memory_sparse_scope(bool sparse) : prev(g_sparse) {
+    g_sparse = sparse;
+}
+
+llama_memory_sparse_scope::~llama_memory_sparse_scope() {
+    g_sparse = prev;
+}
+
+static ggml_backend_reg_t buffer_type_reg(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    return dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
 }
 
 llama_memory_status llama_memory_status_combine(llama_memory_status s0, llama_memory_status s1) {
@@ -109,6 +132,51 @@ ggml_backend_buffer_t llama_memory_bufs::emplace(ggml_context_ptr ctx, ggml_back
     bufs.emplace_back(std::move(ctx), std::move(buf));
 
     return bufs.back().second.get();
+}
+
+ggml_backend_buffer_t llama_memory_bufs::emplace_sparse(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft, const char * name) {
+    ggml_backend_reg_t reg = no_alloc ? nullptr : buffer_type_reg(buft);
+    auto alloc = reg ? (ggml_backend_cuda_buffer_sparse_alloc_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_buffer_sparse_alloc") : nullptr;
+    const size_t size = alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : 0;
+    ggml_backend_buffer_ptr buf(size > 0 ? alloc(buft, size) : nullptr);
+    if (!buf) {
+        return emplace(std::move(ctx), buft, name);
+    }
+
+    ggml_tallocr talloc = ggml_tallocr_new(buf.get());
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+        if (t->data != nullptr) {
+            continue;
+        }
+        const ggml_status st = t->view_src == nullptr ? ggml_tallocr_alloc(&talloc, t) : ggml_backend_view_init(t);
+        if (st != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error(std::string("failed to allocate buffer for ") + name);
+        }
+    }
+
+    sparse.push_back(buf.get());
+    bufs.emplace_back(std::move(ctx), std::move(buf));
+
+    return bufs.back().second.get();
+}
+
+bool llama_memory_bufs::is_sparse(ggml_backend_buffer_t buf) const {
+    return std::find(sparse.begin(), sparse.end(), buf) != sparse.end();
+}
+
+bool llama_memory_bufs::commit(ggml_backend_buffer_t buf, const std::vector<size_t> & ranges) {
+    ggml_backend_reg_t reg = buffer_type_reg(ggml_backend_buffer_get_type(buf));
+    auto fn = reg ? (ggml_backend_cuda_buffer_sparse_commit_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_buffer_sparse_commit") : nullptr;
+    return fn && fn(buf, ranges.data(), ranges.size()/2);
+}
+
+size_t llama_memory_bufs::committed(ggml_backend_buffer_t buf) {
+    ggml_backend_reg_t reg = buffer_type_reg(ggml_backend_buffer_get_type(buf));
+    auto fn = reg ? (ggml_backend_cuda_buffer_sparse_committed_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_buffer_sparse_committed") : nullptr;
+    return fn ? fn(buf) : ggml_backend_buffer_get_size(buf);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_bufs::memory_breakdown() const {

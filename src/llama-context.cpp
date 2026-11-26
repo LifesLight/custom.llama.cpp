@@ -569,7 +569,27 @@ llama_context::llama_context(
             /*.no_alloc  =*/ model.no_alloc(),
         };
 
+        // LLAMA_KV_GROW: the KV caches of a target context allocate sparse buffers, mapped in steps of this many cells
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc()) {
+            kv_grow_step = GGML_PAD((uint32_t) llama_env_uint("LLAMA_KV_GROW", 0, 0, UINT32_MAX/2), 256u);
+        }
+        const bool kv_follow = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other &&
+            params.ctx_other->kv_grow_step > 0 && !model.no_alloc();
+        llama_memory_sparse_scope sparse_scope(kv_grow_step > 0 || kv_follow);
+
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (kv_grow_step > 0 && (!memory || memory->get_cap() == 0)) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_GROW: the memory of this model cannot grow, it is allocated in full\n", __func__);
+            kv_grow_step = 0;
+        }
+        if (kv_grow_step > 0) {
+            kv_set_cap(kv_grow_step);
+        }
+        if (kv_follow && memory && memory->get_cap() > 0 && memory->set_cap(params.ctx_other->memory->get_cap())) {
+            kv_lead = params.ctx_other;
+            kv_lead->kv_followers.push_back(this);
+        }
     }
 
     // init backends
@@ -718,6 +738,14 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (kv_lead) {
+        auto & f = kv_lead->kv_followers;
+        f.erase(std::remove(f.begin(), f.end(), this), f.end());
+    }
+    for (auto * follower : kv_followers) {
+        follower->kv_lead = nullptr;
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -917,8 +945,60 @@ uint32_t llama_context::ubatch_prepare(uint32_t n_tokens, bool media) {
     return cparams.n_ubatch;
 }
 
+bool llama_context::kv_set_cap(uint32_t n_cells) {
+    const uint32_t cap = memory->get_cap();
+    if (!memory->set_cap(n_cells)) {
+        return false;
+    }
+    const uint32_t res = memory->get_cap();
+    // the followers map the same cells, back to the old cells (which only unmaps) when one cannot
+    for (size_t i = 0; i < kv_followers.size(); ++i) {
+        llama_memory_i * mem = kv_followers[i]->memory.get();
+        if (!mem->set_cap(std::max(res, mem->get_cells_end()))) {
+            for (size_t j = 0; j < i; ++j) {
+                kv_followers[j]->memory->set_cap(cap);
+            }
+            memory->set_cap(cap);
+            return false;
+        }
+    }
+    if (res != cap) {
+        LLAMA_LOG_INFO("%s: kv_grow: %u -> %u of %u cells mapped\n", __func__, cap, res, cparams.n_ctx_seq);
+    }
+    return true;
+}
+
+void llama_context::kv_grow(uint32_t n_tokens, bool small) {
+    if (kv_lead && memory->get_cells_end() + n_tokens > memory->get_cap()) {
+        memory->set_cap(memory->get_cells_end() + n_tokens + kv_lead->kv_grow_ahead);
+    }
+    if (kv_grow_step == 0 || cparams.training) {
+        return;
+    }
+    const uint32_t cap = memory->get_cap();
+    // a prompt maps the cells of each batch as it reaches them: ubatch_auto plans the memory of its later batches
+    const uint64_t want = (uint64_t) memory->get_cells_end() + n_tokens + kv_grow_ahead;
+    const uint32_t target = (uint32_t) std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD(want, (uint64_t) kv_grow_step));
+    // a decode batch only grows, a prompt also gives back what it does not use
+    if (target == cap || (small && target < cap)) {
+        return;
+    }
+    if (!kv_set_cap(target) && target > cap) {
+        // the workspace, and the GPU tier with it, make room
+        kv_cap_pending = target;
+        if (moe_hot) {
+            moe_hot_drop = true;
+        }
+        sched_workspace_recreate = true;
+        sched_need_reserve = true;
+    }
+}
+
 bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe) {
     const bool small = !startup_probe && sched_decode_workspace > 0 && !cparams.training && n_tokens <= sched_decode_workspace;
+    if (!startup_probe) {
+        kv_grow(n_tokens, small);
+    }
     if (!small) {
         moe_hot_attempted = false;
     }
@@ -1171,6 +1251,14 @@ void llama_context::sched_reserve() {
             moe_hot_drop = false;
         }
         sched_workspace_recreate = false;
+    }
+
+    if (kv_cap_pending > 0) {
+        const uint32_t n_cells = kv_cap_pending;
+        kv_cap_pending = 0;
+        if (!kv_set_cap(n_cells)) {
+            throw std::runtime_error(format("kv_grow: cannot map %u cells of the KV cache", n_cells));
+        }
     }
 
     sched_new({
@@ -3668,7 +3756,7 @@ void llama_context::ubatch_sizes(const llama_memory_context_i * mctx, uint32_t n
     }
 }
 
-std::vector<int64_t> llama_context::ubatch_budget() {
+std::vector<int64_t> llama_context::ubatch_budget(uint32_t n_cells) {
     // the memory the compute buffers may take on each device: what is free, plus the buffers of this scheduler
     // (replaced by the reservation), minus the margin and the memory reserved for others
     std::vector<int64_t> budget(backend_ptrs.size(), INT64_MAX);
@@ -3684,6 +3772,25 @@ std::vector<int64_t> llama_context::ubatch_budget() {
         budget[i] = (int64_t) free + (int64_t) ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) -
             (int64_t) ubatch_margin - (int64_t) (it != ubatch_dev_reserve.end() ? it->second : 0);
     }
+
+    if (kv_grow_step > 0 && memory) {
+        const uint64_t cap  = memory->get_cap();
+        const uint64_t need = std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD((uint64_t) n_cells + kv_grow_ahead, (uint64_t) kv_grow_step));
+        if (need > cap) {
+            std::map<ggml_backend_buffer_type_t, size_t> cell_bytes;
+            memory->get_cell_bytes(cell_bytes);
+            for (const auto * follower : kv_followers) {
+                follower->memory->get_cell_bytes(cell_bytes);
+            }
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const auto it = cell_bytes.find(ggml_backend_dev_buffer_type(ggml_backend_get_device(backend_ptrs[i])));
+                if (it != cell_bytes.end() && budget[i] != INT64_MAX) {
+                    // with the chunks that the tensors start and end in
+                    budget[i] -= (int64_t) ((need - cap)*it->second) + 32*1024*1024;
+                }
+            }
+        }
+    }
     return budget;
 }
 
@@ -3693,7 +3800,7 @@ uint32_t llama_context::ubatch_fit(uint32_t n_seqs, uint32_t n_cells, uint32_t n
     if (!mctx) {
         return 0;
     }
-    const std::vector<int64_t> budget = ubatch_budget();
+    const std::vector<int64_t> budget = ubatch_budget(n_cells);
     std::vector<size_t> sizes;
     auto fits = [&](uint32_t n_ubatch) {
         n_tries++;
@@ -3737,7 +3844,7 @@ uint32_t llama_context::ubatch_extend(uint32_t n_seqs, uint32_t n_ubatch, uint32
     auto cells_of = [&](uint32_t k) { return std::min(hi_c, lo_c + k*step); };
     auto fits = [&](uint32_t n_cells) {
         n_tries++;
-        const std::vector<int64_t> budget = ubatch_budget();
+        const std::vector<int64_t> budget = ubatch_budget(n_cells);
         llama_memory_reserve_scope scope(n_cells >= n_ctx ? 0 : n_cells);
         const auto mctx = memory->init_full();
         if (!mctx) {
@@ -3779,7 +3886,7 @@ uint32_t llama_context::ubatch_extend(uint32_t n_seqs, uint32_t n_ubatch, uint32
 uint32_t llama_context::ubatch_select(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_min) {
     const int64_t t_start_us = ggml_time_us();
 
-    const std::vector<int64_t> budget = ubatch_budget();
+    const std::vector<int64_t> budget = ubatch_budget(ubatch_need > 0 ? ubatch_need : cparams.n_ctx_seq);
 
     std::vector<size_t> sizes;
     int n_tries = 0;
@@ -4885,6 +4992,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     if (memory) {
         LLAMA_LOG_DEBUG("%s: - reading memory module\n", __func__);
 
+        if (kv_grow_step > 0) {
+            moe_hot_release();
+        }
         memory->state_read(io);
     }
 
@@ -4901,6 +5011,10 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
+        // a sparse KV cache maps the cells it restores: the GPU tier gives back its memory first (a prompt follows)
+        if (kv_grow_step > 0 && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+            moe_hot_release();
+        }
         memory->state_read(io, seq_id, flags);
     }
 
