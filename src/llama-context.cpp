@@ -3990,7 +3990,11 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
         lctx->n_reallocs_same++;
     }
 
-    LLAMA_LOG_INFO("%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
+    // the allocator then holds the sizes of this graph, so a context whose graphs grow with the cells reallocates again
+    // with them (the MTP draft: about every 128 tokens of a prompt). at info only the powers of two
+    const int32_t n = lctx->n_reallocs_same + lctx->n_reallocs_diff;
+    const ggml_log_level lvl = (n & (n - 1)) == 0 ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_DEBUG;
+    llama_log_internal(lvl, "%s: graph reallocation: nodes = %d (changed = %d), splits = %d, n_same = %d, n_diff = %d\n",
             __func__, ggml_graph_n_nodes(gf), graph_size_changed, ggml_backend_sched_get_n_splits(sched),
             lctx->n_reallocs_same, lctx->n_reallocs_diff);
 }
