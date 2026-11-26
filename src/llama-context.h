@@ -328,6 +328,13 @@ private:
     // ubatch_auto: the largest ubatch from n_min to ubatch_max whose compute buffers fit in the free device memory,
     // for the graphs of mctx (see ubatch_cells); n_min if none fits
     uint32_t ubatch_select(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_min);
+    // ubatch_auto: the memory the compute buffers may take per backend (INT64_MAX for the host)
+    std::vector<int64_t> ubatch_budget();
+    // ubatch_auto: the largest cell count from `from` up to `end` (0 = the full context) for which the graphs of
+    // n_ubatch tokens still fit, so that one reservation covers the next batches of the prompt
+    uint32_t ubatch_extend(uint32_t n_seqs, uint32_t n_ubatch, uint32_t from, uint32_t end);
+    // ubatch_auto: the largest ubatch up to n_max (multiples of 256) whose graphs attending to n_cells fit, 0 if none
+    uint32_t ubatch_fit(uint32_t n_seqs, uint32_t n_cells, uint32_t n_max, int & n_tries);
     // ubatch_auto: compute buffer sizes per backend of the prompt graph of n_ubatch tokens, without allocating them
     void ubatch_sizes(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_ubatch, std::vector<size_t> & sizes);
 
@@ -449,8 +456,14 @@ private:
     uint32_t ubatch_min_embd   = 0;     // llama_set_n_ubatch_min_embd
     uint32_t ubatch_hint       = 0;     // llama_set_prompt_hint
     uint32_t ubatch_need       = 0;     // cells the next prompt reservation plans for, 0 = the full context
+    uint32_t ubatch_need_end   = 0;     // cells at the end of the prompt: how far that reservation may cover
     uint32_t ubatch_need_min   = 0;     // smallest ubatch of the next prompt reservation
+    uint64_t ubatch_need_used  = 0;     // cells in use when it is planned
+    uint64_t ubatch_need_tok   = 0;     // the cells at the end of the prompt, not padded
+    bool     ubatch_need_plan  = false; // the first reservation of a prompt: staged or for its end
+    bool     ubatch_probe      = false; // reserving for ubatch_prepare(): the caller cuts its batch at the ubatch
     uint32_t ubatch_res_cells  = 0;     // cells the current prompt reservation plans for, 0 = the full context
+    uint64_t ubatch_res_used   = 0;     // cells in use when it was planned: fewer is a new prompt, planned again
     bool     ubatch_res_valid  = false; // the prompt workspace is reserved with these
     bool     ubatch_startup    = false; // the provisional reservation at load
     std::map<ggml_backend_dev_t, size_t> ubatch_dev_reserve; // llama_set_device_reserve

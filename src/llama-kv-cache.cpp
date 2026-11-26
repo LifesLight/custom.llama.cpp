@@ -424,6 +424,14 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
     }
 }
 
+uint32_t llama_kv_cache::get_cells_end() const {
+    uint32_t res = 0;
+    for (const auto & cells : v_cells) {
+        res = std::max(res, cells.used_max_p1());
+    }
+    return res;
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();

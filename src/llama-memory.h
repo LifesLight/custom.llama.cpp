@@ -132,6 +132,9 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // one past the last cell in use
+    virtual uint32_t get_cells_end() const { return 0; }
+
     //
     // ops
     //
