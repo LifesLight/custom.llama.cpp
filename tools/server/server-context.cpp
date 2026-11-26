@@ -837,8 +837,8 @@ struct server_slot {
         const double n_prompt_second = stats.n_prompt_tps();
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+        SLT_INF(*this, "prompt processing, n_tokens = %6d of %d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
+                (int) stats.n_prompt_processed, (int) (task->n_tokens() - stats.n_prompt_cached), f_progress, t_prompt_total / 1e3, n_prompt_second);
     }
 
     void print_timings() const {
@@ -4972,6 +4972,9 @@ private:
                             n_batch  = n_batch_prompt(true);
                             n_ubatch = llama_n_ubatch_cur(ctx_tgt);
                         }
+
+                        SLT_INF(slot, "new prompt: %d tokens, %d cached, %d to process in batches of up to %d tokens (n_ubatch = %d)\n",
+                                slot.task->n_tokens(), n_past, slot.task->n_tokens() - n_past, n_batch, n_ubatch);
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {

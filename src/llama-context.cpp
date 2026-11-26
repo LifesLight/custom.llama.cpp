@@ -947,6 +947,7 @@ uint32_t llama_context::ubatch_prepare(uint32_t n_tokens, bool media) {
 }
 
 bool llama_context::kv_set_cap(uint32_t n_cells) {
+    const int64_t t_start_us = ggml_time_us();
     const uint32_t cap = memory->get_cap();
     if (!memory->set_cap(n_cells)) {
         return false;
@@ -963,17 +964,51 @@ bool llama_context::kv_set_cap(uint32_t n_cells) {
             return false;
         }
     }
-    if (res != cap) {
-        LLAMA_LOG_INFO("%s: kv_grow: %u -> %u of %u cells mapped\n", __func__, cap, res, cparams.n_ctx_seq);
-    }
+    kv_log_cap(cap, res, t_start_us, true, "");
     return true;
+}
+
+void llama_context::kv_log_cap(uint32_t from, uint32_t to, int64_t t_start_us, bool followers, const char * what) const {
+    if (from == to || from == 0) {
+        return;
+    }
+    std::string mem;
+    for (const auto & [buft, bytes] : kv_bytes(std::min(from, to), std::max(from, to), followers)) {
+        mem += format("%s%s %c%.0f MiB", mem.empty() ? "" : ", ", ggml_backend_buft_name(buft), to > from ? '+' : '-', bytes/1048576.0);
+    }
+    if (t_start_us > 0) {
+        mem += format("%s%.0f ms", mem.empty() ? "" : ", ", (ggml_time_us() - t_start_us)/1000.0);
+    }
+    LLAMA_LOG_INFO("kv_grow: %s%s%u -> %u of %u cells mapped%s (%s)\n", kv_lead ? log_name() : "", kv_lead ? ": " : "",
+            from, to, cparams.n_ctx_seq, what, mem.c_str());
+}
+
+std::map<ggml_backend_buffer_type_t, int64_t> llama_context::kv_bytes(uint64_t from, uint64_t to, bool followers) const {
+    std::map<ggml_backend_buffer_type_t, int64_t> res;
+    if (!memory || to <= from) {
+        return res;
+    }
+    std::map<ggml_backend_buffer_type_t, size_t> cell_bytes;
+    memory->get_cell_bytes(cell_bytes);
+    for (const auto * follower : kv_followers) {
+        if (followers) {
+            follower->memory->get_cell_bytes(cell_bytes);
+        }
+    }
+    for (const auto & [buft, n] : cell_bytes) {
+        res[buft] = (int64_t) ((to - from)*n);
+    }
+    return res;
 }
 
 void llama_context::kv_grow(uint32_t n_tokens, bool small) {
     if (kv_lead && memory->get_cells_end() + n_tokens > memory->get_cap()) {
+        const int64_t  t_start_us = ggml_time_us();
+        const uint32_t cap = memory->get_cap();
         if (!memory->set_cap(memory->get_cells_end() + n_tokens + kv_lead->kv_grow_ahead)) {
-            LLAMA_LOG_WARN("%s: kv_grow: cannot map %u cells of the draft context\n", __func__, memory->get_cells_end() + n_tokens);
+            LLAMA_LOG_WARN("%s: kv_grow: cannot map %u cells of the %s context\n", __func__, memory->get_cells_end() + n_tokens, log_name());
         }
+        kv_log_cap(cap, memory->get_cap(), t_start_us, false, "");
     }
     if (kv_grow_step == 0 || cparams.training) {
         return;
@@ -1002,6 +1037,52 @@ void llama_context::kv_grow(uint32_t n_tokens, bool small) {
     }
 }
 
+uint64_t llama_context::cells_used() const {
+    if (!memory) {
+        return 0;
+    }
+    // the cells up to the last position: the first position of a memory can be that of a part that keeps fewer
+    // cells (the recurrent part of a hybrid memory, the raw window of DSV4)
+    uint64_t used = 0;
+    for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
+        const llama_pos p1 = memory->seq_pos_max(s);
+        if (p1 >= 0) {
+            used += (uint64_t) p1 + 1;
+        }
+    }
+    return std::max<uint64_t>(used, memory->get_cells_end());
+}
+
+const char * llama_context::log_name() const {
+    return cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : cparams.ctx_other ? "draft" : "main";
+}
+
+void llama_context::prefill_end() {
+    if (!prefill.active) {
+        return;
+    }
+    prefill.active = false;
+    uint64_t n_tokens = 0;
+    uint32_t n_ubatch = 0;
+    std::string ubs;
+    for (const auto & [n, k] : prefill.ubatches) {
+        n_tokens += (uint64_t) n*k;
+        n_ubatch += k;
+        ubs += format("%s%u%s", ubs.empty() ? "" : ", ", n, k > 1 ? format(" x%u", k).c_str() : "");
+    }
+    if (n_ubatch == 0) {
+        return;
+    }
+    std::string kv;
+    if (kv_grow_step > 0 && memory) {
+        kv = format(", KV %u of %u cells mapped", memory->get_cap(), cparams.n_ctx_seq);
+    }
+    LLAMA_LOG_INFO("%s: prefill: %llu tokens from cell %llu in %u ubatches (%s), %d reservations in %.1f s%s, %.1f s\n",
+            __func__, (unsigned long long) n_tokens, (unsigned long long) prefill.n_from, n_ubatch, ubs.c_str(),
+            prefill.n_res, prefill.t_res/1000.0, kv.c_str(), (ggml_time_us() - prefill.t_start)/1e6);
+    prefill.ubatches.clear();
+}
+
 bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe) {
     const bool small = !startup_probe && sched_decode_workspace > 0 && !cparams.training && n_tokens <= sched_decode_workspace;
     if (!startup_probe) {
@@ -1009,6 +1090,20 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
     }
     if (!small) {
         moe_hot_attempted = false;
+    }
+    // the prefill log: a prompt runs until the first small batch, or until a prompt that starts on fewer cells
+    if (ubatch_auto && sched_decode_workspace > 0 && !startup_probe && !cparams.training) {
+        const uint64_t used = cells_used();
+        if (small || (prefill.active && used < prefill.n_last)) {
+            prefill_end();
+        }
+        if (!small && !prefill.active) {
+            prefill = {};
+            prefill.active  = true;
+            prefill.t_start = ggml_time_us();
+            prefill.n_from  = used;
+        }
+        prefill.n_last = used;
     }
     // a batch with media embeddings is a prompt, also when small: the projector may still hold its memory
     moe_hot_n_small = small && !media ? moe_hot_n_small + (moe_hot_n_small < 2) : 0;
@@ -1041,15 +1136,7 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
         uint32_t need_end = ubatch_hint;
         uint64_t used     = 0;
         if (memory) {
-            // the cells up to the last position: the first position of a memory can be that of a part that keeps
-            // fewer cells (the recurrent part of a hybrid memory, the raw window of DSV4)
-            for (uint32_t s = 0; s < cparams.n_seq_max; ++s) {
-                const llama_pos p1 = memory->seq_pos_max(s);
-                if (p1 >= 0) {
-                    used += (uint64_t) p1 + 1;
-                }
-            }
-            used = std::max<uint64_t>(used, memory->get_cells_end());
+            used = cells_used();
             // with several positions per embedding (M-RoPE), the positions can count fewer cells than the tokens: only
             // the hint of the whole prompt bounds them
             const bool pos_cells = model.hparams.n_pos_per_embd() == 1;
@@ -1087,7 +1174,7 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
             cparams.n_ubatch >= std::min(need_min, ubatch_max);
         if (sched_need_reserve || !covered) {
             if (!sched_need_reserve) {
-                LLAMA_LOG_INFO("%s: ubatch_auto: the prompt needs %s cells (reserved: %s), reserving again\n", __func__,
+                LLAMA_LOG_DEBUG("%s: ubatch_auto: the prompt needs %s cells (reserved: %s), reserving again\n", __func__,
                         need > 0 ? std::to_string(need).c_str() : "all",
                         ubatch_res_cells > 0 ? std::to_string(ubatch_res_cells).c_str() : "all");
                 // with workspace switching, the old buffers are freed first, so that the new ones can take their memory
@@ -1370,6 +1457,7 @@ void llama_context::sched_reserve() {
                 if (!flat && u_end > 0 && ubatch_need_plan) {
                     uint64_t n_staged = 0;
                     std::map<uint32_t, uint32_t> fit_at;
+                    std::vector<std::pair<uint32_t, uint32_t>> stages; // runs of (tokens, count)
                     for (uint64_t pos = used, u = n_tokens; pos < end && n_staged < n_flat; ++n_staged) {
                         if (n_staged > 0) {
                             const uint32_t c = pad_c(std::min<uint64_t>(pos + u, end));
@@ -1379,12 +1467,23 @@ void llama_context::sched_reserve() {
                             }
                             u = std::max<uint32_t>(it->second, 256);
                         }
+                        const uint32_t n = (uint32_t) std::min<uint64_t>(u, end - pos);
+                        if (!stages.empty() && stages.back().first == n) {
+                            stages.back().second++;
+                        } else {
+                            stages.emplace_back(n, 1);
+                        }
                         pos += u;
                     }
                     flat = n_staged >= n_flat;
-                    LLAMA_LOG_INFO("%s: ubatch_auto: %llu prompt tokens in %s%llu ubatches staged or %llu at n_ubatch = %u for %u cells: %s (%d graphs in %.0f ms)\n",
-                            __func__, (unsigned long long) (end - used), flat ? ">= " : "", (unsigned long long) n_staged,
-                            (unsigned long long) n_flat, u_end, c_end, flat ? "at once" : "staged", n_tries, (ggml_time_us() - t0)/1000.0);
+                    std::string str;
+                    for (const auto & [n, k] : stages) {
+                        str += format("%s%u%s", str.empty() ? "" : ", ", n, k > 1 ? format(" x%u", k).c_str() : "");
+                    }
+                    LLAMA_LOG_INFO("%s: prefill: plan for %llu tokens from cell %llu: staged %s%s (%s%llu ubatches) or %llu x %u at once for %u cells -> %s (%d graphs in %.0f ms)\n",
+                            __func__, (unsigned long long) (end - used), (unsigned long long) used, str.c_str(), flat ? ", ..." : "",
+                            flat ? ">= " : "", (unsigned long long) n_staged, (unsigned long long) n_flat, u_end, c_end,
+                            flat ? "at once" : "staged", n_tries, (ggml_time_us() - t0)/1000.0);
                 }
                 if (flat) {
                     n_tokens    = u_end;
@@ -1516,13 +1615,6 @@ void llama_context::sched_reserve() {
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
-        if (switching) {
-            size_t available = 0, total = 0;
-            ggml_backend_dev_memory(ggml_backend_get_device(backend), &available, &total);
-            LLAMA_LOG_INFO("workspace_switch: context=%p mode=%s tokens=%u backend=%s compute_MiB=%.2f->%.2f free_MiB=%.2f->%.2f\n",
-                    (void *) this, sched_workspace_small ? "small" : "large", n_tokens, ggml_backend_name(backend),
-                    old_sizes[i]/1048576.0, backend_buf_exp_size[i]/1048576.0, free_before[i]/1048576.0, available/1048576.0);
-        }
     }
 
     {
@@ -1547,9 +1639,62 @@ void llama_context::sched_reserve() {
     llama_log_internal(log_lvl, "%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
     sched_reserved = true;
-    if (switching) {
-        LLAMA_LOG_INFO("workspace_switch: context=%p mode=%s ready in %.2f ms\n",
-                (void *) this, sched_workspace_small ? "small" : "large", (t_end_us - t_start_us)/1000.0);
+
+    // one line per reservation of a prompt (ubatch_auto) or workspace switch: the compute buffers (old -> new), the
+    // budget of ubatch_auto (after the KV cells it plans to map) and the free memory after it
+    const bool log_prefill = ub_sel && !ubatch_startup;
+    if (log_prefill || switching) {
+        const uint32_t n_cells_kv = n_cells_res > 0 ? n_cells_res : cparams.n_ctx_seq;
+        const std::vector<int64_t> budget = log_prefill ? ubatch_budget(n_cells_kv) : std::vector<int64_t>();
+        std::map<ggml_backend_buffer_type_t, int64_t> kv;
+        if (log_prefill && kv_grow_step > 0 && memory) {
+            const uint64_t need = std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD((uint64_t) n_cells_kv + kv_grow_ahead, (uint64_t) kv_grow_step));
+            kv = kv_bytes(memory->get_cap(), need);
+        }
+        std::string mem;
+        int64_t d_max = 0;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const int64_t cur = (int64_t) backend_buf_exp_size[i];
+            const int64_t old = switching ? (int64_t) old_sizes[i] : cur;
+            if (cur <= 1 && old <= 1) {
+                continue;
+            }
+            d_max = std::max<int64_t>(d_max, std::abs(cur - old));
+            mem += format("%s%s ", mem.empty() ? "" : ", ", ggml_backend_name(backend_ptrs[i]));
+            if (switching) {
+                mem += format("%.0f -> ", old/1048576.0);
+            }
+            mem += format("%.0f", cur/1048576.0);
+            if (log_prefill && budget[i] != INT64_MAX) {
+                mem += format(" of %.0f", budget[i]/1048576.0);
+            }
+            mem += " MiB";
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            const auto it_kv = kv.find(ggml_backend_dev_buffer_type(dev));
+            if (it_kv != kv.end() && it_kv->second > 0) {
+                mem += format(" after KV +%.0f", it_kv->second/1048576.0);
+            }
+            if (switching && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                size_t available = 0, total = 0;
+                ggml_backend_dev_memory(dev, &available, &total);
+                mem += format(" (%.0f free)", available/1048576.0);
+            }
+        }
+        const double t_ms = (t_end_us - t_start_us)/1000.0;
+        if (log_prefill) {
+            LLAMA_LOG_INFO("%s: prefill: n_ubatch = %u for cells %llu..%s (the prompt ends at %llu): %s, %.0f ms\n", __func__,
+                    n_tokens, (unsigned long long) ubatch_need_used, n_cells_res > 0 ? std::to_string(n_cells_res).c_str() : "all",
+                    (unsigned long long) ubatch_need_tok, mem.c_str(), t_ms);
+            if (prefill.active) {
+                prefill.n_res++;
+                prefill.t_res += t_ms;
+            }
+        } else {
+            // a switch that barely changes the buffers (the draft context between its batch sizes) at debug
+            llama_log_internal(d_max >= 32*1048576 ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_DEBUG,
+                    "workspace_switch: %s %s (%u tokens): %s, %.0f ms\n", log_name(), sched_workspace_small ? "small" : "large",
+                    n_tokens, mem.c_str(), t_ms);
+        }
     }
 }
 
@@ -2983,6 +3128,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool startup_probe)
     do {
         const auto & ubatch = mctx->get_ubatch();
 
+        if (prefill.active) {
+            auto & ubs = prefill.ubatches;
+            if (!ubs.empty() && ubs.back().first == ubatch.n_tokens) {
+                ubs.back().second++;
+            } else {
+                ubs.emplace_back(ubatch.n_tokens, 1);
+            }
+        }
+
         // count the outputs in this ubatch
         {
             int32_t n_outputs_new = 0;
@@ -3789,18 +3943,12 @@ std::vector<int64_t> llama_context::ubatch_budget(uint32_t n_cells) {
     if (kv_grow_step > 0 && memory) {
         const uint64_t cap  = memory->get_cap();
         const uint64_t need = std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD((uint64_t) n_cells + kv_grow_ahead, (uint64_t) kv_grow_step));
-        if (need > cap) {
-            std::map<ggml_backend_buffer_type_t, size_t> cell_bytes;
-            memory->get_cell_bytes(cell_bytes);
-            for (const auto * follower : kv_followers) {
-                follower->memory->get_cell_bytes(cell_bytes);
-            }
-            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-                const auto it = cell_bytes.find(ggml_backend_dev_buffer_type(ggml_backend_get_device(backend_ptrs[i])));
-                if (it != cell_bytes.end() && budget[i] != INT64_MAX) {
-                    // with the chunks that the tensors start and end in
-                    budget[i] -= (int64_t) ((need - cap)*it->second) + 32*1024*1024;
-                }
+        const auto kv = kv_bytes(cap, need);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const auto it = kv.find(ggml_backend_dev_buffer_type(ggml_backend_get_device(backend_ptrs[i])));
+            if (it != kv.end() && budget[i] != INT64_MAX) {
+                // with the chunks that the tensors start and end in
+                budget[i] -= it->second + 32*1024*1024;
             }
         }
     }
@@ -3890,7 +4038,7 @@ uint32_t llama_context::ubatch_extend(uint32_t n_seqs, uint32_t n_ubatch, uint32
     }
     const uint32_t res = cells_of(lo);
     if (lo > 0) {
-        LLAMA_LOG_INFO("%s: ubatch_auto: n_ubatch = %u reserved up to %u cells (the prompt ends at %u), %d graphs in %.0f ms\n",
+        LLAMA_LOG_DEBUG("%s: ubatch_auto: n_ubatch = %u reserved up to %u cells (the prompt ends at %u), %d graphs in %.0f ms\n",
                 __func__, n_ubatch, res, hi_c, n_tries, (ggml_time_us() - t_start_us)/1000.0);
     }
     return res >= n_ctx ? 0 : res;
@@ -3949,7 +4097,8 @@ uint32_t llama_context::ubatch_select(const llama_memory_context_i * mctx, uint3
             mem += format(" %s %.0f/%.0f MiB", ggml_backend_name(backend_ptrs[i]), sizes[i]/1048576.0, budget[i]/1048576.0);
         }
     }
-    LLAMA_LOG_INFO("%s: ubatch_auto: n_ubatch = %u for %s cells (compute/budget:%s), %d graphs in %.0f ms\n", __func__,
+    llama_log_internal(ubatch_startup ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_DEBUG,
+            "%s: ubatch_auto: n_ubatch = %u for %s cells (compute/budget:%s), %d graphs in %.0f ms\n", __func__,
             res, ubatch_need > 0 ? std::to_string(ubatch_need).c_str() : "all", mem.c_str(), n_tries + 1,
             (ggml_time_us() - t_start_us)/1000.0);
 
@@ -5012,7 +5161,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         if (kv_grow_step > 0) {
             moe_hot_release();
         }
+        const uint32_t cap = memory->get_cap();
         memory->state_read(io);
+        kv_log_cap(cap, memory->get_cap(), 0, false, " for a state read");
     }
 
     return io.n_bytes();
@@ -5032,7 +5183,9 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
         if (kv_grow_step > 0 && !(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
             moe_hot_release();
         }
+        const uint32_t cap = memory->get_cap();
         memory->state_read(io, seq_id, flags);
+        kv_log_cap(cap, memory->get_cap(), 0, false, " for a state read");
     }
 
     return io.n_bytes();

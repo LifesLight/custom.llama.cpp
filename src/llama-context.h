@@ -483,6 +483,26 @@ private:
 
     void kv_grow(uint32_t n_tokens, bool small);
     bool kv_set_cap(uint32_t n_cells);
+    // the device memory of the KV cells [from, to) of this context (and its followers), per buffer type
+    std::map<ggml_backend_buffer_type_t, int64_t> kv_bytes(uint64_t from, uint64_t to, bool followers = true) const;
+    void kv_log_cap(uint32_t from, uint32_t to, int64_t t_start_us, bool followers, const char * what) const;
+
+    // ubatch_auto with workspace switching: the ubatches and reservations of a prompt, logged at its end
+    struct prefill_log {
+        bool     active  = false;
+        int64_t  t_start = 0;
+        uint64_t n_from  = 0; // cells in use at its start
+        uint64_t n_last  = 0; // and at its last batch
+        int      n_res   = 0;
+        double   t_res   = 0.0; // ms
+        std::vector<std::pair<uint32_t, uint32_t>> ubatches; // runs of (tokens, count)
+    } prefill;
+    void prefill_end();
+
+    // cells up to the last position of each sequence, at least the cells in use
+    uint64_t cells_used() const;
+    // main, mtp or draft
+    const char * log_name() const;
 
 public:
     void set_prompt_hint(uint32_t n_tokens) { ubatch_hint = n_tokens; }
