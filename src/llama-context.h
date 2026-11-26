@@ -470,10 +470,11 @@ private:
     std::map<ggml_backend_dev_t, size_t> ubatch_dev_reserve; // llama_set_device_reserve
 
     // LLAMA_KV_GROW: the sparse KV cache maps the cells in use and those of the batch (with kv_grow_ahead more) in
-    // steps of kv_grow_step cells, a prompt gives back the others. 0 = off
+    // steps of kv_grow_step cells, a new prompt gives back the others. 0 = off
     uint32_t kv_grow_step    = 0;
     uint32_t kv_grow_ahead   = 64;
     uint32_t kv_cap_pending  = 0; // mapped once the workspace (and the GPU tier) made room
+    uint32_t kv_used_last    = 0; // cells in use at the previous batch: fewer starts a new prompt
 
     // the MTP draft context of a target with LLAMA_KV_GROW follows the cap of the target (kv_lead), which plans the
     // memory of both

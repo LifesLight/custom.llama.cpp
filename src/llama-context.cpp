@@ -570,7 +570,8 @@ llama_context::llama_context(
         };
 
         // LLAMA_KV_GROW: the KV caches of a target context allocate sparse buffers, mapped in steps of this many cells
-        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !model.no_alloc()) {
+        // (not a draft that reads the target, a DFlash/DSpark decoder: its cache is small)
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !params.ctx_other && !model.no_alloc()) {
             kv_grow_step = GGML_PAD((uint32_t) llama_env_uint("LLAMA_KV_GROW", 0, 0, UINT32_MAX/2), 256u);
         }
         const bool kv_follow = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other &&
@@ -970,17 +971,24 @@ bool llama_context::kv_set_cap(uint32_t n_cells) {
 
 void llama_context::kv_grow(uint32_t n_tokens, bool small) {
     if (kv_lead && memory->get_cells_end() + n_tokens > memory->get_cap()) {
-        memory->set_cap(memory->get_cells_end() + n_tokens + kv_lead->kv_grow_ahead);
+        if (!memory->set_cap(memory->get_cells_end() + n_tokens + kv_lead->kv_grow_ahead)) {
+            LLAMA_LOG_WARN("%s: kv_grow: cannot map %u cells of the draft context\n", __func__, memory->get_cells_end() + n_tokens);
+        }
     }
     if (kv_grow_step == 0 || cparams.training) {
         return;
     }
-    const uint32_t cap = memory->get_cap();
+    const uint32_t cap  = memory->get_cap();
+    const uint32_t used = memory->get_cells_end();
+    // fewer cells in use than at the previous batch: a new prompt (or a shorter one), which may give back cells
+    const bool fewer = used < kv_used_last;
+    kv_used_last = used;
     // a prompt maps the cells of each batch as it reaches them: ubatch_auto plans the memory of its later batches
-    const uint64_t want = (uint64_t) memory->get_cells_end() + n_tokens + kv_grow_ahead;
+    const uint64_t want = (uint64_t) used + n_tokens + kv_grow_ahead;
     const uint32_t target = (uint32_t) std::min<uint64_t>(cparams.n_ctx_seq, GGML_PAD(want, (uint64_t) kv_grow_step));
-    // a decode batch only grows, a prompt also gives back what it does not use
-    if (target == cap || (small && target < cap)) {
+    // within a prompt or a generation the cells only grow: a short batch (the server cuts one before a checkpoint)
+    // does not give back the cells of the next one
+    if (target == cap || (target < cap && (small || !fewer))) {
         return;
     }
     if (!kv_set_cap(target) && target > cap) {
