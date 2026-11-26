@@ -4963,8 +4963,12 @@ private:
                             update_ubatch_hints();
                         }
 
-                        // the ubatch of the new prompt, with the projector released
+                        // the ubatch of the new prompt, with the projector released. the cells after the cached
+                        // prefix go first and the hint is the one of this prompt, so that the reservation plans for
+                        // the cells the prompt uses (not for the previous prompt, which may be saved to disk by now)
                         if (params_base.ubatch_auto && batch.size() == 0) {
+                            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+                            update_ubatch_hints();
                             n_batch  = n_batch_prompt(true);
                             n_ubatch = llama_n_ubatch_cur(ctx_tgt);
                         }
