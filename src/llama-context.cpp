@@ -1077,7 +1077,12 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
             need_min = std::max(need_min, n_tokens);
         }
 
-        const bool covered = ubatch_res_valid && used >= ubatch_res_used &&
+        // the last two batches of a prompt: the server cuts the first one an ubatch before the end (a checkpoint), so a
+        // reservation that does not reach the end plans for it before that cut. a smaller ubatch of the end after the
+        // cut would leave a short batch
+        const bool tail = ubatch_res_valid && ubatch_res_cells != 0 && (need_end == 0 || need_end > ubatch_res_cells) &&
+            ubatch_need_tok <= used + 2*(uint64_t) cparams.n_ubatch;
+        const bool covered = ubatch_res_valid && used >= ubatch_res_used && !tail &&
             (ubatch_res_cells == 0 || (need > 0 && need <= ubatch_res_cells)) &&
             cparams.n_ubatch >= std::min(need_min, ubatch_max);
         if (sched_need_reserve || !covered) {
