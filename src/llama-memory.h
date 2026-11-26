@@ -146,6 +146,8 @@ struct llama_memory_i {
 
     // sparse memory (LLAMA_KV_GROW): the device memory is mapped for the cells [0, cap) only, 0 = not sparse
     virtual uint32_t get_cap() const { return 0; }
+    // whether this memory would map its cells in steps with LLAMA_KV_GROW (also when it was not allocated so)
+    virtual bool get_can_cap() const { return false; }
     // map the cells [0, n_cells), at least the cells in use, and unmap the others. false if out of memory (unchanged)
     virtual bool set_cap(uint32_t n_cells) { GGML_UNUSED(n_cells); return true; }
     // one past the last cell in use

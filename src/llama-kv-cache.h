@@ -136,6 +136,7 @@ public:
     bool get_can_shift() const override;
 
     uint32_t get_cap() const override;
+    bool     get_can_cap() const override;
     bool     set_cap(uint32_t n_cells) override;
     uint32_t get_cells_end() const override;
     void     get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const override;
@@ -347,7 +348,8 @@ private:
 
     // sparse buffers (LLAMA_KV_GROW): the memory of the cells [n_cap, size) is not mapped, and find_slot() does not
     // use these cells
-    bool     sparse = false;
+    bool     sparse  = false;
+    bool     can_cap = false;
     uint32_t n_cap  = 0;
 
     // the ranges of the cells [0, n_cells) of the tensors in buf

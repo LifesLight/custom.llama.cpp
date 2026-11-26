@@ -70,6 +70,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
 
+bool llama_memory_hybrid_idx::get_can_cap() const {
+    return llama_memory_hybrid::get_can_cap() && (!mem_idx || mem_idx->get_can_cap());
+}
+
 uint32_t llama_memory_hybrid_idx::get_cap() const {
     const uint32_t cap = llama_memory_hybrid::get_cap();
     return mem_idx && mem_idx->get_cap() > 0 ? (cap > 0 ? std::min(cap, mem_idx->get_cap()) : mem_idx->get_cap()) : cap;

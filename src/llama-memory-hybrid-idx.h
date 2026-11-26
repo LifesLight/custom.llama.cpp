@@ -59,6 +59,7 @@ public:
 
     // the indexer cache uses the cells of the attention cache: both have the same cap
     uint32_t get_cap() const override;
+    bool     get_can_cap() const override;
     bool     set_cap(uint32_t n_cells) override;
     void     get_cell_bytes(std::map<ggml_backend_buffer_type_t, size_t> & out) const override;
 

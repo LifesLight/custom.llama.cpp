@@ -1243,7 +1243,9 @@ struct ts_search_row {
     std::vector<uint32_t> ub;        // ubatch per prompt size, 0 if even 256 does not fit
     std::vector<int> limit;          // index of the device that limits the ubatch per prompt size, -1 if none
     bool extra_ok = true;            // the extra memory fits next to the decode state
+    bool extra_full = true;          // also at the full context (with LLAMA_KV_GROW)
     std::vector<int64_t> spare_full; // per GPU: budget left at the full context with the ubatch chosen there, MiB
+    std::vector<double> passes;      // ubatches of the ranked prompt sizes, the ubatch of each part from its end
 };
 
 } // namespace
@@ -1281,6 +1283,7 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
     std::vector<ggml_backend_dev_t> devs;
     std::vector<int64_t> free_mem;
     uint32_t n_ctx = 0;
+    bool kv_grows = false; // the KV cache of the target maps its cells in steps (LLAMA_KV_GROW)
     {
         llama_model_ptr model(common_model_load(params.model.get_paths(), mparams));
         if (!model) {
@@ -1303,6 +1306,7 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
             return false;
         }
         n_ctx = llama_n_ctx(ctx.get());
+        kv_grows = llama_kv_can_grow(ctx.get());
     }
     if (devs.size() < 2) {
         LOG_ERR("%s: needs at least two GPUs, the model has %zu\n", __func__, devs.size());
@@ -1333,14 +1337,33 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
     const int k_cur = ts_sum > 0.0f ? (int) std::lround(ts_cur[0]) :
         (int) std::lround((double) n_pair * free_mem[0] / (double) (free_mem[0] + free_mem[1]));
 
-    // the prompt sizes: as --ubatch-auto plans them, in steps of 4096 cells, and the full context
+    // the prompt sizes: as --ubatch-auto plans them, in steps of 4096 cells, up to 64k and the full context. the
+    // splits are ranked by the ubatches of the prompts of 16k to 64k
     std::vector<uint32_t> cells;
-    for (uint32_t c : { 4096u, 32768u }) {
+    for (uint32_t c : { 4096u, 8192u, 16384u, 32768u, 49152u, 65536u }) {
         if (c < n_ctx) {
             cells.push_back(c);
         }
     }
     cells.push_back(n_ctx);
+    std::vector<uint32_t> ranked;
+    for (uint32_t c : { 16384u, 32768u, 49152u, 65536u }) {
+        if (c <= n_ctx) {
+            ranked.push_back(c);
+        }
+    }
+    if (ranked.empty()) {
+        ranked.push_back(n_ctx);
+    }
+
+    // LLAMA_KV_GROW: the KV cache maps the cells of the prompt (in steps), not the full context
+    const char * kv_env = getenv("LLAMA_KV_GROW");
+    const uint32_t kv_step = kv_env ? GGML_PAD((uint32_t) std::min<unsigned long>(strtoul(kv_env, nullptr, 10), UINT32_MAX/2), 256u) : 0;
+    const uint32_t n_ctx_small = 4096;
+    kv_grows = kv_grows && kv_step > 0 && n_ctx > 2*n_ctx_small;
+    auto kv_mapped = [&](uint32_t n) {
+        return kv_step > 0 ? std::min<uint32_t>(n_ctx, GGML_PAD(n + 64, kv_step)) : n_ctx;
+    };
 
     const uint32_t step = 256;
 
@@ -1410,6 +1433,51 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
         // after the draft setup, which may add device rows to the target
         add(ctx.get(), true, false);
 
+        // LLAMA_KV_GROW: the device memory per KV cell, from a second target context of fewer cells (the context
+        // memory of the target that does not grow with the cells stays, e.g. a recurrent state). the cache of an MTP
+        // draft follows the target, all of its context memory is KV
+        std::vector<int64_t> kv_cell(devs.size(), 0);
+        if (kv_grows) {
+            auto context_of = [&](const llama_context * c, std::vector<int64_t> & out) {
+                out.assign(devs.size(), 0);
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(c)) {
+                    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                    for (size_t i = 0; i < devs.size(); ++i) {
+                        if (!ggml_backend_buft_is_host(buft) && dev == devs[i]) {
+                            out[i] += (int64_t) mb.context;
+                        }
+                    }
+                }
+            };
+            llama_context_params cparams_small = cparams;
+            cparams_small.n_ctx = n_ctx_small;
+            llama_context_ptr ctx_small(llama_init_from_model(model.get(), cparams_small));
+            if (ctx_small) {
+                std::vector<int64_t> c_full, c_small;
+                context_of(ctx.get(), c_full);
+                context_of(ctx_small.get(), c_small);
+                const int64_t d_cells = (int64_t) n_ctx - (int64_t) llama_n_ctx(ctx_small.get());
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    kv_cell[i] = std::max<int64_t>(0, c_full[i] - c_small[i])/std::max<int64_t>(d_cells, 1);
+                }
+            }
+            if (spec_mtp && !has_draft && ctx_dft) {
+                std::vector<int64_t> c_dft;
+                context_of(ctx_dft.get(), c_dft);
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    kv_cell[i] += c_dft[i]/(int64_t) n_ctx;
+                }
+            }
+        }
+        // the memory next to the compute buffers of a prompt of n cells: the KV cells it maps (and the chunks they
+        // start and end in, as --ubatch-auto charges them)
+        auto fixed_at = [&](uint32_t n, size_t i) {
+            if (kv_cell[i] == 0) {
+                return fixed[i];
+            }
+            return fixed[i] - kv_cell[i]*(int64_t) (n_ctx - kv_mapped(n)) + 32*MiB;
+        };
+
         std::vector<ggml_backend_dev_t> mdevs(16);
         std::vector<size_t> msizes(16);
         // the compute sizes per GPU of a prompt of n cells at ubatch u
@@ -1434,12 +1502,12 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
                 std::string str;
                 for (size_t i = 0; i < devs.size(); ++i) {
                     str += string_format(" %s fixed %" PRId64 " compute %" PRId64 " free %" PRId64, ggml_backend_dev_name(devs[i]),
-                        fixed[i]/MiB, sz[i]/MiB, free_mem[i]/MiB);
+                        fixed_at(n, i)/MiB, sz[i]/MiB, free_mem[i]/MiB);
                 }
                 LOG_INF("%s: k=%d cells=%u ub=%u:%s\n", __func__, k, n, u, str.c_str());
             }
             for (size_t i = 0; i < devs.size(); ++i) {
-                if (fixed[i] + sz[i] + margin > free_mem[i]) {
+                if (fixed_at(n, i) + sz[i] + margin > free_mem[i]) {
                     return (int) i;
                 }
             }
@@ -1474,22 +1542,44 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
             row.limit.push_back(best == ub_max ? -1 : lim);
         }
 
+        // the ubatches of a prompt of n tokens: each part of it between two prompt sizes runs with the ubatch of
+        // the end of that part, as the prefill schedule stages them
+        for (const uint32_t n : ranked) {
+            double p = 0.0;
+            uint32_t prev = 0;
+            for (size_t j = 0; j < cells.size() && prev < n; ++j) {
+                const uint32_t end = std::min(cells[j], n);
+                if (end <= prev) {
+                    continue;
+                }
+                p += row.ub[j] > 0 ? (double) (end - prev)/row.ub[j] : INFINITY;
+                prev = end;
+            }
+            row.passes.push_back(p);
+        }
+
         // what is left at the full context with its ubatch, per GPU
         sizes(n_ctx, std::max<uint32_t>(row.ub.back(), 1), sz);
         for (size_t i = 0; i < devs.size(); ++i) {
             row.spare_full.push_back((free_mem[i] - fixed[i] - sz[i] - margin)/MiB);
         }
 
-        // the extra memory (a projector) next to the decode state: a small workspace at the full context
+        // the extra memory (a projector) next to the decode state: a small workspace (reserved for the full context)
+        // and the KV cells, of the full context or with LLAMA_KV_GROW of the largest ranked prompt
         if (!extra_mem.empty()) {
             sizes(n_ctx, 32, sz);
-            for (size_t i = 0; i < devs.size(); ++i) {
-                const auto it = extra_mem.find(devs[i]);
-                const int64_t extra = it != extra_mem.end() ? (int64_t) it->second : 0;
-                if (fixed[i] + sz[i] + extra + margin > free_mem[i]) {
-                    row.extra_ok = false;
+            auto extra_fits = [&](uint32_t n) {
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    const auto it = extra_mem.find(devs[i]);
+                    const int64_t extra = it != extra_mem.end() ? (int64_t) it->second : 0;
+                    if (fixed_at(n, i) + sz[i] + extra + margin > free_mem[i]) {
+                        return false;
+                    }
                 }
-            }
+                return true;
+            };
+            row.extra_ok   = extra_fits(kv_grows ? ranked.back() : n_ctx);
+            row.extra_full = extra_fits(n_ctx);
         }
 
         if (k == k_cur) {
@@ -1510,6 +1600,12 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
     LOG_INF("%s: splitting %d layers between %s (%" PRId64 " MiB free) and %s (%" PRId64 " MiB free), -c %u, ubatch up to %u, margin %" PRId64 " MiB\n",
         __func__, n_pair, ggml_backend_dev_name(devs[0]), free_mem[0]/MiB, ggml_backend_dev_name(devs[1]), free_mem[1]/MiB,
         n_ctx, ub_max, margin/MiB);
+    if (kv_grows) {
+        LOG_INF("%s: the KV cache maps the cells of the prompt in steps of %u (LLAMA_KV_GROW): the projector is checked next to %u cells\n",
+            __func__, kv_step, ranked.back());
+    } else if (kv_step > 0) {
+        LOG_INF("%s: LLAMA_KV_GROW is set, but the KV cache of this model is allocated for the full context\n", __func__);
+    }
 
     // from the configured split outwards, until a split does not fit any more
     std::vector<ts_search_row> rows;
@@ -1544,22 +1640,42 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
     for (const uint32_t n : cells) {
         head += string_format(" %14s", (std::to_string(n) + " cells").c_str());
     }
-    head += "   spare at -c [MiB]";
+    std::string head_passes;
+    for (const uint32_t n : ranked) {
+        head_passes += string_format("%s%uk", head_passes.empty() ? "" : "/", n/1024);
+    }
+    head += "   ubatches " + head_passes + "   spare at -c [MiB]";
     LOG_INF("%s:   %s\n", __func__, head.c_str());
 
-    // the recommendation: the largest ubatch at the middle prompt size, then at the full context, then at the
-    // smallest, then the most memory left on the tighter GPU at the full context
-    const size_t i_mid = cells.size() > 1 ? cells.size() - 2 : 0;
+    // the recommendation: the fewest ubatches over the prompts of 16k to 64k, then the largest ubatch at the full
+    // context, then the most memory left on the tighter GPU at the full context
     const ts_search_row * best = nullptr;
+    auto total = [](const ts_search_row & r) {
+        double t = 0.0;
+        for (const double p : r.passes) {
+            t += p;
+        }
+        return t;
+    };
     auto better = [&](const ts_search_row & a, const ts_search_row & b) {
-        for (size_t i : { i_mid, cells.size() - 1, (size_t) 0 }) {
-            if (a.ub[i] != b.ub[i]) {
-                return a.ub[i] > b.ub[i];
-            }
+        const double ta = total(a);
+        const double tb = total(b);
+        if (std::fabs(ta - tb) > 1e-3*std::max(ta, tb)) {
+            return ta < tb;
+        }
+        if (a.ub.back() != b.ub.back()) {
+            return a.ub.back() > b.ub.back();
         }
         const int64_t sa = *std::min_element(a.spare_full.begin(), a.spare_full.end());
         const int64_t sb = *std::min_element(b.spare_full.begin(), b.spare_full.end());
         return sa > sb;
+    };
+    auto fmt_passes = [](const ts_search_row & r) {
+        std::string str;
+        for (const double p : r.passes) {
+            str += string_format("%s%.1f", str.empty() ? "" : "/", p);
+        }
+        return str;
     };
     const ts_search_row * cur = nullptr;
     for (const auto & r : rows) {
@@ -1574,12 +1690,14 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
                 }
                 line += string_format(" %14s", cell.c_str());
             }
-            line += "  ";
+            line += string_format("   %*s  ", (int) std::max<size_t>(head_passes.size() + 9, 1), fmt_passes(r).c_str());
             for (size_t i = 0; i < devs.size(); ++i) {
                 line += string_format(" %6" PRId64, r.spare_full[i]);
             }
             if (!r.extra_ok) {
                 line += "  (projector does not fit)";
+            } else if (!r.extra_full) {
+                line += "  (projector does not fit at -c)";
             }
         }
         LOG_INF("%s: %s\n", __func__, line.c_str());
@@ -1598,11 +1716,13 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
         return false;
     }
     if (cur && best->k == cur->k) {
-        LOG_INF("%s: recommended: -ts %s (the configured split)\n", __func__, fmt_ts(best->k).c_str());
+        LOG_INF("%s: recommended: -ts %s (the configured split, %s ubatches for %s prompts)\n", __func__, fmt_ts(best->k).c_str(),
+            fmt_passes(*best).c_str(), head_passes.c_str());
     } else {
-        LOG_INF("%s: recommended: -ts %s (ubatch %u at %u cells", __func__, fmt_ts(best->k).c_str(), best->ub[i_mid], cells[i_mid]);
+        LOG_INF("%s: recommended: -ts %s (%s ubatches for %s prompts", __func__, fmt_ts(best->k).c_str(),
+            fmt_passes(*best).c_str(), head_passes.c_str());
         if (cur && cur->ok) {
-            LOG_CNT(", the configured -ts %s: %u", fmt_ts(cur->k).c_str(), cur->ub[i_mid]);
+            LOG_CNT(", the configured -ts %s: %s", fmt_ts(cur->k).c_str(), fmt_passes(*cur).c_str());
         }
         LOG_CNT(")\n");
     }

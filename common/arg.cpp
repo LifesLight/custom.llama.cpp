@@ -1682,7 +1682,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--ts-search"},
         "measure layer splits between the first two GPUs without loading the model and print the ubatch "
-        "--ubatch-auto would select for each at a few prompt sizes, then exit. needs -ngl, or -ts in layers",
+        "--ubatch-auto would select for each at a few prompt sizes, then exit. recommends the split with the fewest "
+        "ubatches for prompts of 16k to 64k; with LLAMA_KV_GROW the KV counts the cells of each prompt size. "
+        "needs -ngl, or -ts in layers",
         [](common_params & params) {
             params.ts_search = true;
         }

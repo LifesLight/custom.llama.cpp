@@ -135,6 +135,10 @@ uint32_t llama_memory_hybrid::get_cap() const {
     return mem_attn->get_cap();
 }
 
+bool llama_memory_hybrid::get_can_cap() const {
+    return mem_attn->get_can_cap();
+}
+
 bool llama_memory_hybrid::set_cap(uint32_t n_cells) {
     return mem_attn->set_cap(n_cells);
 }

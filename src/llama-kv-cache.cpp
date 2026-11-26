@@ -274,10 +274,11 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // LLAMA_KV_GROW: the cells of one stream are a prefix of each tensor, unless V is transposed
-    bool want_sparse = llama_memory_sparse() && n_stream == 1 && !other;
+    can_cap = n_stream == 1 && !other;
     for (const auto & layer : layers) {
-        want_sparse = want_sparse && (!layer.v || !v_trans);
+        can_cap = can_cap && (!layer.v || !v_trans);
     }
+    const bool want_sparse = llama_memory_sparse() && can_cap;
 
     // allocate the tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
@@ -444,6 +445,10 @@ void llama_kv_cache::init_rotation(const char * name_tag) {
 
 uint32_t llama_kv_cache::get_cap() const {
     return sparse ? n_cap : 0;
+}
+
+bool llama_kv_cache::get_can_cap() const {
+    return can_cap;
 }
 
 uint32_t llama_kv_cache::get_cells_end() const {
