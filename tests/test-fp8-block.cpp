@@ -84,13 +84,16 @@ static bool check(ggml_backend_t backend, int tokens, bool unit_vectors, int bs 
         for (int t = 0; t < tokens; ++t) {
             for (int row = 0; row < n; ++row) {
                 double expected = 0.0;
+                double magnitude = 0.0;
                 for (int col = 0; col < k; ++col) {
                     const float weight = decode(weights[(b*n + row)*k + col]) *
                                          scales[(b*blocks_n + row/bs)*blocks_k + col/bs];
                     expected += double(weight) * input[(b*tokens + t)*k + col];
+                    magnitude += std::abs(double(weight) * input[(b*tokens + t)*k + col]);
                 }
                 const double actual = output[(b*tokens + t)*n + row];
-                const double tolerance = unit_vectors ? 0.0 : 0.0002 * (1 + std::abs(expected));
+                // above 8 tokens CUDA runs cuBLAS, whose handles use TF32 (10-bit mantissa inputs)
+                const double tolerance = unit_vectors ? 0.0 : tokens > 8 ? 0.001 * (1 + magnitude) : 0.0002 * (1 + std::abs(expected));
                 if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
                     std::fprintf(stderr, "%s: bs=%d batch=%d tokens=%d b=%d t=%d row=%d got %.9g expected %.9g\n",
                                  ggml_backend_name(backend), bs, batch, tokens, b, t, row, actual, expected);
@@ -118,7 +121,9 @@ int main() {
         }
         for (int batch : { 1, 3 }) {
             if (!check(backend.get(), 4, true, 32, batch) || !check(backend.get(), 5, false, 32, batch) ||
-                !check(backend.get(), 40, false, 32, batch) || !check(backend.get(), 13, false, 128, batch)) {
+                !check(backend.get(), 40, false, 32, batch) || !check(backend.get(), 13, false, 128, batch) ||
+                !check(backend.get(), 1, false, 32, batch) || !check(backend.get(), 7, false, 32, batch) ||
+                !check(backend.get(), 8, false, 128, batch)) {
                 return 1;
             }
         }

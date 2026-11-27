@@ -2,35 +2,67 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+// a warp takes nrows rows and all tokens at once, so the weights are read once and each input value feeds nrows
+// rows; a lane takes 4 consecutive weights per step (k and n are multiples of bs >= 32, so the 4 share one scale)
+template <int ntokens, int nrows>
 static __global__ void mul_mat_vec_fp8_block(
-        const uint8_t * weights, const float * inputs, const float * scales, float * out,
-        int k, int n, int tokens, int bs) {
+        const uint8_t * weights, const float * inputs, const float * scales, float * out, int k, int n, int bs) {
     const int lane = threadIdx.x % WARP_SIZE;
-    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
-    const int token = blockIdx.y;
+    const int row0 = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE * nrows;
     const int batch = blockIdx.z;
-    if (row >= n) {
+    if (row0 >= n) {
         return;
     }
 
-    const int blocks_k = k / bs;
-    const uint8_t * w = weights + ((int64_t) batch*n + row)*k;
-    const float * x = inputs + ((int64_t) batch*tokens + token)*k;
-    const float * s = scales + ((int64_t) batch*(n/bs) + row/bs)*blocks_k;
-    float sum = 0.0f;
-    for (int block = 0; block < blocks_k; ++block) {
-        const float d = s[block];
-        const int start = block * bs;
-        for (int offset = 0; offset < bs; offset += WARP_SIZE) {
-            const int col = start + offset + lane;
-            const float weight = __fmul_rn(ggml_cuda_f8_e4m3_to_fp32(w[col]), d);
-            sum = fmaf(weight, x[col], sum);
+    const uint8_t * w = weights + ((int64_t) batch*n + row0)*k;
+    const float * x = inputs + (int64_t) batch*ntokens*k;
+    const float * s = scales + (int64_t) batch*(n/bs)*(k/bs);
+    float sum[nrows][ntokens] = {};
+    for (int col = 4*lane; col < k; col += 4*WARP_SIZE) {
+        float4 xv[ntokens];
+#pragma unroll
+        for (int t = 0; t < ntokens; ++t) {
+            xv[t] = *(const float4 *) (x + (int64_t) t*k + col);
+        }
+#pragma unroll
+        for (int r = 0; r < nrows; ++r) {
+            const uint32_t q = *(const uint32_t *) (w + (int64_t) r*k + col);
+            const float d = s[(row0 + r)/bs*(k/bs) + col/bs];
+            float wf[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                wf[j] = __fmul_rn(ggml_cuda_f8_e4m3_to_fp32((q >> (8*j)) & 0xFF), d);
+            }
+#pragma unroll
+            for (int t = 0; t < ntokens; ++t) {
+                sum[r][t] = fmaf(wf[0], xv[t].x, sum[r][t]);
+                sum[r][t] = fmaf(wf[1], xv[t].y, sum[r][t]);
+                sum[r][t] = fmaf(wf[2], xv[t].z, sum[r][t]);
+                sum[r][t] = fmaf(wf[3], xv[t].w, sum[r][t]);
+            }
         }
     }
-    sum = warp_reduce_sum(sum);
-    if (lane == 0) {
-        out[((int64_t) batch*tokens + token)*n + row] = sum;
+#pragma unroll
+    for (int r = 0; r < nrows; ++r) {
+#pragma unroll
+        for (int t = 0; t < ntokens; ++t) {
+            const float v = warp_reduce_sum(sum[r][t]);
+            if (lane == 0) {
+                out[((int64_t) batch*ntokens + t)*n + row0 + r] = v;
+            }
+        }
     }
+}
+
+template <int ntokens>
+static void launch_mul_mat_vec_fp8_block(
+        const uint8_t * weights, const float * inputs, const float * scales, float * out,
+        int k, int n, int n_batch, int bs, cudaStream_t stream) {
+    constexpr int nrows = 4; // divides n, a multiple of bs
+    constexpr int threads = 128;
+    const int warps = n/nrows;
+    const dim3 grid((warps + threads/WARP_SIZE - 1)/(threads/WARP_SIZE), 1, n_batch);
+    mul_mat_vec_fp8_block<ntokens, nrows><<<grid, threads, 0, stream>>>(weights, inputs, scales, out, k, n, bs);
 }
 
 static __global__ void dequantize_fp8_block_rows(
@@ -64,10 +96,19 @@ void ggml_cuda_mul_mat_fp8_block(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 
-    if (tokens <= 8) {
-        constexpr int threads = 128;
-        const dim3 grid((n + threads/WARP_SIZE - 1)/(threads/WARP_SIZE), tokens, n_batch);
-        mul_mat_vec_fp8_block<<<grid, threads, 0, ctx.stream()>>>(weights, inputs, scales, out, k, n, tokens, bs);
+    // the vector kernel reads 16-byte input and 4-byte weight words
+    if (tokens <= 8 && ((uintptr_t) inputs | (uintptr_t) weights) % 16 == 0) {
+        cudaStream_t stream = ctx.stream();
+        switch (tokens) {
+            case 1: launch_mul_mat_vec_fp8_block<1>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+            case 2: launch_mul_mat_vec_fp8_block<2>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+            case 3: launch_mul_mat_vec_fp8_block<3>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+            case 4: launch_mul_mat_vec_fp8_block<4>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+            case 5: launch_mul_mat_vec_fp8_block<5>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+            case 6: launch_mul_mat_vec_fp8_block<6>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+            case 7: launch_mul_mat_vec_fp8_block<7>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+            default: launch_mul_mat_vec_fp8_block<8>(weights, inputs, scales, out, k, n, n_batch, bs, stream); break;
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
