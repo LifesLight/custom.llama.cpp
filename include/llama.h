@@ -640,6 +640,7 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+    LLAMA_API bool    llama_model_is_swa_all   (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -1264,6 +1265,20 @@ extern "C" {
     // Write the enabled layer inputs to a device buffer [n_layer_inp*n_embd, n_batch] instead of host memory.
     // Row r holds the token at batch index r, layers in ascending layer id order.
     LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
+
+    // Minimum trailing prompt tokens whose enabled layer inputs are preserved for DFlash/DSpark during CED prefill.
+    LLAMA_API void llama_set_embeddings_layer_inp_tail(struct llama_context * ctx, uint32_t tail_len);
+
+    // Returns CED layer-input capture status for seq_id: -1 = none/standard path, 0 = deferred in encoder tail, 1 = flushed to layer_inp buffers.
+    LLAMA_API int32_t llama_ced_layer_inp_status(
+            const struct llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_pos * pos_beg_out,
+            int32_t * row_beg_out,
+            int32_t * n_rows_out);
+
+    // Resets CED layer-input capture status for seq_id after consuming flushed buffers.
+    LLAMA_API void llama_ced_clear_layer_inp_status(struct llama_context * ctx, llama_seq_id seq_id);
 
     // Whether decode accepts entries added with llama_batch_ext_add_embd_row()
     // (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).

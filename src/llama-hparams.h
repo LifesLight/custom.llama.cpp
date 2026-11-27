@@ -373,6 +373,14 @@ struct llama_hparams {
     int32_t  dsv41_cand_src         = -1;    // -1 = no candidate block selection
     uint32_t dsv41_cand_topk_blocks = 0;
     uint32_t dsv41_cand_block_size  = 0;
+    int32_t  dsv41_ced_dec_layer    = -1;    // first decoder layer of Causal Encoder-Decoder split, -1 = none
+
+    uint32_t dsv41_ced_tail_tokens(uint32_t n_rs_seq = 0) const {
+        if (dsv41_ced_dec_layer < 0 || n_swa == 0) {
+            return 0;
+        }
+        return (n_layer() - (uint32_t) dsv41_ced_dec_layer) * (n_swa - 1) + 1 + 2 * n_rs_seq;
+    }
 
     // 0 = full rank (DeepSeek-V4)
     uint32_t hc_low_rank = 0;

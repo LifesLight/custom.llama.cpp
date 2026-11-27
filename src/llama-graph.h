@@ -626,11 +626,14 @@ public:
 
     void set_input(const llama_ubatch * ubatch);
 
-    ggml_tensor * get_k_idxs() const { return self_k_idxs; }
+    ggml_tensor * get_k_idxs()     const { return self_k_idxs; }
+    ggml_tensor * get_k_idxs_dec() const { return self_k_idxs_dec; }
 
-    ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+    ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
+    ggml_tensor * self_k_idxs_dec = nullptr; // I64 [n_batch] (CED decoder SWA layers)
 
     llm_attn_mask self_attn_mask;
+    llm_attn_mask self_attn_mask_dec;
 
     std::vector<ggml_tensor *> self_k_rot;
 
@@ -686,6 +689,7 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_dsv4_context * mctx;
+    int32_t ced_mode = 0; // llama_dsv4_ced_mode
 };
 
 class llm_graph_input_attn_cross : public llm_graph_input_i {
@@ -963,6 +967,8 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_ced_h()       const { return t_ced_h; }
+    ggml_tensor * get_ced_pre()     const { return t_ced_pre; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -1004,6 +1010,12 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_ced_h       = nullptr; // [n_embd, hc_mult, n_keep] CED encoder exit stream
+    ggml_tensor * t_ced_pre     = nullptr; // [hc_mult, n_keep] CED encoder exit pre_prev
+
+    bool    ced_skip_layer_inp = false;
+    int32_t ced_li_start       = -1;
+    int64_t ced_li_dst_offset  = 0;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1125,6 +1137,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // Optional next-layer token count hint for llama_moe_stream prefetch/forecast (-1 = use cur n_tokens, 0 = none)
+    mutable int32_t moe_stream_next_n_tokens = -1;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

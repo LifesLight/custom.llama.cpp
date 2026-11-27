@@ -706,7 +706,9 @@ struct llama_moe_stream::impl {
         if (thp_thread.joinable()) {
             thp_thread.join();
         }
+#ifdef __linux__
         stop_grow();
+#endif
 
 #ifdef __linux__
         for (auto & s : slots) {
@@ -3293,12 +3295,13 @@ struct llama_moe_stream::impl {
 
     // for a batch of n tokens of layer il computed on the GPU: the router of the next layer, false if its experts are
     // not forecast
-    bool forecast_info(int il, int64_t n, llama_moe_stream_prefetch & out) const {
-        if (!fc_on || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+    bool forecast_info(int il, int64_t n, llama_moe_stream_prefetch & out, int64_t next_n = -1) const {
+        if (!fc_on || next_n == 0 || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
             return false;
         }
         const auto & t = pf_targets[layer_of_il[il]];
-        if (t.next_li < 0 || cpu_path(il, n) || cpu_path(layers[t.next_li].il, n) || !layers[t.next_li].streamed()) {
+        const int64_t nn = next_n < 0 ? n : next_n;
+        if (t.next_li < 0 || cpu_path(il, n) || cpu_path(layers[t.next_li].il, nn) || !layers[t.next_li].streamed()) {
             return false;
         }
         out.gate_inp    = t.gate_inp;
@@ -3321,12 +3324,13 @@ struct llama_moe_stream::impl {
         return ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, 1, forecast_op, 1, const_cast<op_ctx *>(&pf_op_ctxs[li]));
     }
 
-    bool prefetch_info(int il, int64_t n, llama_moe_stream_prefetch & out) const {
-        if (pf_k <= 0 || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
+    bool prefetch_info(int il, int64_t n, llama_moe_stream_prefetch & out, int64_t next_n = -1) const {
+        if (pf_k <= 0 || next_n == 0 || il < 0 || il >= (int) layer_of_il.size() || layer_of_il[il] < 0) {
             return false;
         }
         const auto & t = pf_targets[layer_of_il[il]];
-        if (t.next_li < 0 || !cpu_path(il, n) || !cpu_path(layers[t.next_li].il, n)) {
+        const int64_t nn = next_n < 0 ? n : next_n;
+        if (t.next_li < 0 || !cpu_path(il, n) || !cpu_path(layers[t.next_li].il, nn)) {
             return false;
         }
         // all its experts are cached, or the busy slots could leave a batch without room (no overflow window)
@@ -5258,13 +5262,14 @@ ggml_tensor * llama_moe_stream::build_profile_mark(ggml_context * ctx, ggml_tens
 #endif
 }
 
-bool llama_moe_stream::forecast_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const {
+bool llama_moe_stream::forecast_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out, int64_t next_n_tokens) const {
 #ifdef __linux__
-    return pimpl->is_active && pimpl->forecast_info(il, n_tokens, out);
+    return pimpl->is_active && pimpl->forecast_info(il, n_tokens, out, next_n_tokens);
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(n_tokens);
     GGML_UNUSED(out);
+    GGML_UNUSED(next_n_tokens);
     return false;
 #endif
 }
@@ -5280,13 +5285,14 @@ ggml_tensor * llama_moe_stream::build_forecast(ggml_context * ctx, ggml_tensor *
 #endif
 }
 
-bool llama_moe_stream::prefetch_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const {
+bool llama_moe_stream::prefetch_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out, int64_t next_n_tokens) const {
 #ifdef __linux__
-    return pimpl->is_active && pimpl->prefetch_info(il, n_tokens, out);
+    return pimpl->is_active && pimpl->prefetch_info(il, n_tokens, out, next_n_tokens);
 #else
     GGML_UNUSED(il);
     GGML_UNUSED(n_tokens);
     GGML_UNUSED(out);
+    GGML_UNUSED(next_n_tokens);
     return false;
 #endif
 }

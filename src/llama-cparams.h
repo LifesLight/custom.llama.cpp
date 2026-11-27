@@ -70,6 +70,7 @@ struct llama_cparams {
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
     bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
+    uint32_t embeddings_layer_inp_tail = 0; // minimum trailing prompt tokens needing layer_inp under DSV41 CED
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

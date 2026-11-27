@@ -3,10 +3,44 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <unordered_map>
 #include <vector>
+
+enum llama_dsv4_ced_mode {
+    LLAMA_DSV4_CED_FULL     = 0,
+    LLAMA_DSV4_CED_ENC_ONLY = 1,
+    LLAMA_DSV4_CED_DEC_ONLY = 2,
+};
+
+struct llama_dsv4_ced_plan {
+    llama_dsv4_ced_mode mode = LLAMA_DSV4_CED_FULL;
+
+    // [n_layer] first token index within the ubatch [0 .. n_tokens] that needs
+    // SWA K projection (k_start) / full attention+FFN output (o_start) at layer il.
+    // Empty = unpruned (all tokens run at all decoder layers).
+    std::vector<int32_t> k_start;
+    std::vector<int32_t> o_start;
+
+    // Host pointers for LLAMA_DSV4_CED_DEC_ONLY ubatch inputs.
+    const float  * dec_h_enc    = nullptr; // [n_tokens * hc_mult * n_embd]
+    const float  * dec_pre_prev = nullptr; // [n_tokens * hc_mult]
+    const int8_t * dec_is_embd  = nullptr; // [n_tokens] (0 = text, 1 = embedding/VL)
+    bool dec_has_vl = false;
+    bool dec_all_vl = false;
+
+    // DSpark layer_inp extraction bounds inside [0 .. n_tokens):
+    // -1 = normal (all rows), [0 .. n_tokens) = slice [li_start, n_tokens), >= n_tokens = skip
+    int32_t li_start      = -1;
+    int64_t li_dst_offset = 0;
+
+    // LLAMA_DSV4_CED_ENC_ONLY: max trailing tokens per sequence exported to host ring (0 = all)
+    uint32_t tail_keep_max = 0;
+};
+
+bool llama_dsv41_ced_env_enabled();
 
 class llama_dsv4_comp_state {
 public:
@@ -116,6 +150,21 @@ public:
             uint32_t n_ubatch,
             bool embd_all) override;
 
+    llama_memory_context_ptr init_batch_ced(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            bool embd_all,
+            bool enc_only,
+            const llama_dsv4_ced_plan * full_plan = nullptr);
+
+    llama_memory_context_ptr init_dec_only(
+            llama_seq_id seq_id,
+            std::vector<llama_ubatch> ubatches,
+            std::vector<llama_dsv4_ced_plan> ced_plans);
+
+    llama_memory_context_ptr init_full_enc_only();
+    llama_memory_context_ptr init_full_dec_only();
+
     llama_memory_context_ptr init_full() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
@@ -160,7 +209,66 @@ public:
     // copy the sources into their mirrors after a state read
     void refill_comp_mirrors();
 
+    // CED (Causal Encoder-Decoder) API for DeepSeek-V4.1
+    bool      ced_enabled() const;
+    int32_t   get_ced_dec_layer() const;
+    uint32_t  get_ced_n_swa() const;
+    uint32_t  get_ced_hc_mult() const;
+    uint32_t  get_ced_n_embd() const;
+    uint32_t  get_ced_tail_cap() const;
+    uint32_t  get_ced_dec_ubatch_cap() const;
+    void      ced_ensure_tail_cap(uint32_t min_cap);
+
+    bool      ced_has_deferred(llama_seq_id seq_id = -1) const;
+    llama_pos seq_dec_pos_max(llama_seq_id seq_id) const;
+    void      ced_reset_dec_seq(llama_seq_id seq_id);
+    void      ced_clear_tail(llama_seq_id seq_id, bool free_mem = false);
+    void      ced_trim_tail_after(llama_seq_id seq_id, llama_pos pos_max_keep);
+
+    void ced_push_tail(
+            llama_seq_id seq_id,
+            const float     * h_enc,
+            const float     * pre_prev,
+            const llama_pos * pos,
+            const int8_t    * is_embd,
+            uint32_t          n_tokens);
+
+    void ced_extract_tail_range(
+            llama_seq_id seq_id,
+            llama_pos    p_start,
+            std::vector<float>     & out_h,
+            std::vector<float>     & out_pre,
+            std::vector<llama_pos> & out_pos,
+            std::vector<int8_t>    & out_is_embd) const;
+
+    void ced_compute_layer_bounds(
+            llama_pos p_enc,
+            llama_pos dec_pos_max,
+            llama_pos p_out_min,
+            const std::vector<llama_pos> & p_li_min,
+            std::vector<llama_pos> & K_min,
+            std::vector<llama_pos> & O_min) const;
+
+    void ced_map_chunk_bounds(
+            const llama_pos * chunk_pos,
+            uint32_t n_chunk,
+            const std::vector<llama_pos> & K_min,
+            const std::vector<llama_pos> & O_min,
+            std::vector<int32_t> & k_start,
+            std::vector<int32_t> & o_start) const;
+
 private:
+    friend class llama_kv_cache_dsv4_context;
+
+    struct ced_seq_tail {
+        uint32_t head  = 0;
+        uint32_t count = 0;
+        std::vector<float>     h_enc;    // [cap * hc_mult * n_embd]
+        std::vector<float>     pre_prev; // [cap * hc_mult]
+        std::vector<llama_pos> pos;      // [cap]
+        std::vector<int8_t>    is_embd;  // [cap]
+    };
+
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;
@@ -168,6 +276,14 @@ private:
 
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
+
+    int32_t  ced_dec_layer = -1;
+    uint32_t ced_n_layer   = 0;
+    uint32_t ced_n_swa     = 0;
+    uint32_t ced_hc_mult   = 0;
+    uint32_t ced_n_embd    = 0;
+    uint32_t ced_tail_cap  = 0;
+    std::vector<ced_seq_tail> ced_tails;
 
     std::vector<uint32_t> rs_idx;
 
@@ -184,6 +300,7 @@ private:
     bool comp_mirrors_stale = false;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
+    std::unique_ptr<llama_kv_cache>      kv_raw_dec; // CED decoder SWA layers (>= ced_dec_layer), nullptr when CED disabled
     std::unique_ptr<llama_kv_cache>      kv_csa;
     std::unique_ptr<llama_kv_cache>      kv_hca;
     std::unique_ptr<llama_kv_cache>      kv_lid;
@@ -200,20 +317,27 @@ class llama_kv_cache_dsv4_raw_context : public llama_memory_context_i {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv);
+    llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv, llama_kv_cache * kv_dec, int32_t ced_dec_layer, llama_dsv4_ced_mode reserve_mode = LLAMA_DSV4_CED_FULL);
 
     llama_kv_cache_dsv4_raw_context(
             llama_kv_cache_iswa * kv,
+            llama_kv_cache * kv_dec,
+            int32_t ced_dec_layer,
             llama_context * lctx,
             bool optimize);
 
     llama_kv_cache_dsv4_raw_context(
             llama_kv_cache_iswa * kv,
+            llama_kv_cache * kv_dec,
+            int32_t ced_dec_layer,
             slot_info_vec_t sinfos_base_write,
             slot_info_vec_t sinfos_swa_write,
             slot_info_vec_t sinfos_swa_read,
+            slot_info_vec_t sinfos_dec_write,
+            slot_info_vec_t sinfos_dec_read,
             std::vector<llama_ubatch> ubatches,
-            std::vector<llama_ubatch> ubatches_write);
+            std::vector<llama_ubatch> ubatches_write,
+            std::vector<llama_ubatch> ubatches_dec_write);
 
     bool next() override;
     bool apply() override;
@@ -221,17 +345,24 @@ public:
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool     has_enc() const;
+    bool     has_dec() const;
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_dec() const;
     uint32_t get_n_write() const;
+    uint32_t get_n_write_dec() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_k_idxs_dec(ggml_context * ctx, const llama_ubatch & ubatch) const;
     std::vector<ggml_tensor *> get_k_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst) const;
+    void set_input_k_idxs_dec(ggml_tensor * dst) const;
     void set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_attn_mask_dec(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
 
     // token history of the raw (window) cells, for host-side n-gram hashing (deepseek41 Engram)
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
@@ -240,16 +371,23 @@ private:
     size_t i_next = 0;
 
     llama_kv_cache * kv_swa = nullptr;
+    llama_kv_cache * kv_dec = nullptr;
+    int32_t ced_dec_layer   = -1;
 
     slot_info_vec_t sinfos_write;
     slot_info_vec_t sinfos_read;
+    slot_info_vec_t sinfos_dec_write;
+    slot_info_vec_t sinfos_dec_read;
     std::vector<llama_ubatch> ubatches;
     std::vector<llama_ubatch> ubatches_write;
+    std::vector<llama_ubatch> ubatches_dec_write;
 
     const llama_memory_context_ptr ctx_base_mem;
     const llama_memory_context_ptr ctx_swa_mem;
+    const llama_memory_context_ptr ctx_dec_mem;
 
-    uint32_t n_kv = 0;
+    uint32_t n_kv     = 0;
+    uint32_t n_kv_dec = 0;
 
     const llama_memory_status status;
 };
@@ -260,7 +398,7 @@ class llama_kv_cache_dsv4_comp_context {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
-    llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv);
+    llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv, bool single_stream = false);
 
     llama_kv_cache_dsv4_comp_context(
             llama_kv_cache * kv,
@@ -342,7 +480,8 @@ public:
     llama_kv_cache_dsv4_context(llama_memory_status status);
 
     llama_kv_cache_dsv4_context(
-            llama_kv_cache_dsv4 * kv);
+            llama_kv_cache_dsv4 * kv,
+            llama_dsv4_ced_mode reserve_mode = LLAMA_DSV4_CED_FULL);
 
     llama_kv_cache_dsv4_context(
             llama_kv_cache_dsv4 * kv,
@@ -357,8 +496,21 @@ public:
             slot_info_vec_t sinfos_raw_base_write,
             slot_info_vec_t sinfos_raw_swa_write,
             slot_info_vec_t sinfos_raw_swa_read,
+            slot_info_vec_t sinfos_raw_dec_write,
+            slot_info_vec_t sinfos_raw_dec_read,
             std::vector<llama_ubatch> ubatches,
-            std::vector<llama_ubatch> ubatches_raw);
+            std::vector<llama_ubatch> ubatches_raw,
+            std::vector<llama_ubatch> ubatches_dec,
+            std::vector<llama_dsv4_ced_plan> ced_plans);
+
+    // DEC_ONLY constructor
+    llama_kv_cache_dsv4_context(
+            llama_kv_cache_dsv4 * kv,
+            slot_info_vec_t sinfos_raw_dec_write,
+            slot_info_vec_t sinfos_raw_dec_read,
+            std::vector<llama_ubatch> ubatches,
+            std::vector<comp_plan> plans_hca,
+            std::vector<llama_dsv4_ced_plan> ced_plans);
 
     virtual ~llama_kv_cache_dsv4_context();
 
@@ -392,6 +544,8 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    const llama_dsv4_ced_plan & get_ced_plan() const;
+
     int32_t get_comp_read_layer(int32_t il) const;
 
 private:
@@ -402,6 +556,7 @@ private:
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;
     std::vector<comp_plan> plans_lid;
+    std::vector<llama_dsv4_ced_plan> ced_plans;
 
     const std::unique_ptr<llama_kv_cache_dsv4_raw_context> ctx_raw;
     const llama_memory_context_ptr ctx_csa_mem;
@@ -421,9 +576,11 @@ private:
     stream_copy_info sc_info_lid;
 
     bool reserve_plans = false;
+    llama_dsv4_ced_mode reserve_mode = LLAMA_DSV4_CED_FULL;
     mutable comp_plan reserve_plan_csa;
     mutable comp_plan reserve_plan_hca;
     mutable comp_plan reserve_plan_lid;
+    llama_dsv4_ced_plan default_ced_plan;
 
     const llama_memory_status status;
 

@@ -20,6 +20,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+class llama_kv_cache_dsv4;
 class llama_moe_cache;
 
 class llama_io_read_i;
@@ -133,6 +134,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_embeddings_layer_inp_dev(bool value);
+    void set_embeddings_layer_inp_tail(uint32_t tail_len);
+    int32_t ced_layer_inp_status(llama_seq_id seq_id, llama_pos * pos_beg_out, int32_t * row_beg_out, int32_t * n_rows_out) const;
+    void ced_clear_layer_inp_status(llama_seq_id seq_id);
 
     // whether decode accepts entries whose embd is a row of ctx_other's layer input device buffer
     bool supports_embd_row() const;
@@ -323,7 +327,7 @@ private:
     void sched_new(const sched_params & params);
 
     // switch the workspace for a batch of n_tokens (small or large), and manage the GPU expert tier, false on failure
-    bool sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe);
+    bool sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe, bool force_large = false);
 
     // ubatch_auto: the largest ubatch from n_min to ubatch_max whose compute buffers fit in the free device memory,
     // for the graphs of mctx (see ubatch_cells); n_min if none fits
@@ -338,6 +342,7 @@ private:
     uint32_t ubatch_fit(uint32_t n_seqs, uint32_t n_cells, uint32_t n_max, int & n_tries);
     // ubatch_auto: compute buffer sizes per backend of the prompt graph of n_ubatch tokens, without allocating them
     void ubatch_sizes(const llama_memory_context_i * mctx, uint32_t n_seqs, uint32_t n_ubatch, std::vector<size_t> & sizes);
+    void ubatch_add_cuda_scratch(ggml_cgraph * gf, std::vector<size_t> & out_sizes) const;
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
@@ -605,6 +610,30 @@ private:
 
     // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
+
+    struct ced_flush_req {
+        llama_seq_id seq_id = -1;
+        llama_pos out_pos = -1;
+        int64_t out_row = -1;
+        int32_t out_batch_idx = -1;
+        int64_t li_row_base = 0;
+    };
+
+    struct ced_li_state {
+        int32_t status = -1; // -1 = none/standard path, 0 = deferred in encoder tail, 1 = flushed to layer_inp buffers
+        llama_pos pos_beg = -1;
+        int32_t row_beg = 0;
+        int32_t n_rows = 0;
+    };
+
+    std::vector<ced_li_state> ced_li_status;
+    uint32_t ced_dec_n_ubatch  = 0;
+    uint32_t ced_full_n_ubatch = 0;
+
+    llama_kv_cache_dsv4 * get_kv_dsv4() const;
+    bool ced_use_split_reserve() const;
+    void ced_update_tail_cap_for_li();
+    int ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bool from_decode);
 
     // perf
     mutable int64_t t_start_us  = 0;

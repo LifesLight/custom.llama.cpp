@@ -969,13 +969,13 @@ static void dsv4_set_kq_mask(
     }
 }
 
-static ggml_tensor * dsv4_build_raw_kq_mask(
+static ggml_tensor * dsv4_build_raw_kq_mask_nkv(
         ggml_context * ctx,
-        const llama_kv_cache_dsv4_raw_context * mctx,
+        uint32_t n_kv,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams,
-        int64_t n_stream) {
-    const auto n_kv     = mctx->get_n_kv();
+        int64_t n_stream,
+        const char * name) {
     const auto n_tokens = ubatch.n_tokens;
 
     GGML_ASSERT(n_stream > 0);
@@ -985,17 +985,16 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
-    ggml_set_name(res, "attn_inp_kq_mask");
+    ggml_set_name(res, name);
 
     return res;
 }
 
-static bool dsv4_can_reuse_raw_kq_mask(
+static bool dsv4_can_reuse_raw_kq_mask_nkv(
         ggml_tensor * kq_mask,
-        const llama_kv_cache_dsv4_raw_context * mctx,
+        uint32_t n_kv,
         const llama_ubatch & ubatch,
         int64_t n_stream) {
-    const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
 
     GGML_ASSERT(n_stream > 0);
@@ -1156,48 +1155,84 @@ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
     if (self_attn_mask.raw && self_attn_mask.raw->buffer) {
         mctx->set_input_attn_mask(self_attn_mask, ubatch, cparams.causal_attn);
     }
+
+    if (self_k_idxs_dec && self_k_idxs_dec->buffer) {
+        mctx->set_input_k_idxs_dec(self_k_idxs_dec);
+    }
+
+    if (self_attn_mask_dec.raw && self_attn_mask_dec.raw->buffer) {
+        mctx->set_input_attn_mask_dec(self_attn_mask_dec, ubatch, cparams.causal_attn);
+    }
 }
 
 void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
-    const auto & plan_csa = mctx->get_csa_plan(*ubatch);
-    const auto & plan_hca = mctx->get_hca_plan(*ubatch);
-    const auto & plan_lid = mctx->get_lid_plan(*ubatch);
-    const int64_t n_stream = plan_csa.n_stream;
+    const auto mode = (llama_dsv4_ced_mode) ced_mode;
 
     inp_raw->mctx = mctx->get_raw();
     inp_raw->set_input(ubatch);
 
+    const auto & plan_hca = mctx->get_hca_plan(*ubatch);
+
+    if (mode == LLAMA_DSV4_CED_DEC_ONLY) {
+        dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, plan_hca.n_stream);
+        return;
+    }
+
+    const auto & plan_csa = mctx->get_csa_plan(*ubatch);
+    const int64_t n_stream = plan_csa.n_stream;
+
     dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
     dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
-    dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+
+    if (mode == LLAMA_DSV4_CED_FULL) {
+        const auto & plan_lid = mctx->get_lid_plan(*ubatch);
+        dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+    }
 }
 
 bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
 
     this->mctx = mctx;
-    inp_raw->mctx = mctx->get_raw();
-
-    bool res = true;
-
-    const auto & plan_csa = mctx->get_csa_plan(params.ubatch);
-    const auto & plan_hca = mctx->get_hca_plan(params.ubatch);
-    const auto & plan_lid = mctx->get_lid_plan(params.ubatch);
-    const int64_t n_stream = plan_csa.n_stream;
-
     const auto * raw_ctx = mctx->get_raw();
     inp_raw->mctx = raw_ctx;
+
+    const auto new_mode = mctx->get_ced_plan().mode;
+    if ((int32_t) new_mode != ced_mode) {
+        return false;
+    }
+
+    bool res = true;
+    res &= (inp_raw->self_k_idxs != nullptr) == raw_ctx->has_enc();
+    res &= (inp_raw->self_k_idxs_dec != nullptr) == raw_ctx->has_dec();
+
+    const auto & plan_hca = mctx->get_hca_plan(params.ubatch);
+    const int64_t n_stream = new_mode == LLAMA_DSV4_CED_DEC_ONLY ? plan_hca.n_stream : mctx->get_csa_plan(params.ubatch).n_stream;
 
     if (inp_raw->self_k_idxs && inp_raw->self_k_idxs->buffer) {
         res &= inp_raw->self_k_idxs->ne[0] == raw_ctx->get_n_write();
     }
     if (inp_raw->self_attn_mask.raw && inp_raw->self_attn_mask.raw->buffer) {
-        res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_attn_mask.raw, raw_ctx, params.ubatch, n_stream);
+        res &= dsv4_can_reuse_raw_kq_mask_nkv(inp_raw->self_attn_mask.raw, raw_ctx->get_n_kv(), params.ubatch, n_stream);
     }
 
-    res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
+    if (inp_raw->self_k_idxs_dec && inp_raw->self_k_idxs_dec->buffer) {
+        res &= inp_raw->self_k_idxs_dec->ne[0] == raw_ctx->get_n_write_dec();
+    }
+    if (inp_raw->self_attn_mask_dec.raw && inp_raw->self_attn_mask_dec.raw->buffer) {
+        res &= dsv4_can_reuse_raw_kq_mask_nkv(inp_raw->self_attn_mask_dec.raw, raw_ctx->get_n_kv_dec(), params.ubatch, n_stream);
+    }
+
     res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
-    res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
+
+    if (new_mode != LLAMA_DSV4_CED_DEC_ONLY) {
+        const auto & plan_csa = mctx->get_csa_plan(params.ubatch);
+        res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
+    }
+    if (new_mode == LLAMA_DSV4_CED_FULL) {
+        const auto & plan_lid = mctx->get_lid_plan(params.ubatch);
+        res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
+    }
 
     return res;
 }
@@ -1459,6 +1494,12 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_ced_h       = nullptr;
+    t_ced_pre     = nullptr;
+
+    ced_skip_layer_inp = false;
+    ced_li_start       = -1;
+    ced_li_dst_offset  = 0;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1513,7 +1554,13 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
     }
-    {
+    if (t_ced_h != nullptr) {
+        ggml_set_output(t_ced_h);
+    }
+    if (t_ced_pre != nullptr) {
+        ggml_set_output(t_ced_pre);
+    }
+    if (!ced_skip_layer_inp) {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size() && !params.cparams.embeddings_layer_inp_dev; ++il) {
             if (embeddings_layer_inp[il]) {
@@ -2584,9 +2631,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     bool pf_cpu = false;
     bool pf_gpu = false;
-    if (moe_stream != nullptr && moe_cache == nullptr) {
-        pf_cpu = moe_stream->prefetch_info(il, n_tokens, pf);
-        pf_gpu = !pf_cpu && moe_stream->forecast_info(il, n_tokens, pf);
+    if (moe_stream != nullptr && moe_cache == nullptr && moe_stream_next_n_tokens != 0) {
+        pf_cpu = moe_stream->prefetch_info(il, n_tokens, pf, moe_stream_next_n_tokens);
+        pf_gpu = !pf_cpu && moe_stream->forecast_info(il, n_tokens, pf, moe_stream_next_n_tokens);
         if ((pf_cpu || pf_gpu) && !(pf_inp->ne[0] == pf.gate_inp->ne[0] && ggml_nrows(pf_inp) == n_tokens &&
                 (pf.norm == nullptr || ggml_nelements(pf.norm) == pf_inp->ne[0]))) {
             pf_cpu = pf_gpu = false;
@@ -4499,25 +4546,41 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
 llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
     const auto * raw_ctx  = mctx_cur->get_raw();
+    const auto   mode     = mctx_cur->get_ced_plan().mode;
 
     auto inp_raw = std::make_unique<llm_graph_input_dsv4_raw>(cparams, raw_ctx);
 
-    const int64_t n_stream = mctx_cur->get_csa_plan(ubatch).n_stream;
+    const int64_t n_stream = mode == LLAMA_DSV4_CED_DEC_ONLY
+        ? mctx_cur->get_hca_plan(ubatch).n_stream
+        : mctx_cur->get_csa_plan(ubatch).n_stream;
 
     GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE && "DSV4 expects SWA raw cache");
 
-    inp_raw->self_k_idxs = raw_ctx->build_input_k_idxs(ctx0, ubatch);
-    inp_raw->self_attn_mask.raw = dsv4_build_raw_kq_mask(ctx0, raw_ctx, ubatch, cparams, n_stream);
+    if (raw_ctx->has_enc()) {
+        inp_raw->self_k_idxs        = raw_ctx->build_input_k_idxs(ctx0, ubatch);
+        inp_raw->self_attn_mask.raw = dsv4_build_raw_kq_mask_nkv(ctx0, raw_ctx->get_n_kv(), ubatch, cparams, n_stream, "attn_inp_kq_mask");
+    }
+    if (raw_ctx->has_dec()) {
+        inp_raw->self_k_idxs_dec        = raw_ctx->build_input_k_idxs_dec(ctx0, ubatch);
+        inp_raw->self_attn_mask_dec.raw = dsv4_build_raw_kq_mask_nkv(ctx0, raw_ctx->get_n_kv_dec(), ubatch, cparams, n_stream, "attn_inp_kq_mask_dec");
+    }
 
     inp_raw->self_k_rot = raw_ctx->get_k_rot();
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
+    inp->ced_mode = (int32_t) mode;
 
-    dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
+    if (mode != LLAMA_DSV4_CED_DEC_ONLY) {
+        dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);
+        inp->inp_csa.k_rot = mctx_cur->get_csa()->get_k_rot();
+    }
+
     dsv4_build_comp_inputs(ctx0, inp->inp_hca, mctx_cur->get_hca_plan(ubatch), "hca", cparams, n_stream);
-    dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
-    inp->inp_csa.k_rot = mctx_cur->get_csa()->get_k_rot();
     inp->inp_hca.k_rot = mctx_cur->get_hca()->get_k_rot();
-    inp->inp_lid.k_rot = mctx_cur->get_lid()->get_k_rot();
+
+    if (mode == LLAMA_DSV4_CED_FULL) {
+        dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream);
+        inp->inp_lid.k_rot = mctx_cur->get_lid()->get_k_rot();
+    }
 
     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
 }
@@ -4911,15 +4974,56 @@ void llm_graph_context::build_logits() const {
     }
 }
 
+class llm_graph_input_ced_li_idxs : public llm_graph_input_i {
+public:
+    llm_graph_input_ced_li_idxs(const llama_memory_context_i * mctx, int32_t li_start)
+        : mctx(mctx), li_start(li_start) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        const auto * mctx_dsv4 = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+        const int64_t dst_off = mctx_dsv4->get_ced_plan().li_dst_offset;
+        const int64_t n_rows  = (int64_t) ubatch->n_tokens - li_start;
+        GGML_ASSERT(idxs && idxs->ne[0] == n_rows);
+        std::vector<int64_t> data(n_rows);
+        for (int64_t i = 0; i < n_rows; ++i) {
+            data[i] = dst_off + i;
+        }
+        ggml_backend_tensor_set(idxs, data.data(), 0, n_rows * sizeof(int64_t));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = params.mctx;
+        const auto * mctx_dsv4 = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+        return mctx_dsv4->get_ced_plan().li_start == li_start &&
+               idxs && idxs->ne[0] == (int64_t) params.ubatch.n_tokens - li_start;
+    }
+
+    const llama_memory_context_i * mctx = nullptr;
+    int32_t li_start = 0;
+    ggml_tensor * idxs = nullptr;
+};
+
 void llm_graph_context::build_layer_inp_dev() const {
-    if (!cparams.embeddings_layer_inp_dev || layer_inp_dev == nullptr) {
+    if (!cparams.embeddings_layer_inp_dev || layer_inp_dev == nullptr || res->ced_skip_layer_inp) {
         return;
     }
 
-    auto inp = std::make_unique<llm_graph_input_batch_idxs>();
-
-    inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
-    ggml_set_input(inp->idxs);
+    ggml_tensor * row_idxs = nullptr;
+    int64_t n_rows = n_tokens;
+    if (res->ced_li_start >= 0) {
+        n_rows = n_tokens - res->ced_li_start;
+        auto inp = std::make_unique<llm_graph_input_ced_li_idxs>(mctx, res->ced_li_start);
+        inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_rows);
+        ggml_set_input(inp->idxs);
+        row_idxs = inp->idxs;
+        res->add_input(std::move(inp));
+    } else {
+        auto inp = std::make_unique<llm_graph_input_batch_idxs>();
+        inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
+        ggml_set_input(inp->idxs);
+        row_idxs = inp->idxs;
+        res->add_input(std::move(inp));
+    }
 
     // row layout: [layer_0 | layer_1 | ...] in ascending layer id order
     int64_t col = 0;
@@ -4933,12 +5037,10 @@ void llm_graph_context::build_layer_inp_dev() const {
         GGML_ASSERT(src->ne[0] == n_embd);
 
         ggml_tensor * dst = ggml_view_2d(ctx0, layer_inp_dev, n_embd, layer_inp_dev->ne[1], layer_inp_dev->nb[1], col*n_embd*ggml_element_size(layer_inp_dev));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n_embd, n_tokens), inp->idxs));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n_embd, n_rows), row_idxs));
         col++;
     }
     GGML_ASSERT(col*n_embd == layer_inp_dev->ne[0]);
-
-    res->add_input(std::move(inp));
 }
 
 void llm_graph_context::build_h_nextn_dev() const {

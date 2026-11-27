@@ -20,10 +20,16 @@ static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
+static constexpr uint32_t DSV4_STATE_VERSION_CED   = 2;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
+
+bool llama_dsv41_ced_env_enabled() {
+    const char * v = getenv("LLAMA_DSV41_CED");
+    return !v || atoi(v) != 0;
+}
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
@@ -1248,6 +1254,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
+    ced_dec_layer((model.arch == LLM_ARCH_DEEPSEEK41 && llama_dsv41_ced_env_enabled()) ? model.hparams.dsv41_ced_dec_layer : -1),
     rs_idx(n_seq_max, 0),
     rs_max(n_seq_max, 0) {
 
@@ -1257,6 +1264,14 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         }
 
         return true;
+    };
+
+    const layer_filter_cb filter_raw_enc = [&](int32_t il) {
+        return filter_raw(il) && (ced_dec_layer < 0 || il < ced_dec_layer);
+    };
+
+    const layer_filter_cb filter_raw_dec = [&](int32_t il) {
+        return filter_raw(il) && ced_dec_layer >= 0 && il >= ced_dec_layer;
     };
 
     GGML_UNUSED(unified);
@@ -1276,7 +1291,28 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, no_alloc, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch,
-            nullptr, filter_raw, reuse, nullptr);
+            nullptr, filter_raw_enc, reuse, nullptr);
+
+    if (ced_dec_layer >= 0) {
+        ced_n_layer  = model.hparams.n_layer();
+        ced_n_swa    = model.hparams.n_swa;
+        ced_hc_mult  = model.hparams.dsv4_hc_mult;
+        ced_n_embd   = model.hparams.n_embd;
+        ced_tail_cap = model.hparams.dsv41_ced_tail_tokens(n_rs_seq);
+        ced_tails.resize(n_seq_max);
+
+        const uint32_t dec_ub_cap   = std::min(n_ubatch, std::max(ced_tail_cap, 256u));
+        const uint32_t size_swa_dec = swa_full
+            ? kv_raw->get_swa()->get_size()
+            : std::min(kv_raw->get_swa()->get_size(), GGML_PAD(hparams_raw.n_swa + dec_ub_cap, 256u));
+        LLAMA_LOG_INFO("%s: creating DeepSeek-V4.1 CED decoder SWA KV cache (layers >= %d, size = %u cells)\n",
+                __func__, ced_dec_layer, size_swa_dec);
+        kv_raw_dec = std::make_unique<llama_kv_cache>(
+                model, no_alloc, hparams_raw, type_k, type_v,
+                v_trans, offload, unified_raw, size_swa_dec, n_seq_max,
+                hparams_raw.n_swa, hparams_raw.swa_type, nullptr, filter_raw_dec, reuse, nullptr);
+        kv_raw_dec->clear(true);
+    }
 
     // V4.1: CSA slot = ratio 2, HCA slot = ratio 1, no overlap and no indexer compressor; the index K is stored
     // next to the compressed KV ([kv | index K]) and only the KV source layers own rows
@@ -1489,6 +1525,15 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) {
+    return init_batch_ced(balloc, n_ubatch, embd_all, false, nullptr);
+}
+
+llama_memory_context_ptr llama_kv_cache_dsv4::init_batch_ced(
+            llama_batch_allocr & balloc,
+            uint32_t n_ubatch,
+            bool embd_all,
+            bool enc_only,
+            const llama_dsv4_ced_plan * full_plan) {
     GGML_UNUSED(embd_all);
 
     const auto & batch = balloc.get_batch();
@@ -1521,13 +1566,40 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
 
         auto sinfos_raw_swa_read = dsv4_build_raw_read_sinfos(sinfos_raw_swa_write, ubatches);
 
+        llama_kv_cache::slot_info_vec_t sinfos_dec_write;
+        llama_kv_cache::slot_info_vec_t sinfos_dec_read;
+        std::vector<llama_ubatch> ubatches_dec;
+        if (kv_raw_dec && !enc_only) {
+            ubatches_dec = ubatches_raw;
+            sinfos_dec_write = kv_raw_dec->prepare(ubatches_dec);
+            if (sinfos_dec_write.empty()) {
+                return nullptr;
+            }
+            sinfos_dec_read = dsv4_build_raw_read_sinfos(sinfos_dec_write, ubatches);
+        }
+
+        std::vector<llama_dsv4_ced_plan> ced_plans(ubatches.size());
+        if (enc_only) {
+            for (auto & p : ced_plans) {
+                p.mode          = LLAMA_DSV4_CED_ENC_ONLY;
+                p.tail_keep_max = ced_tail_cap;
+            }
+        } else if (full_plan && ubatches.size() == 1) {
+            ced_plans[0] = *full_plan;
+            ced_plans[0].mode = LLAMA_DSV4_CED_FULL;
+        }
+
         return std::make_unique<llama_kv_cache_dsv4_context>(
                 this,
                 std::move(sinfos_raw_base_write),
                 std::move(sinfos_raw_swa_write),
                 std::move(sinfos_raw_swa_read),
+                std::move(sinfos_dec_write),
+                std::move(sinfos_dec_read),
                 std::move(ubatches),
-                std::move(ubatches_raw));
+                std::move(ubatches_raw),
+                std::move(ubatches_dec),
+                std::move(ced_plans));
     };
 
     // Independent sequences can share an equal-length ubatch.
@@ -1565,8 +1637,59 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
     return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
 
+llama_memory_context_ptr llama_kv_cache_dsv4::init_dec_only(
+        llama_seq_id seq_id,
+        std::vector<llama_ubatch> ubatches,
+        std::vector<llama_dsv4_ced_plan> ced_plans) {
+    GGML_UNUSED(seq_id);
+    if (!kv_raw_dec || ubatches.empty() || ubatches.size() != ced_plans.size()) {
+        return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    auto sinfos_dec_write = kv_raw_dec->prepare(ubatches);
+    if (sinfos_dec_write.empty()) {
+        return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    auto sinfos_dec_read = dsv4_build_raw_read_sinfos(sinfos_dec_write, ubatches);
+
+    const uint32_t ratio_hca   = hca_state->get_ratio();
+    const uint32_t kv_hca_size = kv_hca->get_size();
+    std::vector<llama_kv_cache_dsv4_context::comp_plan> plans_hca(ubatches.size());
+    for (size_t u = 0; u < ubatches.size(); ++u) {
+        const auto & ub = ubatches[u];
+        auto & plan = plans_hca[u];
+        plan.n_stream = 1;
+        plan.n_visible.resize(ub.n_tokens);
+        int64_t max_nv = 0;
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            const llama_pos pos = ub.pos[i];
+            const int64_t nv = pos >= 0 ? (int64_t) (pos + 1)/ratio_hca : 0;
+            plan.n_visible[i] = (int32_t) nv;
+            max_nv = std::max(max_nv, nv);
+        }
+        plan.n_kv = std::min<int64_t>(kv_hca_size, std::max<int64_t>(GGML_PAD(max_nv, 256u), 256));
+        ced_plans[u].mode = LLAMA_DSV4_CED_DEC_ONLY;
+    }
+
+    return std::make_unique<llama_kv_cache_dsv4_context>(
+            this,
+            std::move(sinfos_dec_write),
+            std::move(sinfos_dec_read),
+            std::move(ubatches),
+            std::move(plans_hca),
+            std::move(ced_plans));
+}
+
+llama_memory_context_ptr llama_kv_cache_dsv4::init_full_enc_only() {
+    return std::make_unique<llama_kv_cache_dsv4_context>(this, LLAMA_DSV4_CED_ENC_ONLY);
+}
+
+llama_memory_context_ptr llama_kv_cache_dsv4::init_full_dec_only() {
+    return std::make_unique<llama_kv_cache_dsv4_context>(this, LLAMA_DSV4_CED_DEC_ONLY);
+}
+
 llama_memory_context_ptr llama_kv_cache_dsv4::init_full() {
-    return std::make_unique<llama_kv_cache_dsv4_context>(this);
+    return std::make_unique<llama_kv_cache_dsv4_context>(this, LLAMA_DSV4_CED_FULL);
 }
 
 llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, bool optimize) {
@@ -1587,6 +1710,10 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
 
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
+    if (kv_raw_dec) {
+        kv_raw_dec->clear(true);
+        ced_clear_tail(-1, data);
+    }
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
 }
 
@@ -1605,6 +1732,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             bool res = true;
 
             res = res & kv_raw->seq_rm(seq_id, p0, -1);
+            if (kv_raw_dec) {
+                res = res & kv_raw_dec->seq_rm(seq_id, p0, -1);
+            }
             res = res & kv_csa->seq_rm(seq_id, p0/csa_state->get_ratio(), -1);
             res = res & kv_hca->seq_rm(seq_id, p0/hca_state->get_ratio(), -1);
             res = res & kv_lid->seq_rm(seq_id, p0/lid_state->get_ratio(), -1);
@@ -1622,7 +1752,13 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
-        const bool res = kv_raw->seq_rm(seq_id, p0, p1);
+        bool res = kv_raw->seq_rm(seq_id, p0, p1);
+        if (res && kv_raw_dec) {
+            if (kv_raw_dec->seq_pos_max(seq_id) >= p0) {
+                res = res & kv_raw_dec->seq_rm(seq_id, p0, p1);
+            }
+            ced_trim_tail_after(seq_id, p0 - 1);
+        }
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
         }
@@ -1630,7 +1766,15 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         return res;
     }
 
-    const bool res = kv_raw->seq_rm(seq_id, p0, p1);
+    bool res = kv_raw->seq_rm(seq_id, p0, p1);
+    if (kv_raw_dec) {
+        if (seq_id < 0) {
+            kv_raw_dec->clear(true);
+        } else {
+            res = res & kv_raw_dec->seq_rm(seq_id, p0, p1);
+        }
+        ced_clear_tail(seq_id, false);
+    }
 
     if (res) {
         clear_compressed(seq_id, true);
@@ -1643,6 +1787,14 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     GGML_ASSERT(p0 <= 0 && p1 < 0 && "DSV4 only supports full sequence copies");
 
     kv_raw->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    if (kv_raw_dec) {
+        kv_raw_dec->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        if (seq_id_src != seq_id_dst &&
+                seq_id_src >= 0 && (uint32_t) seq_id_src < n_seq_max &&
+                seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_seq_max) {
+            ced_tails[seq_id_dst] = ced_tails[seq_id_src];
+        }
+    }
     kv_csa->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_hca->seq_cp(seq_id_src, seq_id_dst, -1, -1);
     kv_lid->seq_cp(seq_id_src, seq_id_dst, -1, -1);
@@ -1661,6 +1813,9 @@ void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max);
 
     kv_raw->seq_keep(seq_id);
+    if (kv_raw_dec) {
+        kv_raw_dec->seq_keep(seq_id);
+    }
 
     for (llama_seq_id id = 0; id < (llama_seq_id) n_seq_max; ++id) {
         if (id == seq_id) {
@@ -1668,16 +1823,26 @@ void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
         }
 
         kv_raw->seq_rm(id, -1, -1);
+        if (kv_raw_dec) {
+            kv_raw_dec->seq_rm(id, -1, -1);
+            ced_clear_tail(id, false);
+        }
         clear_compressed(id, true);
     }
 }
 
 void llama_kv_cache_dsv4::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     kv_raw->seq_add(seq_id, p0, p1, shift);
+    if (kv_raw_dec) {
+        kv_raw_dec->seq_add(seq_id, p0, p1, shift);
+    }
 }
 
 void llama_kv_cache_dsv4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     kv_raw->seq_div(seq_id, p0, p1, d);
+    if (kv_raw_dec) {
+        kv_raw_dec->seq_div(seq_id, p0, p1, d);
+    }
 }
 
 llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
@@ -1701,6 +1866,11 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_raw->memory_breakdown();
+    if (kv_raw_dec) {
+        for (const auto & buft_size : kv_raw_dec->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
     for (const auto & buft_size : kv_csa->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
@@ -1725,8 +1895,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
+    GGML_ASSERT(!kv_raw_dec || !ced_has_deferred(seq_id));
+
     const uint32_t magic   = DSV4_STATE_MAGIC;
-    const uint32_t version = DSV4_STATE_VERSION;
+    const uint32_t version = kv_raw_dec ? DSV4_STATE_VERSION_CED : DSV4_STATE_VERSION;
     const uint32_t mode    = partial_only ? DSV4_STATE_MODE_PARTIAL : DSV4_STATE_MODE_FULL;
 
     io.write(&magic,   sizeof(magic));
@@ -1734,6 +1906,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&mode,    sizeof(mode));
 
     kv_raw->state_write(io, seq_id, flags);
+    if (kv_raw_dec) {
+        kv_raw_dec->state_write(io, seq_id, flags);
+    }
 
     if (!partial_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
@@ -1767,7 +1942,8 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (magic != DSV4_STATE_MAGIC) {
         throw std::runtime_error("DSV4 state magic mismatch");
     }
-    if (version != DSV4_STATE_VERSION) {
+    const uint32_t expected_version = kv_raw_dec ? DSV4_STATE_VERSION_CED : DSV4_STATE_VERSION;
+    if (version != expected_version) {
         throw std::runtime_error("DSV4 state version mismatch");
     }
 
@@ -1782,6 +1958,13 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     kv_raw->state_read(io, seq_id, flags);
+    if (kv_raw_dec) {
+        if (seq_id >= 0) {
+            kv_raw_dec->seq_rm(seq_id, -1, -1);
+        }
+        kv_raw_dec->state_read(io, seq_id, flags);
+        ced_clear_tail(seq_id, false);
+    }
 
     if (!partial_only) {
         clear_compressed(seq_id, true);
@@ -1938,12 +2121,283 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     }
 }
 
+bool llama_kv_cache_dsv4::ced_enabled() const {
+    return ced_dec_layer >= 0 && kv_raw_dec != nullptr;
+}
+
+int32_t llama_kv_cache_dsv4::get_ced_dec_layer() const {
+    return ced_dec_layer;
+}
+
+uint32_t llama_kv_cache_dsv4::get_ced_n_swa() const {
+    return ced_n_swa;
+}
+
+uint32_t llama_kv_cache_dsv4::get_ced_hc_mult() const {
+    return ced_hc_mult;
+}
+
+uint32_t llama_kv_cache_dsv4::get_ced_n_embd() const {
+    return ced_n_embd;
+}
+
+uint32_t llama_kv_cache_dsv4::get_ced_tail_cap() const {
+    return ced_tail_cap;
+}
+
+uint32_t llama_kv_cache_dsv4::get_ced_dec_ubatch_cap() const {
+    if (!kv_raw_dec) {
+        return 0;
+    }
+    const uint32_t sz = kv_raw_dec->get_size();
+    return sz > ced_n_swa ? sz - ced_n_swa : sz;
+}
+
+void llama_kv_cache_dsv4::ced_ensure_tail_cap(uint32_t min_cap) {
+    if (!ced_enabled() || min_cap <= ced_tail_cap) {
+        return;
+    }
+    const size_t h_stride = (size_t) ced_hc_mult * ced_n_embd;
+    const uint32_t old_cap = ced_tail_cap;
+    for (auto & t : ced_tails) {
+        if (t.count == 0) {
+            t = {};
+            continue;
+        }
+        std::vector<float>     new_h((size_t) min_cap * h_stride);
+        std::vector<float>     new_pre((size_t) min_cap * ced_hc_mult);
+        std::vector<llama_pos> new_pos(min_cap);
+        std::vector<int8_t>    new_emb(min_cap);
+        for (uint32_t k = 0; k < t.count; ++k) {
+            const uint32_t src = (t.head + old_cap - t.count + k) % old_cap;
+            std::memcpy(new_h.data()   + (size_t) k * h_stride,    t.h_enc.data()    + (size_t) src * h_stride,    h_stride * sizeof(float));
+            std::memcpy(new_pre.data() + (size_t) k * ced_hc_mult, t.pre_prev.data() + (size_t) src * ced_hc_mult, ced_hc_mult * sizeof(float));
+            new_pos[k] = t.pos[src];
+            new_emb[k] = t.is_embd[src];
+        }
+        t.h_enc    = std::move(new_h);
+        t.pre_prev = std::move(new_pre);
+        t.pos      = std::move(new_pos);
+        t.is_embd  = std::move(new_emb);
+        t.head     = t.count % min_cap;
+    }
+    ced_tail_cap = min_cap;
+}
+
+bool llama_kv_cache_dsv4::ced_has_deferred(llama_seq_id seq_id) const {
+    if (!ced_enabled()) {
+        return false;
+    }
+    if (seq_id >= 0) {
+        GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+        return kv_raw->seq_pos_max(seq_id) > kv_raw_dec->seq_pos_max(seq_id);
+    }
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if (kv_raw->seq_pos_max((llama_seq_id) s) > kv_raw_dec->seq_pos_max((llama_seq_id) s)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+llama_pos llama_kv_cache_dsv4::seq_dec_pos_max(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        return -1;
+    }
+    if (!kv_raw_dec) {
+        return kv_raw->seq_pos_max(seq_id);
+    }
+    return kv_raw_dec->seq_pos_max(seq_id);
+}
+
+void llama_kv_cache_dsv4::ced_reset_dec_seq(llama_seq_id seq_id) {
+    if (!kv_raw_dec || seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        return;
+    }
+    kv_raw_dec->seq_rm(seq_id, -1, -1);
+}
+
+void llama_kv_cache_dsv4::ced_clear_tail(llama_seq_id seq_id, bool free_mem) {
+    if (seq_id < 0) {
+        for (auto & t : ced_tails) {
+            if (free_mem) {
+                t = {};
+            } else {
+                t.head  = 0;
+                t.count = 0;
+            }
+        }
+        return;
+    }
+    if ((uint32_t) seq_id < ced_tails.size()) {
+        auto & t = ced_tails[seq_id];
+        if (free_mem) {
+            t = {};
+        } else {
+            t.head  = 0;
+            t.count = 0;
+        }
+    }
+}
+
+void llama_kv_cache_dsv4::ced_trim_tail_after(llama_seq_id seq_id, llama_pos pos_max_keep) {
+    if (!ced_enabled() || seq_id < 0 || (uint32_t) seq_id >= ced_tails.size()) {
+        return;
+    }
+    auto & t = ced_tails[seq_id];
+    const uint32_t cap = ced_tail_cap;
+    while (t.count > 0) {
+        const uint32_t last = (t.head + cap - 1) % cap;
+        if (t.pos[last] <= pos_max_keep) {
+            break;
+        }
+        t.head = last;
+        t.count--;
+    }
+}
+
+void llama_kv_cache_dsv4::ced_push_tail(
+        llama_seq_id seq_id,
+        const float     * h_enc,
+        const float     * pre_prev,
+        const llama_pos * pos,
+        const int8_t    * is_embd,
+        uint32_t          n_tokens) {
+    if (!ced_enabled() || n_tokens == 0) {
+        return;
+    }
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < ced_tails.size());
+
+    auto & t = ced_tails[seq_id];
+    const uint32_t cap = ced_tail_cap;
+    const size_t h_stride = (size_t) ced_hc_mult * ced_n_embd;
+
+    if (t.pos.size() < cap) {
+        t.h_enc.resize((size_t) cap * h_stride);
+        t.pre_prev.resize((size_t) cap * ced_hc_mult);
+        t.pos.resize(cap);
+        t.is_embd.resize(cap);
+    }
+
+    const uint32_t start = n_tokens > cap ? n_tokens - cap : 0;
+    for (uint32_t i = start; i < n_tokens; ++i) {
+        std::memcpy(t.h_enc.data()   + (size_t) t.head * h_stride,    h_enc    + (size_t) i * h_stride,    h_stride * sizeof(float));
+        std::memcpy(t.pre_prev.data() + (size_t) t.head * ced_hc_mult, pre_prev + (size_t) i * ced_hc_mult, ced_hc_mult * sizeof(float));
+        t.pos[t.head]     = pos[i];
+        t.is_embd[t.head] = is_embd ? is_embd[i] : 0;
+        t.head = (t.head + 1) % cap;
+        if (t.count < cap) {
+            t.count++;
+        }
+    }
+}
+
+void llama_kv_cache_dsv4::ced_extract_tail_range(
+        llama_seq_id seq_id,
+        llama_pos    p_start,
+        std::vector<float>     & out_h,
+        std::vector<float>     & out_pre,
+        std::vector<llama_pos> & out_pos,
+        std::vector<int8_t>    & out_is_embd) const {
+    GGML_ASSERT(ced_enabled() && seq_id >= 0 && (uint32_t) seq_id < ced_tails.size());
+
+    const auto & t = ced_tails[seq_id];
+    const uint32_t cap = ced_tail_cap;
+    GGML_ASSERT(t.count > 0 && t.pos.size() == cap);
+
+    const uint32_t oldest_idx = (t.head + cap - t.count) % cap;
+    GGML_ASSERT(t.pos[oldest_idx] <= p_start);
+
+    uint32_t k_beg = 0;
+    while (k_beg < t.count) {
+        const uint32_t idx = (t.head + cap - t.count + k_beg) % cap;
+        if (t.pos[idx] >= p_start) {
+            break;
+        }
+        ++k_beg;
+    }
+    GGML_ASSERT(k_beg < t.count);
+
+    const uint32_t n_out    = t.count - k_beg;
+    const size_t   h_stride = (size_t) ced_hc_mult * ced_n_embd;
+
+    out_h.resize((size_t) n_out * h_stride);
+    out_pre.resize((size_t) n_out * ced_hc_mult);
+    out_pos.resize(n_out);
+    out_is_embd.resize(n_out);
+
+    for (uint32_t j = 0; j < n_out; ++j) {
+        const uint32_t src = (t.head + cap - t.count + k_beg + j) % cap;
+        std::memcpy(out_h.data()   + (size_t) j * h_stride,    t.h_enc.data()    + (size_t) src * h_stride,    h_stride * sizeof(float));
+        std::memcpy(out_pre.data() + (size_t) j * ced_hc_mult, t.pre_prev.data() + (size_t) src * ced_hc_mult, ced_hc_mult * sizeof(float));
+        out_pos[j]     = t.pos[src];
+        out_is_embd[j] = t.is_embd[src];
+    }
+}
+
+void llama_kv_cache_dsv4::ced_compute_layer_bounds(
+        llama_pos p_enc,
+        llama_pos dec_pos_max,
+        llama_pos p_out_min,
+        const std::vector<llama_pos> & p_li_min,
+        std::vector<llama_pos> & K_min,
+        std::vector<llama_pos> & O_min) const {
+    const int32_t L = (int32_t) ced_n_layer;
+    K_min.assign(L, p_enc + 1);
+    O_min.assign(L, p_enc + 1);
+
+    if (!ced_enabled() || p_enc <= dec_pos_max) {
+        return;
+    }
+
+    const llama_pos S        = (llama_pos) ced_n_swa - 1;
+    const llama_pos p_floor  = std::max<llama_pos>(0, dec_pos_max + 1);
+    const llama_pos p_kv_min = std::max<llama_pos>(p_floor, p_enc - S - (llama_pos) n_rs_seq);
+
+    for (int32_t il = L - 1; il >= ced_dec_layer; --il) {
+        llama_pos om = (il == L - 1) ? p_out_min : O_min[il];
+        om = std::max(om, p_floor);
+        O_min[il] = om;
+
+        llama_pos km = p_kv_min;
+        if (om <= p_enc) {
+            km = std::min(km, std::max<llama_pos>(p_floor, om - S));
+        }
+        if ((size_t) il < p_li_min.size() && p_li_min[il] <= p_enc) {
+            km = std::min(km, std::max<llama_pos>(p_floor, p_li_min[il]));
+        }
+        K_min[il] = km;
+
+        if (il > ced_dec_layer) {
+            O_min[il - 1] = om <= p_enc ? std::min(km, om) : km;
+        }
+    }
+}
+
+void llama_kv_cache_dsv4::ced_map_chunk_bounds(
+        const llama_pos * chunk_pos,
+        uint32_t n_chunk,
+        const std::vector<llama_pos> & K_min,
+        const std::vector<llama_pos> & O_min,
+        std::vector<int32_t> & k_start,
+        std::vector<int32_t> & o_start) const {
+    k_start.assign(ced_n_layer, 0);
+    o_start.assign(ced_n_layer, 0);
+    if (!ced_enabled()) {
+        return;
+    }
+    for (int32_t il = ced_dec_layer; il < (int32_t) ced_n_layer; ++il) {
+        k_start[il] = (int32_t) (std::lower_bound(chunk_pos, chunk_pos + n_chunk, K_min[il]) - chunk_pos);
+        o_start[il] = (int32_t) (std::lower_bound(chunk_pos, chunk_pos + n_chunk, O_min[il]) - chunk_pos);
+    }
+}
+
 //
 // llama_kv_cache_dsv4_raw_context
 //
 
-static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv) {
-    const uint32_t n_stream = kv->get_n_stream();
+static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv, bool single_stream = false) {
+    const uint32_t n_stream = single_stream ? 1u : kv->get_n_stream();
 
     llama_kv_cache::slot_info sinfo;
     sinfo.s0 = 0;
@@ -1957,43 +2411,78 @@ static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv
     return sinfo;
 }
 
-llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(llama_kv_cache_iswa * kv) :
-    kv_swa(kv->get_swa()),
+llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
+        llama_kv_cache_iswa * kv,
+        llama_kv_cache * kv_dec,
+        int32_t ced_dec_layer,
+        llama_dsv4_ced_mode reserve_mode) :
+    kv_swa(reserve_mode == LLAMA_DSV4_CED_DEC_ONLY ? nullptr : kv->get_swa()),
+    kv_dec(reserve_mode == LLAMA_DSV4_CED_ENC_ONLY ? nullptr : kv_dec),
+    ced_dec_layer(ced_dec_layer),
     ctx_base_mem(nullptr),
     ctx_swa_mem(nullptr),
-    n_kv(kv_swa->get_size()),
+    ctx_dec_mem(nullptr),
+    n_kv(kv_swa ? kv_swa->get_size() : 0),
+    n_kv_dec(this->kv_dec ? this->kv_dec->get_size() : 0),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
-    sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa));
-    sinfos_write = sinfos_read;
+    const bool dec_only = reserve_mode == LLAMA_DSV4_CED_DEC_ONLY;
+    if (kv_swa) {
+        sinfos_read.push_back(dsv4_build_full_sinfo(kv_swa));
+        sinfos_write = sinfos_read;
+    }
+    if (this->kv_dec) {
+        sinfos_dec_read.push_back(dsv4_build_full_sinfo(this->kv_dec, dec_only));
+        sinfos_dec_write = sinfos_dec_read;
+    }
 }
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         llama_kv_cache_iswa * kv,
+        llama_kv_cache * kv_dec,
+        int32_t ced_dec_layer,
         llama_context * lctx,
         bool optimize) :
     kv_swa(kv->get_swa()),
+    kv_dec(kv_dec),
+    ced_dec_layer(ced_dec_layer),
     ctx_base_mem(kv->get_base()->init_update(lctx, optimize)),
     ctx_swa_mem(kv->get_swa()->init_update(lctx, optimize)),
+    ctx_dec_mem(kv_dec ? kv_dec->init_update(lctx, optimize) : nullptr),
     n_kv(kv_swa->get_size()),
-    status(llama_memory_status_combine(ctx_base_mem->get_status(), ctx_swa_mem->get_status())) {
+    n_kv_dec(kv_dec ? kv_dec->get_size() : 0),
+    status(llama_memory_status_combine(
+            llama_memory_status_combine(ctx_base_mem->get_status(), ctx_swa_mem->get_status()),
+            ctx_dec_mem ? ctx_dec_mem->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE)) {
 }
 
 llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         llama_kv_cache_iswa * kv,
+        llama_kv_cache * kv_dec,
+        int32_t ced_dec_layer,
         slot_info_vec_t sinfos_base_write,
         slot_info_vec_t sinfos_swa_write,
         slot_info_vec_t sinfos_swa_read,
+        slot_info_vec_t sinfos_dec_write,
+        slot_info_vec_t sinfos_dec_read,
         std::vector<llama_ubatch> ubatches,
-        std::vector<llama_ubatch> ubatches_write) :
+        std::vector<llama_ubatch> ubatches_write,
+        std::vector<llama_ubatch> ubatches_dec_write) :
     kv_swa(kv->get_swa()),
+    kv_dec(kv_dec),
+    ced_dec_layer(ced_dec_layer),
     sinfos_write(std::move(sinfos_swa_write)),
     sinfos_read(std::move(sinfos_swa_read)),
+    sinfos_dec_write(std::move(sinfos_dec_write)),
+    sinfos_dec_read(std::move(sinfos_dec_read)),
     ubatches(std::move(ubatches)),
     ubatches_write(std::move(ubatches_write)),
-    ctx_base_mem(std::make_unique<llama_kv_cache_context>(
+    ubatches_dec_write(std::move(ubatches_dec_write)),
+    ctx_base_mem(sinfos_base_write.empty() ? nullptr : std::make_unique<llama_kv_cache_context>(
                 kv->get_base(), std::move(sinfos_base_write), this->ubatches_write)),
     ctx_swa_mem(nullptr),
-    n_kv(kv_swa->get_size()),
+    ctx_dec_mem(nullptr),
+    n_kv(kv_swa ? kv_swa->get_size() : 0),
+    n_kv_dec(kv_dec ? kv_dec->get_size() : 0),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
 }
 
@@ -2022,9 +2511,16 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     if (ctx_swa_mem) {
         res = res & ctx_swa_mem->apply();
     }
+    if (ctx_dec_mem) {
+        res = res & ctx_dec_mem->apply();
+    }
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
         n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
+    }
+    if (kv_dec && !ubatches_dec_write.empty()) {
+        kv_dec->apply_ubatch(sinfos_dec_write[i_next], ubatches_dec_write[i_next]);
+        n_kv_dec = kv_dec->get_n_kv(sinfos_dec_read[i_next]);
     }
 
     return res;
@@ -2040,8 +2536,20 @@ const llama_ubatch & llama_kv_cache_dsv4_raw_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
+bool llama_kv_cache_dsv4_raw_context::has_enc() const {
+    return kv_swa != nullptr && (ubatches.empty() || !ubatches_write.empty());
+}
+
+bool llama_kv_cache_dsv4_raw_context::has_dec() const {
+    return kv_dec != nullptr && (ubatches.empty() || !ubatches_dec_write.empty());
+}
+
 uint32_t llama_kv_cache_dsv4_raw_context::get_n_kv() const {
     return n_kv;
+}
+
+uint32_t llama_kv_cache_dsv4_raw_context::get_n_kv_dec() const {
+    return n_kv_dec;
 }
 
 uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
@@ -2052,15 +2560,28 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     return ubatches_write[i_next].n_tokens;
 }
 
+uint32_t llama_kv_cache_dsv4_raw_context::get_n_write_dec() const {
+    if (ubatches_dec_write.empty()) {
+        return 0;
+    }
+
+    return ubatches_dec_write[i_next].n_tokens;
+}
+
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
+    if (kv_dec && ced_dec_layer >= 0 && il >= ced_dec_layer) {
+        return kv_dec->get_k(ctx, il, n_kv_dec, sinfos_dec_read[i_next]);
+    }
     return kv_swa->get_k(ctx, il, n_kv, sinfos_read[i_next]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    const auto & sinfo = sinfos_write[i_next];
+    const bool use_dec = kv_dec && ced_dec_layer >= 0 && il >= ced_dec_layer;
+    const llama_kv_cache * target_kv = use_dec ? kv_dec : kv_swa;
+    const auto & sinfo = use_dec ? sinfos_dec_write[i_next] : sinfos_write[i_next];
 
     if (k_cur->ne[2] == k_idxs->ne[0]) {
-        return kv_swa->cpy_k(ctx, k_cur, k_idxs, il, sinfo);
+        return target_kv->cpy_k(ctx, k_cur, k_idxs, il, sinfo);
     }
 
     // k_idxs may be expanded to one block per stream while k_cur is only
@@ -2074,7 +2595,7 @@ ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k(ggml_context * ctx, ggml_te
     ggml_tensor * res = nullptr;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         ggml_tensor * k_idxs_s = ggml_view_1d(ctx, k_idxs, sinfo.size(), s*sinfo.size()*ggml_element_size(k_idxs));
-        ggml_tensor * cur = kv_swa->cpy_k(ctx, k_cur, k_idxs_s, il, sinfo);
+        ggml_tensor * cur = target_kv->cpy_k(ctx, k_cur, k_idxs_s, il, sinfo);
         if (res == nullptr) {
             res = cur;
         } else {
@@ -2094,16 +2615,50 @@ ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_idxs(ggml_context *
     return k_idxs;
 }
 
+ggml_tensor * llama_kv_cache_dsv4_raw_context::build_input_k_idxs_dec(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    const uint32_t n_tokens = ubatches_dec_write.empty() ? ubatch.n_tokens : ubatches_dec_write[i_next].n_tokens;
+
+    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_set_input(k_idxs);
+
+    return k_idxs;
+}
+
 std::vector<ggml_tensor *> llama_kv_cache_dsv4_raw_context::get_k_rot() const {
-    return kv_swa->get_k_rot();
+    std::vector<ggml_tensor *> res;
+    if (kv_swa) {
+        res = kv_swa->get_k_rot();
+    }
+    if (kv_dec) {
+        auto dec_rot = kv_dec->get_k_rot();
+        if (res.empty()) {
+            return dec_rot;
+        }
+        for (size_t il = 0; il < res.size() && il < dec_rot.size(); ++il) {
+            if (dec_rot[il] != nullptr) {
+                res[il] = dec_rot[il];
+            }
+        }
+    }
+    return res;
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const {
     kv_swa->set_input_k_idxs(dst, &ubatches_write[i_next], sinfos_write[i_next]);
 }
 
+void llama_kv_cache_dsv4_raw_context::set_input_k_idxs_dec(ggml_tensor * dst) const {
+    GGML_ASSERT(kv_dec != nullptr);
+    kv_dec->set_input_k_idxs(dst, &ubatches_dec_write[i_next], sinfos_dec_write[i_next]);
+}
+
 void llama_kv_cache_dsv4_raw_context::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
     kv_swa->set_input_attn_mask(attn_mask, ubatch, causal_attn);
+}
+
+void llama_kv_cache_dsv4_raw_context::set_input_attn_mask_dec(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(kv_dec != nullptr);
+    kv_dec->set_input_attn_mask(attn_mask, ubatch, causal_attn);
 }
 
 void llama_kv_cache_dsv4_raw_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
@@ -2115,17 +2670,9 @@ void llama_kv_cache_dsv4_raw_context::get_prev_tokens(const llama_ubatch & ubatc
 // llama_kv_cache_dsv4_comp_context
 //
 
-llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv) : kv(kv), n_kv(kv->get_size()) {
-    const uint32_t n_stream = kv->get_n_stream();
-
+llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv, bool single_stream) : kv(kv), n_kv(kv->get_size()) {
     sinfos.resize(1);
-    sinfos[0].s0 = 0;
-    sinfos[0].s1 = n_stream - 1;
-    sinfos[0].idxs.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        sinfos[0].strm.push_back(s);
-        sinfos[0].idxs[s].resize(1, 0);
-    }
+    sinfos[0] = dsv4_build_full_sinfo(kv, single_stream);
 }
 
 llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(
@@ -2173,22 +2720,28 @@ std::vector<ggml_tensor *> llama_kv_cache_dsv4_comp_context::get_k_rot() const {
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
-        llama_kv_cache_dsv4 * kv) :
-    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw())),
-    ctx_csa_mem(kv->get_csa()->init_full()),
+        llama_kv_cache_dsv4 * kv,
+        llama_dsv4_ced_mode reserve_mode) :
+    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), kv->kv_raw_dec.get(), kv->get_ced_dec_layer(), reserve_mode)),
+    ctx_csa_mem(reserve_mode == LLAMA_DSV4_CED_DEC_ONLY ? nullptr : kv->get_csa()->init_full()),
     ctx_hca_mem(kv->get_hca()->init_full()),
-    ctx_lid_mem(kv->get_lid()->init_full()),
-    ctx_csa(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_csa())),
-    ctx_hca(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_hca())),
-    ctx_lid(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_lid())),
+    ctx_lid_mem(reserve_mode == LLAMA_DSV4_CED_FULL ? kv->get_lid()->init_full() : nullptr),
+    ctx_csa(reserve_mode == LLAMA_DSV4_CED_DEC_ONLY ? nullptr : std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_csa())),
+    ctx_hca(std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_hca(), reserve_mode == LLAMA_DSV4_CED_DEC_ONLY)),
+    ctx_lid(reserve_mode == LLAMA_DSV4_CED_FULL ? std::make_unique<llama_kv_cache_dsv4_comp_context>(kv->get_lid()) : nullptr),
     csa_state(kv->get_csa_state()),
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
     reserve_plans(true),
+    reserve_mode(reserve_mode),
     status(llama_memory_status_combine(
-                llama_memory_status_combine(ctx_raw->get_status(), ctx_csa_mem->get_status()),
-                llama_memory_status_combine(ctx_hca_mem->get_status(), ctx_lid_mem->get_status()))),
+                llama_memory_status_combine(ctx_raw->get_status(), ctx_csa_mem ? ctx_csa_mem->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE),
+                llama_memory_status_combine(ctx_hca_mem->get_status(), ctx_lid_mem ? ctx_lid_mem->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE))),
     kv(kv) {
+    default_ced_plan.mode = reserve_mode;
+    if (reserve_mode == LLAMA_DSV4_CED_ENC_ONLY) {
+        default_ced_plan.tail_keep_max = kv->get_ced_tail_cap();
+    }
 }
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
@@ -2198,7 +2751,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         stream_copy_info sc_info_csa,
         stream_copy_info sc_info_hca,
         stream_copy_info sc_info_lid) :
-    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), lctx, optimize)),
+    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), kv->kv_raw_dec.get(), kv->get_ced_dec_layer(), lctx, optimize)),
     ctx_csa_mem(kv->get_csa()->init_update(lctx, optimize)),
     ctx_hca_mem(kv->get_hca()->init_update(lctx, optimize)),
     ctx_lid_mem(kv->get_lid()->init_update(lctx, optimize)),
@@ -2222,8 +2775,12 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         slot_info_vec_t sinfos_raw_base_write,
         slot_info_vec_t sinfos_raw_swa_write,
         slot_info_vec_t sinfos_raw_swa_read,
+        slot_info_vec_t sinfos_raw_dec_write,
+        slot_info_vec_t sinfos_raw_dec_read,
         std::vector<llama_ubatch> ubatches,
-        std::vector<llama_ubatch> ubatches_raw) :
+        std::vector<llama_ubatch> ubatches_raw,
+        std::vector<llama_ubatch> ubatches_dec,
+        std::vector<llama_dsv4_ced_plan> ced_plans) :
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->is_overlap(), true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
@@ -2231,16 +2788,24 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     plans_hca(dsv4_build_comp_plans(this->ubatches, kv->get_hca_state()->get_ratio(), kv->get_hca_state()->is_overlap(), false,
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_lid(dsv4_build_comp_plans(this->ubatches, kv->get_lid_state()->get_ratio(), kv->get_lid_state()->is_overlap(), true,
+    plans_lid(ced_plans.empty() || ced_plans[0].mode != LLAMA_DSV4_CED_ENC_ONLY
+            ? dsv4_build_comp_plans(this->ubatches, kv->get_lid_state()->get_ratio(), kv->get_lid_state()->is_overlap(), true,
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_rs_idx())
+            : std::vector<comp_plan>{}),
+    ced_plans(std::move(ced_plans)),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
                 kv->get_raw(),
+                kv->kv_raw_dec.get(),
+                kv->get_ced_dec_layer(),
                 std::move(sinfos_raw_base_write),
                 std::move(sinfos_raw_swa_write),
                 std::move(sinfos_raw_swa_read),
+                std::move(sinfos_raw_dec_write),
+                std::move(sinfos_raw_dec_read),
                 this->ubatches,
-                std::move(ubatches_raw))),
+                std::move(ubatches_raw),
+                std::move(ubatches_dec))),
     ctx_csa_mem(nullptr),
     ctx_hca_mem(nullptr),
     ctx_lid_mem(nullptr),
@@ -2261,7 +2826,53 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()),
     kv(kv) {
+    if (!this->ced_plans.empty() && this->ced_plans[0].mode == LLAMA_DSV4_CED_ENC_ONLY) {
+        // ENC_ONLY does not attend over kv_hca in decoder layers, so no kq_mask is needed
+        for (auto & p : plans_hca) {
+            p.n_kv = 0;
+        }
+    }
     kv->update_rs_for_ubatches(this->ubatches);
+}
+
+llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+        llama_kv_cache_dsv4 * kv,
+        slot_info_vec_t sinfos_raw_dec_write,
+        slot_info_vec_t sinfos_raw_dec_read,
+        std::vector<llama_ubatch> ubatches,
+        std::vector<comp_plan> plans_hca,
+        std::vector<llama_dsv4_ced_plan> ced_plans) :
+    ubatches(std::move(ubatches)),
+    plans_hca(std::move(plans_hca)),
+    ced_plans(std::move(ced_plans)),
+    ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
+                kv->get_raw(),
+                kv->kv_raw_dec.get(),
+                kv->get_ced_dec_layer(),
+                slot_info_vec_t{},
+                slot_info_vec_t{},
+                slot_info_vec_t{},
+                std::move(sinfos_raw_dec_write),
+                std::move(sinfos_raw_dec_read),
+                this->ubatches,
+                std::vector<llama_ubatch>{},
+                this->ubatches)),
+    ctx_csa_mem(nullptr),
+    ctx_hca_mem(nullptr),
+    ctx_lid_mem(nullptr),
+    ctx_csa(nullptr),
+    ctx_hca(std::make_unique<llama_kv_cache_dsv4_comp_context>(
+                kv->get_hca(),
+                dsv4_build_comp_sinfos(this->ubatches, kv->get_hca()->get_n_stream()),
+                this->ubatches)),
+    ctx_lid(nullptr),
+    csa_state(kv->get_csa_state()),
+    hca_state(kv->get_hca_state()),
+    lid_state(kv->get_lid_state()),
+    status(ctx_raw->get_status()),
+    kv(kv) {
+    default_ced_plan.mode = LLAMA_DSV4_CED_DEC_ONLY;
+    // IMPORTANT: Do NOT call update_rs_for_ubatches() in DEC_ONLY!
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
@@ -2270,9 +2881,15 @@ bool llama_kv_cache_dsv4_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     ctx_raw->next();
-    ctx_csa->next();
-    ctx_hca->next();
-    ctx_lid->next();
+    if (ctx_csa) {
+        ctx_csa->next();
+    }
+    if (ctx_hca) {
+        ctx_hca->next();
+    }
+    if (ctx_lid) {
+        ctx_lid->next();
+    }
 
     if (++i_next >= ubatches.size()) {
         return false;
@@ -2290,7 +2907,11 @@ bool llama_kv_cache_dsv4_context::apply() {
 
     if (ctx_csa_mem) {
         res = res & ctx_csa_mem->apply();
+    }
+    if (ctx_hca_mem) {
         res = res & ctx_hca_mem->apply();
+    }
+    if (ctx_lid_mem) {
         res = res & ctx_lid_mem->apply();
     }
 
@@ -2419,6 +3040,21 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
             ubatch, hca_state->get_ratio(), hca_state->is_overlap(),
             hca_state->get_state_size(), get_hca()->get_n_kv(), hca_state->get_n_stream(), hca_state->get_n_rs_seq());
 
+    if (reserve_mode == LLAMA_DSV4_CED_DEC_ONLY) {
+        reserve_plan_hca.state_pos.clear();
+        reserve_plan_hca.state_persist_src_idxs.clear();
+        reserve_plan_hca.state_persist_dst_idxs.clear();
+        reserve_plan_hca.state_restore_src_idxs.clear();
+        reserve_plan_hca.state_restore_dst_idxs.clear();
+        reserve_plan_hca.state_snapshot_src_idxs.clear();
+        reserve_plan_hca.state_snapshot_dst_idxs.clear();
+        reserve_plan_hca.state_read_idxs.clear();
+        reserve_plan_hca.state_write_idxs.clear();
+        reserve_plan_hca.state_write_pos.clear();
+    } else if (reserve_mode == LLAMA_DSV4_CED_ENC_ONLY) {
+        reserve_plan_hca.n_kv = 0;
+    }
+
     return reserve_plan_hca;
 }
 
@@ -2434,4 +3070,14 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;
+}
+
+const llama_dsv4_ced_plan & llama_kv_cache_dsv4_context::get_ced_plan() const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    if (ced_plans.empty()) {
+        return default_ced_plan;
+    }
+
+    return ced_plans[i_next];
 }

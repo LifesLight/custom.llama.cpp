@@ -429,7 +429,11 @@ struct server_slot {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (!common_speculative_flush_ced(spec, id)) {
+            SLT_ERR(*this, "%s", "failed to flush CED speculative state before saving prompt\n");
+            return false;
+        }
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         const size_t cur_size = cur_size_tgt + cur_size_dft;
@@ -2200,8 +2204,8 @@ private:
             // the RAM taken back at the resume is filled with the most used experts once the server has been idle
             // for a moment, a chunk at a time, so that a new request waits for one chunk at most, and requests in a
             // row (an automated loop of suspends) do not read what the next suspend releases again
-            constexpr int64_t REGROW_IDLE_MS = 3000;
-            constexpr size_t  REGROW_CHUNK   = 2ull*1024*1024*1024;
+            static constexpr int64_t REGROW_IDLE_MS = 3000;
+            static constexpr size_t  REGROW_CHUNK   = 2ull*1024*1024*1024;
             queue_tasks.on_idle([this]() {
                 if (gpu_suspended) {
                     return true; // lent out while suspended: the resume is a task, which starts a new idle period
@@ -3259,6 +3263,10 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (!common_speculative_flush_ced(spec.get(), slot.id)) {
+            SLT_ERR(slot, "%s", "failed to flush CED speculative state before checkpoint\n");
+            throw std::runtime_error("failed to flush CED speculative state before checkpoint");
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3500,6 +3508,10 @@ private:
             throw std::runtime_error("Unable to save slot: incomplete context checkpoints");
         }
 
+        if (!common_speculative_flush_ced(spec.get(), slot.id)) {
+            throw std::runtime_error("Unable to save slot: failed to flush CED speculative state");
+        }
+
         size_t nwrite_dft = 0;
         if (!save_slot_draft(filepath, slot, nwrite_dft)) {
             throw std::runtime_error("Unable to save slot: incomplete draft state");
@@ -3554,6 +3566,9 @@ private:
             }
             // Reserve the payload, appendices, and metadata before starting the write.
             uint64_t reserve = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (!common_speculative_flush_ced(spec.get(), slot.id)) {
+                return false;
+            }
             if (ctx_dft) {
                 reserve += llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
             }

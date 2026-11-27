@@ -142,11 +142,11 @@ public:
 
     // cross-layer prefetch (LLAMA_MOE_STREAM_PREFETCH=K): for a batch of n_tokens of layer il computed on the CPU from
     // the cache, the router of the next layer, false if its experts are not prefetched
-    bool prefetch_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const;
+    bool prefetch_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out, int64_t next_n_tokens = -1) const;
 
     // prefill forecast (LLAMA_MOE_STREAM_FORECAST=1): for a batch of n_tokens of layer il computed on the GPU, the
     // router of the next layer (to apply to the router input of layer il), false if the next layer is not forecast
-    bool forecast_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out) const;
+    bool forecast_info(int il, int64_t n_tokens, llama_moe_stream_prefetch & out, int64_t next_n_tokens = -1) const;
 
     // the op (on the CPU) that gives the forecast ids (top-k of the router of the next layer) to the stream, which
     // reads ahead the predicted experts of the next layer first

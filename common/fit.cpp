@@ -1419,6 +1419,10 @@ bool common_ts_search(const common_params & params, const std::map<ggml_backend_
                 for (uint32_t j = 0; j < llama_model_target_layer_ids_n(model_dft.get()); ++j) {
                     llama_set_embeddings_layer_inp(ctx.get(), (uint32_t) ids[j], true);
                 }
+                const int32_t n_swa_dft = llama_model_n_swa(model_dft.get());
+                if (n_swa_dft > 0 && llama_model_is_swa_all(model_dft.get())) {
+                    llama_set_embeddings_layer_inp_tail(ctx.get(), (uint32_t) n_swa_dft);
+                }
                 llama_set_embeddings_layer_inp_dev(ctx.get(), true);
             }
             if (ctx_dft) {

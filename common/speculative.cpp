@@ -246,6 +246,7 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool flush_ced(llama_seq_id /*seq_id*/) { return true; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1150,6 +1151,12 @@ protected:
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // uniformly windowed draft models (e.g. DSpark) only need the trailing n_swa target features under DSV41 CED
+        const int32_t n_swa_dft = llama_model_n_swa(model_dft);
+        if (n_swa_dft > 0 && llama_model_is_swa_all(model_dft)) {
+            llama_set_embeddings_layer_inp_tail(ctx_tgt, (uint32_t) n_swa_dft);
+        }
+
         // the device buffer keeps layers in ascending id order, the fc input expects target_layer_ids order
         {
             const char * env = getenv("LLAMA_DFLASH_DEV");
@@ -1175,7 +1182,93 @@ protected:
     // called after the host copy injection of a chunk, while h_nextn still holds the context features of batch_inject
     virtual void store_context_features(llama_seq_id /*seq_id*/, int32_t /*n_chunk*/) {}
 
+    bool inject_ced_flushed(llama_seq_id seq_id) {
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        llama_pos pos_beg = -1;
+        int32_t   row_beg = 0;
+        int32_t   n_rows  = 0;
+        if (llama_ced_layer_inp_status(ctx_tgt, seq_id, &pos_beg, &row_beg, &n_rows) != 1) {
+            return true;
+        }
+        if (n_rows <= 0) {
+            llama_ced_clear_layer_inp_status(ctx_tgt, seq_id);
+            return true;
+        }
+
+        // The 1D-position draft KV cache requires consecutive positions unless cleared/rewound when
+        // CED jumps past pre-window draft cells (e.g. checkpoints or multi-turn prompts).
+        if (llama_memory_t mem_dft = llama_get_memory(ctx_dft)) {
+            const llama_pos p0 = llama_memory_seq_pos_max(mem_dft, seq_id);
+            if (p0 >= 0 && pos_beg > p0 + 1) {
+                llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+            } else if (p0 >= 0 && pos_beg <= p0) {
+                if (!llama_memory_seq_rm(mem_dft, seq_id, pos_beg, -1)) {
+                    llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+                }
+            }
+        }
+
+        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+        for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+            const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+
+            if (use_dev_features) {
+                batch_inject.clear();
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    const int32_t   row        = row_beg + offset + i;
+                    const llama_pos p          = pos_beg + offset + i;
+                    const llama_pos pos_arr[4] = { p, p, p, 0 };
+                    batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                }
+
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (CED n_tokens=%d, offset=%d)\n",
+                            __func__, rc, (int) n_chunk, (int) offset);
+                    return false;
+                }
+                continue;
+            }
+
+            features_buf.resize((size_t) n_chunk * n_embd_enc);
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                if (!layer) {
+                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                }
+                for (int32_t i = 0; i < n_chunk; ++i) {
+                    float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer + (size_t) (row_beg + offset + i) * n_embd_tgt;
+                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                }
+            }
+
+            batch_inject.clear();
+            for (int32_t i = 0; i < n_chunk; ++i) {
+                const llama_pos p          = pos_beg + offset + i;
+                const llama_pos pos_arr[4] = { p, p, p, 0 };
+                batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+            }
+            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+            if (rc != 0) {
+                LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (CED n_tokens=%d, offset=%d)\n",
+                        __func__, rc, (int) n_chunk, (int) offset);
+                return false;
+            }
+            store_context_features(seq_id, n_chunk);
+        }
+
+        llama_ced_clear_layer_inp_status(ctx_tgt, seq_id);
+        return true;
+    }
+
 public:
+    bool flush_ced(llama_seq_id seq_id) override {
+        return inject_ced_flushed(seq_id);
+    }
+
     ~common_speculative_impl_draft_dflash() override {
         auto * ctx_dft = this->params.ctx_dft;
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
@@ -1243,6 +1336,16 @@ public:
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
+            const int32_t ced_st = llama_ced_layer_inp_status(ctx_tgt, seq_id, nullptr, nullptr, nullptr);
+            if (ced_st == 0) {
+                continue;
+            }
+            if (ced_st == 1) {
+                if (!inject_ced_flushed(seq_id)) {
+                    return false;
+                }
+                continue;
+            }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
@@ -1251,6 +1354,15 @@ public:
             const bool pos_pinned = first.pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
             if (first.id == LLAMA_TOKEN_NULL && n_rows > 1 && pos_pinned) {
                 continue;
+            }
+
+            if (llama_model_is_swa_all(llama_get_model(ctx_dft))) {
+                if (llama_memory_t mem_dft = llama_get_memory(ctx_dft)) {
+                    const llama_pos p0 = llama_memory_seq_pos_max(mem_dft, seq_id);
+                    if (p0 >= 0 && first.pos[0] > p0 + 1) {
+                        llama_memory_seq_rm(mem_dft, seq_id, -1, -1);
+                    }
+                }
             }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
@@ -3574,6 +3686,20 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 
     for (auto & impl : spec->impls) {
         result = result && impl->process(batch);
+    }
+
+    return result;
+}
+
+bool common_speculative_flush_ced(common_speculative * spec, llama_seq_id seq_id) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->flush_ced(seq_id);
     }
 
     return result;

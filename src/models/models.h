@@ -1502,23 +1502,44 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         ggml_tensor * build_attention41(
                 const llama_model_deepseek41 & model,
                 llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * cur_k,
+                ggml_tensor * cur_o,
+                ggml_tensor * pos_k,
+                ggml_tensor * pos_o,
+                ggml_tensor * k_idxs_dec,
+                ggml_tensor * raw_mask_o,
+                ggml_tensor * hca_mask_o,
+                ggml_tensor * cand_pin_o,
+                int32_t       ks,
+                int32_t       os,
+                bool          skip_comp_write,
+                bool          kv_only,
+                int           il);
+
+        void build_comp_kv_write(
+                const llama_model_deepseek41 & model,
+                llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
-                ggml_tensor * inp_pos,
-                ggml_tensor * cand_pin,
                 int il);
 
+        void build_comp_kv_mirrors(
+                const llama_model_deepseek41 & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                int il_src) const;
+
         std::vector<ggml_tensor *> topk_of; // top-k of each index source layer
+        std::vector<int32_t>       topk_o_start; // [n_layer] o_start at which topk_of[il] was computed
         std::vector<ggml_tensor *> comp_row_of; // [n_layer] new compressed rows of each kv source (for mirrors)
         ggml_tensor * cand_sel    = nullptr; // candidate blocks of the candidate source layer
         int64_t       cand_n_comp = 0;       // compressed rows the candidate source scored
+        int32_t       cand_o_start = 0;      // o_start at which cand_sel was computed
 
         // sparse path (LLAMA_DSV41_SPARSE=0 disables): fused indexer, FA bounded to window + top-k, decode gather
         bool sparse = true;
-        // gather path, shared by layers with the same top-k: selected K rows per (storage layer, top-k source),
-        // the sorted top-k and the mask per top-k source (one input copy per split)
-        std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
-        std::map<int32_t, ggml_tensor *> gather_sel_of;
-        std::map<int32_t, ggml_tensor *> gather_mask_of;
+        // gather path, shared by layers with the same (top-k source, o_start)
+        std::map<std::tuple<int32_t, int32_t, int32_t>, ggml_tensor *> gather_k_of;
+        std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_sel_of;
+        std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_mask_of;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

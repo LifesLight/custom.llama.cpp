@@ -89,6 +89,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// flush any CED-deferred target layer inputs into the draft model for seq_id (e.g. before checkpointing)
+bool common_speculative_flush_ced(common_speculative * spec, llama_seq_id seq_id);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
