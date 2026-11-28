@@ -10,6 +10,7 @@
 
 struct llama_model;
 class llama_moe_hot;
+class llama_monitor;
 
 struct llama_moe_stream_params {
     int32_t     n_threads; // IO threads
@@ -116,6 +117,11 @@ public:
     // any thread: read the tensors of the expert from the model file into buf, at the lowest priority of the IO
     // threads, false on a read error
     bool read_expert(int il, int expert, std::vector<uint8_t> & buf, std::vector<expert_part> & parts);
+
+    // the monitor (llama_monitor_*) gets the selected experts of each layer, between graphs
+    void set_monitor(llama_monitor * mon);
+    // the layer is streamed: its experts and the cache slots it has
+    bool layer_slots(int il, int & n_expert, int & n_cached) const;
 
     // true if src is an expert tensor handled by the stream
     bool is_streamed(const ggml_tensor * src) const;

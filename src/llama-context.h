@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-monitor.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -379,6 +380,19 @@ private:
     llama_moe_cache_ptr moe_cache;
     llama_moe_stream_ptr moe_stream;
 
+public:
+    // the monitor feed (llama_monitor_*), emit sites check monitor->on() first
+    std::unique_ptr<llama_monitor> monitor;
+    int64_t  mon_hot_t = 0;       // the last report of the GPU tier transfers
+    uint64_t mon_hot_prev[5] = {}; // and its totals (llama_moe_hot::totals)
+    void monitor_set_topics(uint32_t topics);
+    void monitor_layout(llama_monitor_layout * out) const;
+    void monitor_snapshot(llama_monitor_layer * layers, uint32_t * counts, uint8_t * where);
+private:
+    // the graph kind of the next process_ubatch, for the monitor
+    uint8_t monitor_ub_kind = LLAMA_MONITOR_UB_FULL;
+    int32_t monitor_dec_tokens = 0, monitor_dec_chunks = 0; // of the current CED decoder pass
+
     // the GPU expert tier of the MoE stream, for the small-batch phase of workspace switching
     std::unique_ptr<llama_moe_hot> moe_hot;
     llama_moe_hot_params moe_hot_params = {};
@@ -634,7 +648,8 @@ private:
     llama_kv_cache_dsv4 * get_kv_dsv4() const;
     bool ced_use_split_reserve() const;
     void ced_update_tail_cap_for_li();
-    int ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bool from_decode);
+    int ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bool from_decode, uint8_t trigger = LLAMA_MONITOR_TRIG_OUTPUT);
+    int ced_flush_decoder_run(const std::vector<ced_flush_req> & reqs, bool from_decode);
 
     // perf
     mutable int64_t t_start_us  = 0;

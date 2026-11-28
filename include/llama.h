@@ -1840,6 +1840,85 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    //
+    // Monitor: a live feed of what the engine does, for a monitoring UI. Shapes, counts, sizes, timings and
+    // layer/expert indices only (never token ids, text or media). Off until a topic is set: then every emit site
+    // costs one relaxed atomic load. Thread safe: the decode thread writes, any thread drains and snapshots.
+    //
+
+    #define LLAMA_MONITOR_TOPIC_TIMELINE 1 // events (ring buffer)
+    #define LLAMA_MONITOR_TOPIC_EXPERTS  2 // per layer and expert selection counters
+
+    enum llama_monitor_event_type {
+        LLAMA_MONITOR_EV_UBATCH         = 1, // a graph computed. kind: LLAMA_MONITOR_UB_*; n[0] tokens, n[1] outputs, n[2] cells used, n[3] 1 if the graph was reused; x[0] first position, x[1] KV cells mapped
+        LLAMA_MONITOR_EV_PREFILL        = 2, // kind 0 begin, 1 end; n[0] tokens, n[1] ubatches (end), x[0] cells at the start
+        LLAMA_MONITOR_EV_WORKSPACE      = 3, // workspace switch/reservation. kind 0 small, 1 large; n[0] tokens, n[1..3] MiB of the first 3 devices after
+        LLAMA_MONITOR_EV_KV_GROW        = 4, // KV cells mapped. kind 0 grow, 1 shrink; n[0] cells before, n[1] cells after
+        LLAMA_MONITOR_EV_CED_DECODER    = 5, // DeepSeek-V4.1 CED decoder pass. kind: trigger LLAMA_MONITOR_TRIG_*; n[0] sequences (rows), n[1] ubatches (chunks)
+        LLAMA_MONITOR_EV_MOE_GRAPH      = 6, // expert reads of one graph. kind 0 mostly CPU experts, 1 mostly GPU upload; n[0] tokens, n[1] layers on the CPU path, n[2] layers on the GPU path; x[0] bytes read ahead and used, x[1] bytes read on demand (the graph waited), x[2] bytes read ahead and not selected
+        LLAMA_MONITOR_EV_MEDIA          = 7, // (server) a media chunk encoded. kind 0 image, 2 audio; n[0] tokens, n[1] chunks in the batch, x[0] first position, x[1] last position
+        LLAMA_MONITOR_EV_STATE          = 8, // (server) kind 0 ctx checkpoint save, 1 ctx checkpoint restore, 2 slot/disk file save, 3 slot/disk file restore, 4 prompt cache save; n[0] tokens, x[0] bytes
+        LLAMA_MONITOR_EV_MOE_UPLOAD     = 9, // RAM to GPU transfers of one graph. n[0] stalls on a missing expert, n[1] read-ahead wanted, n[2] read-ahead done; x[0] bytes uploaded from the read buffers, x[1] bytes uploaded from the RAM cache, x[2] us the graph waited for reads
+        LLAMA_MONITOR_EV_REQUEST        = 10, // (server) a task. kind 1 started: n[0] prompt tokens; kind 0 done: n[0] prompt tokens processed, n[1] prompt tokens cached, n[2] generated tokens, n[3] draft accepted; x[0] draft generated
+        LLAMA_MONITOR_EV_HOT            = 11, // GPU expert tier transfers published since the last report (the span): n[0] experts promoted, n[1] failed; x[0] bytes RAM to GPU, x[1] bytes GPU to RAM, x[2] bytes file to RAM
+    };
+
+    enum llama_monitor_ubatch_kind {
+        LLAMA_MONITOR_UB_FULL    = 0, // the whole model
+        LLAMA_MONITOR_UB_ENCODER = 1, // CED encoder layers only (decoder pass deferred)
+        LLAMA_MONITOR_UB_DECODER = 2, // CED decoder layers over the saved states
+        LLAMA_MONITOR_UB_ENCODE  = 3, // llama_encode
+    };
+
+    enum llama_monitor_trigger {
+        LLAMA_MONITOR_TRIG_OUTPUT = 0, // outputs are wanted
+        LLAMA_MONITOR_TRIG_STATE  = 1, // the layer inputs / state are wanted
+        LLAMA_MONITOR_TRIG_BATCH  = 2, // a full-model batch follows
+    };
+
+    struct llama_monitor_event {
+        uint8_t  type;     // llama_monitor_event_type
+        uint8_t  kind;
+        uint16_t flags;
+        uint32_t seq;      // event number, gaps are dropped events
+        int64_t  t_us;     // start, llama_monitor_now_us()
+        int64_t  dur_us;
+        int32_t  n[4];
+        int64_t  x[3];
+    };
+
+    struct llama_monitor_layout {
+        int32_t n_layer;
+        int32_t n_expert;      // max experts of a layer
+        int32_t n_expert_used;
+        int32_t n_moe_layer;   // layers with experts tracked by the streamer
+    };
+
+    struct llama_monitor_layer {
+        int32_t  moe;          // 1: tracked MoE layer
+        int32_t  n_expert;
+        int32_t  n_cached;     // experts in the RAM cache
+        int32_t  n_hot;        // experts in the GPU tier
+        int32_t  distinct;     // distinct experts selected by the last ubatch
+        int32_t  pad;
+        uint64_t routes;       // selections (token x expert) since the topic was set
+        uint64_t hit_gpu;      // distinct experts per ubatch found in the GPU tier
+        uint64_t hit_ram;      // ... in the RAM cache
+        uint64_t miss;         // ... read from the model file
+    };
+
+    LLAMA_API int64_t llama_monitor_now_us(void);
+    // OR of the topics wanted (0 = off); allocates the buffers when a topic is first set
+    LLAMA_API void    llama_monitor_set_topics(struct llama_context * ctx, uint32_t topics);
+    LLAMA_API void    llama_monitor_get_layout(const struct llama_context * ctx, struct llama_monitor_layout * out);
+    // events oldest first into out, returns the count. *n_dropped: events dropped since the last drain (buffer full)
+    LLAMA_API int32_t llama_monitor_drain(struct llama_context * ctx, struct llama_monitor_event * out, int32_t max, uint64_t * n_dropped);
+    // add an event (the server's media and checkpoints), ignored unless the timeline topic is on
+    LLAMA_API void    llama_monitor_emit(struct llama_context * ctx, const struct llama_monitor_event * ev);
+    // layers[n_layer]; counts[n_layer*n_expert] (selections since the topic was set) and where[n_layer*n_expert]
+    // (0 model file, 1 RAM cache, 2 GPU tier) may be NULL. needs the experts topic for the counters
+    LLAMA_API void    llama_monitor_snapshot(struct llama_context * ctx, struct llama_monitor_layer * layers, uint32_t * counts, uint8_t * where);
+
 #ifdef __cplusplus
 }
 #endif

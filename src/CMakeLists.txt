@@ -30,6 +30,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory.cpp
     llama-moe-cache.cpp
     llama-moe-stream.cpp
+    llama-monitor.cpp
     llama-moe-hot.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp

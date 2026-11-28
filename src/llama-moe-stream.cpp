@@ -3,6 +3,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-monitor.h"
 
 #include <algorithm>
 #include <atomic>
@@ -534,6 +535,15 @@ struct llama_moe_stream::impl {
     totals agg;  // gpu: the ubatches of the current prompt, logged together
 
     bool    graph_cached = false; // the current graph was computed from the cache
+
+    llama_monitor * mon = nullptr; // the experts and the graphs are reported while its topics are on
+    int64_t mon_t0      = 0;       // start of the current graph
+    size_t  mon_read0   = 0;
+    // reads of the current graph by what became of them, in bytes: read ahead and used, demand (selected, not read
+    // ahead: the graph waits for them), read ahead and not selected; and the layers by path
+    size_t  mon_used = 0, mon_demand = 0, mon_wasted = 0;
+    int     mon_cpu_layers = 0, mon_gpu_layers = 0;
+    int64_t mon_stall_us = 0;
     int64_t state_tokens = 0;     // tokens computed on the CPU since the state was saved
     bool    state_dirty  = false;
 
@@ -2951,6 +2961,7 @@ struct llama_moe_stream::impl {
                 const int32_t e = p.slot_expert[s];
                 if (count && l.mark[e] == l.mark_gen) {
                     pf_used++;
+                    mon_used += expert_bytes(l);
                     pf_ready += p.slot_wg[s].pending == 0;
                 } else if (p.pf_vl[s] < 0) {
                     // in a free slot: its reads go on, nothing to give back
@@ -2963,6 +2974,7 @@ struct llama_moe_stream::impl {
                     pf_cancelled++;
                 } else {
                     pf_wasted++;
+                    mon_wasted += expert_bytes(l);
                 }
             }
         }
@@ -3522,6 +3534,19 @@ struct llama_moe_stream::impl {
         l.st_access += needed.size();
         l.st_hits   += needed.size() - missing.size();
 
+        if (mon && mon->on(LLAMA_MONITOR_TOPIC_EXPERTS)) {
+            for (int32_t e : needed) {
+                mon->count(l.il, e, cnt[e]);
+            }
+            for (int32_t e : gpu_needed) {
+                mon->count(l.il, e, cnt[e]);
+            }
+            mon->layer_done(l.il, (int) (needed.size() + gpu_needed.size()), (int) gpu_needed.size(),
+                    (int) (needed.size() - missing.size()), (int) missing.size(), (uint64_t) (k*n));
+            mon_demand += missing.size()*expert_bytes(l);
+            mon_cpu_layers++;
+        }
+
         overflow.clear();
         const size_t read_start = bytes_read;
         wait_group & wg = pend_wg;
@@ -3687,6 +3712,7 @@ struct llama_moe_stream::impl {
         }
 
         cpu_t_policy += t_now() - t_ensure - t_waited;
+        mon_stall_us += (int64_t) (t_waited*1e6);
     }
 
     // the cached experts are computed: wait for the missing ones
@@ -3698,6 +3724,7 @@ struct llama_moe_stream::impl {
         if (!wait(pend_wg)) {
             GGML_ABORT("moe_stream: failed to read the experts of layer %d", layers[li].il);
         }
+        mon_stall_us += (int64_t) ((t_now() - t0)*1e6);
         wait_pf_pending();
         cpu_t_read += t_now() - t0;
         cpu_bytes  += bytes_read - pend_read_start;
@@ -4281,6 +4308,21 @@ struct llama_moe_stream::impl {
             }
             l.counts_gen = graph_gen;
             l.counts     = *counts;
+            mon_gpu_layers++;
+            if (mon && mon->on(LLAMA_MONITOR_TOPIC_EXPERTS)) {
+                int distinct = 0, ram = 0, miss = 0;
+                uint64_t routes = 0;
+                for (int64_t e = 0; e < l.n_expert; ++e) {
+                    const int32_t c = (*counts)[e];
+                    if (c > 0) {
+                        mon->count(l.il, (int32_t) e, (uint32_t) c);
+                        distinct++;
+                        routes += c;
+                        (l.slot_of[e] >= 0 ? ram : miss)++;
+                    }
+                }
+                mon->layer_done(l.il, distinct, 0, ram, miss, routes);
+            }
             // the order of the reads ahead, and with a prompt weight the eviction order of generation (the cache
             // itself does not change during prompt processing)
             const double w = weight();
@@ -4311,6 +4353,11 @@ struct llama_moe_stream::impl {
                 for (int64_t e = 0; e < l.n_expert; ++e) {
                     if ((*counts)[e] > 0 && l.slot_of[e] < 0) {
                         pf_need++;
+                        if (s0 < 0 || slots[s0].state[e] != EXP_PLACED) {
+                            mon_demand += es;
+                        } else {
+                            mon_used += es;
+                        }
                         if (s0 >= 0 && slots[s0].state[e] == EXP_PLACED) {
                             if (slots[s0].wg[e].pending == 0) {
                                 pf_done++;
@@ -4425,6 +4472,11 @@ struct llama_moe_stream::impl {
 
     void begin_graph(ggml_backend_sched_t sched, ggml_cgraph * gf, int64_t n_tok, bool more) {
         graphs_running.fetch_add(1);
+        mon_t0    = ggml_time_us();
+        mon_read0 = bytes_read;
+        mon_used = mon_demand = mon_wasted = 0;
+        mon_cpu_layers = mon_gpu_layers = 0;
+        mon_stall_us = 0;
         if (hot_observer) {
             hot_observer->begin_batch();
         }
@@ -4786,6 +4838,18 @@ struct llama_moe_stream::impl {
         if (graph_cached) {
             drain_prefetch(false);
         }
+        if (mon && mon->on(LLAMA_MONITOR_TOPIC_TIMELINE) && (graph_cached || t_first >= 0.0)) {
+            size_t vain;
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                vain = bytes_vain;
+            }
+            const int64_t dur = graph_end_us - mon_t0;
+            mon->emit(LLAMA_MONITOR_EV_MOE_GRAPH, mon_cpu_layers >= mon_gpu_layers ? 0 : 1, mon_t0, dur, (int32_t) n_tokens,
+                    mon_cpu_layers, mon_gpu_layers, 0, (int64_t) mon_used, (int64_t) mon_demand, (int64_t) (mon_wasted + vain));
+            mon->emit(LLAMA_MONITOR_EV_MOE_UPLOAD, 0, mon_t0, dur, n_misses, pf_need, pf_done + pf_queue, 0,
+                    (int64_t) bytes_up_slot, (int64_t) bytes_up_res, mon_stall_us + (int64_t) (t_stalled*1e6));
+        }
 
         if (graph_cached && !last_streamed) {
             gadvance(n_tokens);
@@ -4962,6 +5026,31 @@ llama_moe_stream::~llama_moe_stream() = default;
 
 bool llama_moe_stream::active() const {
     return pimpl->is_active;
+}
+
+void llama_moe_stream::set_monitor(llama_monitor * mon) {
+#ifdef __linux__
+    pimpl->mon = mon;
+#else
+    GGML_UNUSED(mon);
+#endif
+}
+
+bool llama_moe_stream::layer_slots(int il, int & n_expert, int & n_cached) const {
+#ifdef __linux__
+    if (!active() || il < 0 || il >= (int) pimpl->layer_of_il.size() || pimpl->layer_of_il[il] < 0) {
+        return false;
+    }
+    const auto & l = pimpl->layers[pimpl->layer_of_il[il]];
+    n_expert = (int) l.n_expert;
+    n_cached = (int) l.n_cached;
+    return true;
+#else
+    GGML_UNUSED(il);
+    GGML_UNUSED(n_expert);
+    GGML_UNUSED(n_cached);
+    return false;
+#endif
 }
 
 bool llama_moe_stream::cached(int il, int e) const {

@@ -187,6 +187,7 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+    monitor = std::make_unique<llama_monitor>((int32_t) model.hparams.n_layer(), (int32_t) model.hparams.n_expert, (int32_t) model.hparams.n_expert_used_max());
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -679,6 +680,8 @@ llama_context::llama_context(
                 moe_stream = std::make_unique<llama_moe_stream>(model, backend_ptrs, sparams);
                 if (!moe_stream->active()) {
                     moe_stream.reset();
+                } else {
+                    moe_stream->set_monitor(monitor.get());
                 }
             }
         }
@@ -1001,6 +1004,10 @@ void llama_context::kv_log_cap(uint32_t from, uint32_t to, int64_t t_start_us, b
     if (t_start_us > 0) {
         mem += format("%s%.0f ms", mem.empty() ? "" : ", ", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (monitor->on(LLAMA_MONITOR_TOPIC_TIMELINE)) {
+        const int64_t now = ggml_time_us();
+        monitor->emit(LLAMA_MONITOR_EV_KV_GROW, to < from ? 1 : 0, t_start_us > 0 ? t_start_us : now, t_start_us > 0 ? now - t_start_us : 0, (int32_t) from, (int32_t) to);
+    }
     LLAMA_LOG_INFO("kv_grow: %s%s%u -> %u of %u cells mapped%s (%s)\n", kv_lead ? log_name() : "", kv_lead ? ": " : "",
             from, to, cparams.n_ctx_seq, what, mem.c_str());
 }
@@ -1102,6 +1109,9 @@ void llama_context::prefill_end() {
     LLAMA_LOG_INFO("%s: prefill: %llu tokens from cell %llu in %u ubatches (%s), %d reservations in %.1f s%s, %.1f s\n",
             __func__, (unsigned long long) n_tokens, (unsigned long long) prefill.n_from, n_ubatch, ubs.c_str(),
             prefill.n_res, prefill.t_res/1000.0, kv.c_str(), (ggml_time_us() - prefill.t_start)/1e6);
+    if (monitor->on(LLAMA_MONITOR_TOPIC_TIMELINE)) {
+        monitor->emit(LLAMA_MONITOR_EV_PREFILL, 1, prefill.t_start, ggml_time_us() - prefill.t_start, (int32_t) n_tokens, (int32_t) n_ubatch, 0, 0, (int64_t) prefill.n_from);
+    }
     prefill.ubatches.clear();
 
 }
@@ -1125,6 +1135,9 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
             prefill.active  = true;
             prefill.t_start = ggml_time_us();
             prefill.n_from  = used;
+            if (monitor->on(LLAMA_MONITOR_TOPIC_TIMELINE)) {
+                monitor->emit(LLAMA_MONITOR_EV_PREFILL, 0, prefill.t_start, 0, 0, 0, 0, 0, (int64_t) used);
+            }
         }
         prefill.n_last = used;
     }
@@ -1254,6 +1267,22 @@ bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool 
                 if (moe_hot->tick(*moe_stream)) {
                     sched_need_reserve = true;
                     sched_reserve();
+                }
+                if (monitor->on(LLAMA_MONITOR_TOPIC_TIMELINE)) {
+                    // the transfers run in the background: report what was published since the last report, over that span
+                    uint64_t v[5];
+                    moe_hot->totals(v[0], v[1], v[2], v[3], v[4]);
+                    const int64_t now = ggml_time_us();
+                    if (mon_hot_t == 0 || v[0] < mon_hot_prev[0]) {
+                        std::copy(v, v + 5, mon_hot_prev);
+                        mon_hot_t = now;
+                    } else if (v[0] != mon_hot_prev[0] || v[2] != mon_hot_prev[2] || v[3] != mon_hot_prev[3] || v[4] != mon_hot_prev[4]) {
+                        monitor->emit(LLAMA_MONITOR_EV_HOT, 0, mon_hot_t, now - mon_hot_t, (int32_t) (v[0] - mon_hot_prev[0]),
+                                (int32_t) (v[1] - mon_hot_prev[1]), 0, 0, (int64_t) (v[2] - mon_hot_prev[2]),
+                                (int64_t) (v[3] - mon_hot_prev[3]), (int64_t) (v[4] - mon_hot_prev[4]));
+                        std::copy(v, v + 5, mon_hot_prev);
+                        mon_hot_t = now;
+                    }
                 }
             } catch (const std::exception & e) {
                 drop_hot("update", e);
@@ -2009,6 +2038,13 @@ void llama_context::sched_reserve() {
             }
         }
         const double t_ms = (t_end_us - t_start_us)/1000.0;
+        if (monitor->on(LLAMA_MONITOR_TOPIC_TIMELINE)) {
+            int32_t mib[3] = { 0, 0, 0 };
+            for (size_t i = 0; i < backend_ptrs.size() && i < 3; ++i) {
+                mib[i] = (int32_t) (backend_buf_exp_size[i]/1048576);
+            }
+            monitor->emit(LLAMA_MONITOR_EV_WORKSPACE, sched_workspace_small ? 0 : 1, t_start_us, t_end_us - t_start_us, (int32_t) n_tokens, mib[0], mib[1], mib[2]);
+        }
         if (log_prefill) {
             LLAMA_LOG_INFO("%s: prefill: n_ubatch = %u for cells %llu..%s (the prompt ends at %llu): %s, %.0f ms\n", __func__,
                     n_tokens, (unsigned long long) ubatch_need_used, n_cells_res > 0 ? std::to_string(n_cells_res).c_str() : "all",
@@ -2696,7 +2732,21 @@ static void copy_tensor_async_rows(
 
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers);
 
-int llama_context::ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bool from_decode) {
+int llama_context::ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bool from_decode, uint8_t trigger) {
+    if (!monitor->on(LLAMA_MONITOR_TOPIC_TIMELINE)) {
+        return ced_flush_decoder_run(reqs, from_decode);
+    }
+    const int64_t t0 = ggml_time_us();
+    monitor_dec_tokens = 0;
+    monitor_dec_chunks = 0;
+    const int rc = ced_flush_decoder_run(reqs, from_decode);
+    if (monitor_dec_chunks > 0) {
+        monitor->emit(LLAMA_MONITOR_EV_CED_DECODER, trigger, t0, ggml_time_us() - t0, monitor_dec_tokens, monitor_dec_chunks, (int32_t) reqs.size(), rc);
+    }
+    return rc;
+}
+
+int llama_context::ced_flush_decoder_run(const std::vector<ced_flush_req> & reqs, bool from_decode) {
     auto * kv_dsv4 = get_kv_dsv4();
     if (!kv_dsv4 || !kv_dsv4->ced_enabled() || reqs.empty()) {
         return 0;
@@ -2968,7 +3018,9 @@ int llama_context::ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bo
             }
 
             ggml_status status;
+            monitor_ub_kind = LLAMA_MONITOR_UB_DECODER;
             const auto * res = process_ubatch(ub, ctx_type_to_graph_type(cparams.ctx_type), mctx_dec.get(), status);
+            monitor_ub_kind = LLAMA_MONITOR_UB_FULL;
             if (!res) {
                 kv_dsv4->ced_reset_dec_seq(s);
                 switch (status) {
@@ -3383,6 +3435,8 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t mon_t0 = monitor->on(LLAMA_MONITOR_TOPIC_TIMELINE) ? ggml_time_us() : 0;
+    bool mon_reused = false;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -3407,6 +3461,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        mon_reused = true;
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -3480,6 +3535,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (mon_t0 != 0) {
+        if (monitor_ub_kind == LLAMA_MONITOR_UB_DECODER) {
+            monitor_dec_tokens += (int32_t) ubatch.n_tokens;
+            monitor_dec_chunks++;
+        }
+        monitor->emit(LLAMA_MONITOR_EV_UBATCH, monitor_ub_kind, mon_t0, ggml_time_us() - mon_t0, (int32_t) ubatch.n_tokens, n_outputs,
+                memory ? (int32_t) cells_used() : -1, mon_reused, ubatch.n_tokens > 0 && ubatch.pos ? (int64_t) ubatch.pos[0] : -1,
+                memory ? (int64_t) memory->get_cap() : 0);
+    }
 
     return res;
 }
@@ -3560,7 +3625,9 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
+    monitor_ub_kind = LLAMA_MONITOR_UB_ENCODE;
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    monitor_ub_kind = LLAMA_MONITOR_UB_FULL;
 
     cparams.causal_attn = causal_attn_org;
 
@@ -3973,7 +4040,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool startup_probe)
             n_outputs = 0;
 
             ggml_status status;
+            monitor_ub_kind = LLAMA_MONITOR_UB_ENCODER;
             const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mc, status);
+            monitor_ub_kind = LLAMA_MONITOR_UB_FULL;
             if (!res) {
                 llama_pos pos_min[LLAMA_MAX_SEQ];
                 for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
@@ -4210,7 +4279,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, bool startup_probe)
             }
         }
         if (!pre_reqs.empty()) {
-            const int rc_pre = ced_flush_decoder(pre_reqs, false);
+            const int rc_pre = ced_flush_decoder(pre_reqs, false, LLAMA_MONITOR_TRIG_BATCH);
             if (rc_pre != 0) {
                 return rc_pre;
             }
@@ -6377,7 +6446,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
                 li_base += li_rows;
             }
         }
-        const int rc = ced_flush_decoder(reqs, false);
+        const int rc = ced_flush_decoder(reqs, false, LLAMA_MONITOR_TRIG_STATE);
         if (rc != 0) {
             throw std::runtime_error(format("CED decoder flush failed before state write (rc=%d)", rc));
         }
@@ -6452,7 +6521,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
                 }
             }
         }
-        const int rc = ced_flush_decoder(reqs, false);
+        const int rc = ced_flush_decoder(reqs, false, LLAMA_MONITOR_TRIG_STATE);
         if (rc != 0) {
             throw std::runtime_error(format("CED decoder flush failed before state seq write (rc=%d)", rc));
         }
@@ -7089,6 +7158,51 @@ bool llama_get_causal_attn(const llama_context * ctx) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+void llama_context::monitor_set_topics(uint32_t topics) {
+    monitor->set_topics(topics);
+    if (topics & LLAMA_MONITOR_TOPIC_EXPERTS) {
+        for (int il = 0; il < monitor->n_layer; ++il) {
+            int n_expert = 0, n_cached = 0;
+            if (moe_stream && moe_stream->layer_slots(il, n_expert, n_cached)) {
+                monitor->set_layer(il, n_expert, n_cached, 0);
+            }
+        }
+    }
+}
+
+void llama_context::monitor_layout(llama_monitor_layout * out) const {
+    monitor->layout(out);
+    out->n_moe_layer = 0;
+    for (int il = 0; il < monitor->n_layer; ++il) {
+        int n_expert = 0, n_cached = 0;
+        out->n_moe_layer += moe_stream && moe_stream->layer_slots(il, n_expert, n_cached);
+    }
+}
+
+// reads state that the decode thread changes between graphs: values may be a graph behind
+void llama_context::monitor_snapshot(llama_monitor_layer * layers, uint32_t * counts, uint8_t * where) {
+    monitor->snapshot(layers, counts);
+    const int64_t ne = monitor->n_expert;
+    for (int il = 0; il < monitor->n_layer; ++il) {
+        int n_expert = 0, n_cached = 0;
+        if (!moe_stream || !moe_stream->layer_slots(il, n_expert, n_cached)) {
+            continue;
+        }
+        auto & l = layers[il];
+        l.moe      = 1;
+        l.n_expert = n_expert;
+        l.n_cached = n_cached;
+        l.n_hot    = 0;
+        for (int e = 0; e < n_expert; ++e) {
+            const bool hot = moe_hot && moe_hot->contains(il, e);
+            l.n_hot += hot;
+            if (where) {
+                where[il*ne + e] = hot ? 2 : moe_stream->cached(il, e) ? 1 : 0;
+            }
+        }
+    }
 }
 
 void llama_moe_hot_release(llama_context * ctx) {

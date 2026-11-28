@@ -70,6 +70,9 @@ public:
     bool update_due() const;
     void update(llama_moe_stream & stream);
 
+    // totals since the start: experts published to the GPU tier, failed transfers, bytes RAM to GPU, GPU to RAM, file to RAM
+    void totals(uint64_t & promoted, uint64_t & failed, uint64_t & up, uint64_t & down, uint64_t & file) const;
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

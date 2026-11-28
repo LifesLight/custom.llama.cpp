@@ -1054,6 +1054,14 @@ bool llama_moe_hot::update_due() const {
         pimpl->tokens - pimpl->last_update >= pimpl->update_interval;
 }
 
+void llama_moe_hot::totals(uint64_t & promoted, uint64_t & failed, uint64_t & up, uint64_t & down, uint64_t & file) const {
+    promoted = pimpl->promotions;
+    failed   = pimpl->failed;
+    up       = pimpl->upload_bytes;
+    down     = pimpl->download_bytes;
+    file     = pimpl->file_bytes;
+}
+
 void llama_moe_hot::update(llama_moe_stream & stream) {
     GGML_ASSERT(&stream == &pimpl->stream);
     pimpl->update();
