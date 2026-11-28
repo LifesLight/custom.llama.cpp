@@ -665,6 +665,8 @@ struct common_params {
 
     // server params
     int32_t port                = 9931;          // server listens on this network port
+    int32_t monitor_port        = 0;             // live monitor page and event stream on this port, 0 = off
+    std::string monitor_host    = "127.0.0.1";    // address of the monitor
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
     int32_t timeout_read        = 3600;          // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds

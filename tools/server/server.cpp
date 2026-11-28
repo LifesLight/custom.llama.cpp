@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "server-http.h"
 #include "server-models.h"
+#include "server-monitor.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
@@ -771,6 +772,15 @@ static int server_run_instance(common_params & params, server_role & role, commo
         return 1;
     }
 
+    // the live monitor (--monitor-port): its own listener and thread
+    std::unique_ptr<server_monitor> live_monitor;
+    if (params.monitor_port > 0) {
+        live_monitor = std::make_unique<server_monitor>(params, [&ctx_server]() { return ctx_server.get_llama_context(); });
+        if (!live_monitor->start()) {
+            live_monitor.reset();
+        }
+    }
+
     // optionally, notify router server that this instance is ready
     std::thread monitor_thread;
     if (role.is_managed_by_router()) {
@@ -786,6 +796,9 @@ static int server_run_instance(common_params & params, server_role & role, commo
     // this call blocks the main thread until queue_tasks.terminate() is called
     ctx_server.start_loop();
 
+    if (live_monitor) {
+        live_monitor->stop();
+    }
     clean_up();
     ctx_http.join();
     if (monitor_thread.joinable()) {

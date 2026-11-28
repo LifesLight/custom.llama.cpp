@@ -3523,6 +3523,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PORT"));
     add_opt(common_arg(
+        {"--monitor-port"}, "PORT",
+        "port of the live monitor page of the engine (ubatches, experts, prefill), served by a separate listener (default: 0 = off)",
+        [](common_params & params, int value) {
+            params.monitor_port = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MONITOR_PORT"));
+    add_opt(common_arg(
+        {"--monitor-host"}, "HOST",
+        string_format("address the monitor listens on (default: %s)", params.monitor_host.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.monitor_host = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MONITOR_HOST"));
+    add_opt(common_arg(
         {"--reuse-port"},
         string_format("allow multiple sockets to bind to the same port (default: %s)", params.reuse_port ? "enabled" : "disabled"),
         [](common_params & params) {

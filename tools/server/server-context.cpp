@@ -330,6 +330,7 @@ struct server_batch {
 };
 
 struct server_slot {
+    int64_t t_mon_start = 0; // the monitor: start of the current task
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -446,8 +447,19 @@ struct server_slot {
             return false;
         }
 
+        const int64_t t_save_us = llama_monitor_now_us();
         const size_t n_tgt = llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t n_dft = ctx_dft ? llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        {
+            llama_monitor_event ev = {};
+            ev.type   = LLAMA_MONITOR_EV_STATE;
+            ev.kind   = 4;
+            ev.t_us   = t_save_us;
+            ev.dur_us = llama_monitor_now_us() - t_save_us;
+            ev.n[0]   = (int32_t) prompt.tokens.size();
+            ev.x[0]   = (int64_t) cur_size;
+            llama_monitor_emit(ctx_tgt, &ev);
+        }
         if (n_tgt != cur_size_tgt || n_dft != cur_size_dft) {
             SLT_ERR(*this, "%s", "failed to save complete prompt state\n");
             prompt_cache.states.pop_back();
@@ -855,6 +867,21 @@ struct server_slot {
         const double t_gen        = stats.t_gen_per_token_ms();
         const double n_gen_second = stats.n_gen_tps();
 
+        // the monitor: the span of the task, counts only
+        {
+            llama_monitor_event ev = {};
+            ev.type   = LLAMA_MONITOR_EV_REQUEST;
+            ev.kind   = 0; // done; kind 1 at its start
+            ev.t_us   = t_mon_start > 0 ? t_mon_start : llama_monitor_now_us() - (int64_t) ((t_prompt_total + t_gen_total)*1000.0);
+            ev.dur_us = llama_monitor_now_us() - ev.t_us;
+            ev.n[0]   = (int32_t) stats.n_prompt_processed;
+            ev.n[1]   = (int32_t) stats.n_prompt_cached;
+            ev.n[2]   = (int32_t) stats.n_gen;
+            ev.n[3]   = (int32_t) stats.n_draft_accepted;
+            ev.x[0]   = (int64_t) stats.n_draft_tokens;
+            llama_monitor_emit(ctx_tgt, &ev);
+        }
+
         SLT_INF(*this,
                 "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
                 t_prompt_total, (int) stats.n_prompt_processed, t_prompt, n_prompt_second);
@@ -993,10 +1020,26 @@ static int encode_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch,
     // TODO @ngxson : move this log line to debug when it become more stable
     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+    const int64_t t_enc_us = llama_monitor_now_us();
     res = mtmd_batch_encode(mbatch.get());
     if (res != 0) {
         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
         return -1;
+    }
+
+    // the monitor: one event per encoded chunk (type, tokens and the encode span of the batch; no content)
+    {
+        llama_monitor_event ev = {};
+        ev.type   = LLAMA_MONITOR_EV_MEDIA;
+        ev.t_us   = t_enc_us;
+        ev.dur_us = llama_monitor_now_us() - t_enc_us;
+        ev.n[1]   = n_added;
+        ev.x[0]   = slot.prompt.tokens.pos_next();
+        size_t n_tok = mtmd_input_chunk_get_n_tokens(chunk.get());
+        ev.kind   = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_AUDIO ? 2 : 0;
+        ev.n[0]   = (int32_t) n_tok;
+        ev.x[1]   = ev.x[0] + (int64_t) n_tok - 1;
+        llama_monitor_emit(slot.ctx_tgt, &ev);
     }
 
     return 0;
@@ -2629,6 +2672,17 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+
+        // the monitor: a task starts (prompt tokens only), so that the work of a running task shows under it
+        slot.t_mon_start = llama_monitor_now_us();
+        {
+            llama_monitor_event ev = {};
+            ev.type = LLAMA_MONITOR_EV_REQUEST;
+            ev.kind = 1;
+            ev.t_us = slot.t_mon_start;
+            ev.n[0] = (int32_t) slot.task->n_tokens();
+            llama_monitor_emit(slot.ctx_tgt, &ev);
+        }
         return true;
     }
 
@@ -3206,6 +3260,18 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // the monitor: a state save or restore of kind (see LLAMA_MONITOR_EV_STATE) that started at t_us
+    void monitor_state(uint8_t kind, int64_t t_us, int32_t n_tokens, size_t bytes) const {
+        llama_monitor_event ev = {};
+        ev.type   = LLAMA_MONITOR_EV_STATE;
+        ev.kind   = kind;
+        ev.t_us   = t_us;
+        ev.dur_us = llama_monitor_now_us() - t_us;
+        ev.n[0]   = n_tokens;
+        ev.x[0]   = (int64_t) bytes;
+        llama_monitor_emit(ctx_tgt, &ev);
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -3262,6 +3328,7 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_ckpt_us = llama_monitor_now_us();
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         if (!common_speculative_flush_ced(spec.get(), slot.id)) {
             SLT_ERR(slot, "%s", "failed to flush CED speculative state before checkpoint\n");
@@ -3271,6 +3338,7 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        monitor_state(0, t_ckpt_us, (int32_t) cur.n_tokens, cur.size());
         slot.prompt.checkpoints.push_back(std::move(ckpt));
 
         SLT_TRC(slot,
@@ -3495,6 +3563,7 @@ private:
     }
 
     size_t save_slot_file(const server_slot & slot, const std::string & filepath, const std::vector<char> & packed) const {
+        const int64_t t_mon_us = llama_monitor_now_us();
         GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
         const size_t nwrite = llama_state_seq_save_file(
             ctx_tgt, filepath.c_str(), slot.id,
@@ -3517,10 +3586,12 @@ private:
             throw std::runtime_error("Unable to save slot: incomplete draft state");
         }
 
+        monitor_state(2, t_mon_us, (int32_t) slot.prompt.tokens.size(), nwrite + nwrite_ckpt + nwrite_dft);
         return nwrite + nwrite_ckpt + nwrite_dft;
     }
 
     size_t restore_slot_file(server_slot & slot, const std::string & filepath) const {
+        const int64_t t_mon_us = llama_monitor_now_us();
         size_t nread = 0;
         size_t n_packed = 0;
         llama_tokens packed;
@@ -3551,6 +3622,7 @@ private:
         const size_t nread_ckpt = load_slot_checkpoints(filepath, nread, slot);
         const size_t nread_dft  = load_slot_draft(filepath, nread + nread_ckpt, slot);
         slot.disk_cache_key = disk_cache ? server_cache_adapter_key(disk_model_key, slot.lora) : "";
+        monitor_state(3, t_mon_us, (int32_t) slot.prompt.tokens.size(), nread + nread_ckpt + nread_dft);
         return nread + nread_ckpt + nread_dft;
     }
 
@@ -4914,6 +4986,7 @@ private:
                                     const auto & cur = *reuse.ckpt;
 
                                     // restore the context checkpoint
+                                    const int64_t t_rest_us = llama_monitor_now_us();
                                     if (!cur.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
                                         !cur.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
                                         if (cur.id_task != -1) {
@@ -4925,6 +4998,7 @@ private:
                                     } else {
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
+                                        monitor_state(1, t_rest_us, (int32_t) cur.n_tokens, cur.size());
 
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
                                     }

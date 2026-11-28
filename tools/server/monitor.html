@@ -1,0 +1,868 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>llama monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  --bg: #111316; --fg: #c8ccd1; --dim: #7d848c; --rule: #2a2e34; --panel: #16191d; --sel: #e8e8e8;
+  /* data sources: where an expert came from */
+  --gpu: #5fb38a; --ram: #6f9fd8; --ssd: #d8914a; --demand: #d8574a; --waste: #8a8f96;
+  /* lanes */
+  --c-req: #7d8b99; --c-dec: #b08fd8; --c-enc: #d6c27a; --c-full: #8d9aa8; --c-img: #c76fa8; --c-ws: #b8b24a; --c-kv: #7d848c;
+  --gap: #181b20; --ssd-dim: #7a5533; --c-hot: #5fb38a; --st-save: #c9d36a; --st-rest: #4fc3d0; --p-cpu: #eeeeee; --p-gpu: #3d7fd0;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 12px/1.35 ui-monospace, "DejaVu Sans Mono", Menlo, Consolas, monospace; }
+body { display: flex; flex-direction: column; overflow: hidden; }
+#hdr { border-bottom: 1px solid var(--rule); padding: 3px 6px; display: flex; flex-wrap: wrap; gap: 2px 16px; white-space: nowrap; }
+#hdr .k { color: var(--dim); }
+#hdr .dev { display: inline-flex; align-items: center; gap: 4px; }
+#hdr .bar { display: inline-block; width: 50px; height: 8px; border: 1px solid var(--rule); position: relative; }
+#hdr .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ram); }
+#tabs { display: flex; border-bottom: 1px solid var(--rule); }
+#tabs a { padding: 2px 10px; color: var(--dim); text-decoration: none; border-right: 1px solid var(--rule); cursor: pointer; }
+#tabs a.on { color: var(--fg); background: var(--panel); }
+#tabs .sp { flex: 1; }
+#tabs button { background: none; border: 0; border-left: 1px solid var(--rule); color: var(--dim); font: inherit; padding: 2px 10px; cursor: pointer; }
+#tabs button.on { color: var(--fg); }
+#main { flex: 1; min-height: 0; display: flex; }
+.view { flex: 1; min-width: 0; min-height: 0; display: none; position: relative; }
+.view.on { display: flex; }
+#side { width: 330px; border-left: 1px solid var(--rule); padding: 4px 6px; overflow: auto; background: var(--panel); }
+#side h4 { margin: 0 0 4px; font-weight: normal; color: var(--dim); }
+#side table { border-collapse: collapse; width: 100%; }
+#side td { padding: 0 4px 0 0; vertical-align: top; }
+#side td:first-child { color: var(--dim); white-space: nowrap; }
+#side td[colspan] { white-space: normal; color: var(--fg); }
+#side td + td { overflow-wrap: anywhere; }
+canvas { display: block; }
+#tl { flex: 1; min-width: 0; position: relative; overflow-y: auto; overflow-x: hidden; }
+#tlc { width: 100%; }
+#tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--rule); padding: 2px 5px; white-space: pre; display: none; }
+#lyl { width: 58%; min-width: 0; position: relative; overflow: auto; border-right: 1px solid var(--rule); }
+#lyd { flex: 1; min-width: 0; padding: 4px 6px; overflow: auto; }
+.leg span { margin-right: 12px; }
+.leg i { display: inline-block; width: 8px; height: 8px; margin-right: 3px; }
+#msg { position: absolute; left: 100px; top: 30px; color: var(--dim); }
+#sidec canvas { margin-top: 6px; image-rendering: pixelated; }
+.note { color: var(--dim); margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="hdr"></div>
+<div id="tabs">
+  <a data-v="timeline">timeline</a><a data-v="layers">layers</a>
+  <span class="sp"></span>
+  <span id="hint" style="color:var(--dim);padding:2px 10px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">drag zooms, wheel zooms, shift+wheel pans, double-click a decode block for its steps</span>
+  <button id="m-all" title="everything recorded, growing with new data">all</button><button id="m-follow" title="the last part, scrolling with new data">follow</button><button id="m-hold" title="this window, still">hold</button>
+  <button id="bclear">clear</button>
+</div>
+<div id="main">
+  <div id="v-timeline" class="view"><div id="tl"><canvas id="tlc"></canvas><div id="tip"></div></div><div id="msg"></div></div>
+  <div id="v-layers" class="view">
+    <div id="lyl"><canvas id="lyc"></canvas></div>
+    <div id="lyd"></div>
+  </div>
+  <div id="side"><h4>click a block</h4><div id="sidec"></div></div>
+</div>
+<script>
+"use strict";
+// event types and kinds, see include/llama.h (llama_monitor_event)
+const T = { UBATCH: 1, PREFILL: 2, WORKSPACE: 3, KV_GROW: 4, CED_DEC: 5, MOE: 6, MEDIA: 7, STATE: 8, UPLOAD: 9, REQUEST: 10, HOT: 11, RUN: 100 };
+const TRIG = ["an output", "a state read (checkpoint or save)", "a full-model batch"];
+const STK = ["ctx checkpoint save", "ctx checkpoint restore", "slot file save", "slot file restore", "prompt cache save"];
+const STL = ["ckpt", "ckpt", "disk", "disk", "ram"];
+const $ = (id) => document.getElementById(id);
+const CSSV = {};
+const css = (n) => CSSV[n] || (CSSV[n] = getComputedStyle(document.documentElement).getPropertyValue(n).trim());
+const fmtB = (b) => b >= 2**30 ? (b / 2**30).toFixed(2) + " GiB" : b >= 2**20 ? (b / 2**20).toFixed(1) + " MiB" : b >= 1024 ? (b / 1024).toFixed(1) + " KiB" : Math.round(b) + " B";
+const fmtMs = (ms) => ms >= 60000 ? (ms / 60000).toFixed(1) + " min" : ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : ms >= 1 ? ms.toFixed(1) + " ms" : (ms * 1000).toFixed(0) + " us";
+const pad = (v, n = 2) => String(v).padStart(n, "0");
+
+const S = {
+  layout: null, ev: [], gr: [], now: 0, wall: 0, mem: [], cells: -1, dropped: 0, tFirst: null,
+  ced: false, has: {}, lastG: null, pendG: null, run: null, expand: false,
+  acc: [], pendUb: [],
+  heat: [], where: [], lstat: [], lprev: null, hm: [], selLayer: -1,
+  mode: new URLSearchParams(location.search).get("view") ? "follow" : "all", viewMs: 1000 * (+new URLSearchParams(location.search).get("view") || 60), tEnd: 0,
+  sel: null, view: "timeline", cur: null, brush: null, ovDrag: false,
+};
+// server time (ms since the monitor started) to the clock of this browser
+const clock = (t, ms) => {
+  const d = new Date(S.wall + t);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` + (ms ? "." + pad(d.getMilliseconds(), 3).slice(0, ms) : "");
+};
+
+// ---- events ----
+function mkEv(a) {
+  return { ty: a[0], k: a[1], seq: a[2], t: a[3], d: a[4], n: [a[5], a[6], a[7], a[8]], x: [a[9], a[10], a[11]] };
+}
+// a decode step: all its tokens are outputs (the sampled token and the drafts it verifies)
+const isStep = (e) => e.ty === T.UBATCH && e.k === 0 && e.n[1] === e.n[0] && e.n[0] <= 16;
+function onEvent(e) {
+  if (S.tFirst === null || e.t < S.tFirst) S.tFirst = e.t;
+  switch (e.ty) {
+    case T.UBATCH:
+      if (e.n[2] >= 0) S.cells = e.n[2];
+      if (e.k === 1 || e.k === 2) S.ced = true;
+      // the expert reads of the graph that this ubatch computed
+      if (S.lastG && S.lastG.t >= e.t - 5 && S.lastG.t <= e.t + e.d + 5) e.g = S.lastG;
+      if (isStep(e)) {
+        // decode steps merge into one run while they follow each other
+        const r = S.run;
+        if (r && e.t - (r.t + r.d) < 1500) { r.steps.push(e); r.d = e.t + e.d - r.t; }
+        else { S.run = { ty: T.RUN, k: 0, t: e.t, d: e.d, steps: [e], n: [0, 0, 0, 0], x: [0, 0, 0] }; S.ev.push(S.run); S.has.full = true; }
+        S.pendUb.push(S.run);
+        return;
+      }
+      S.ev.push(e); S.pendUb.push(e);
+      S.has[laneOf(e)] = true;
+      return;
+    case T.MOE:
+      S.pendG = { t: e.t, d: Math.max(e.d, 0.5), tokens: e.n[0], cpuL: e.n[1], gpuL: e.n[2], used: e.x[0], demand: e.x[1], wasted: e.x[2], slot: 0, res: 0, stall: 0, miss: 0, need: 0, done: 0 };
+      return;
+    case T.UPLOAD:
+      if (S.pendG && Math.abs(S.pendG.t - e.t) < 1) {
+        const g = S.pendG;
+        g.miss = e.n[0]; g.need = e.n[1]; g.done = e.n[2]; g.slot = e.x[0]; g.res = e.x[1]; g.stall = e.x[2] / 1000;
+        S.gr.push(g); S.lastG = g; S.pendG = null;
+      }
+      return;
+    case T.REQUEST: {
+      const o = e.k === 0 ? S.ev.find((q) => q.ty === T.REQUEST && q.open && Math.abs(q.t - e.t) < 0.01) : null;
+      if (o) Object.assign(o, e, { open: false });
+      else { e.open = e.k === 1; S.ev.push(e); }
+      S.has.req = true;
+      return;
+    }
+    case T.PREFILL:
+      return; // the ubatches show the prefill
+  }
+  S.ev.push(e);
+  const key = laneOf(e);
+  if (key) S.has[key] = true;
+}
+
+// ---- stream ----
+let es = null;
+function connect() {
+  if (es) es.close();
+  es = new EventSource("/api/stream?topics=timeline,experts");
+  es.onmessage = (m) => {
+    const d = JSON.parse(m.data);
+    if (d.now != null) { S.now = d.now; S.wall = Date.now() - d.now; }
+    if (d.mem) S.mem = d.mem;
+    if (d.dropped) S.dropped += d.dropped;
+    if (d.ev) for (const a of d.ev) onEvent(mkEv(a));
+    if (d.history) S.pendUb = []; // no expert counts for the recorded history
+    if (d.ex) onExperts(d.ex);
+    trim();
+    dirty = true;
+  };
+  es.onerror = () => { $("msg").textContent = "stream lost, retrying"; };
+  es.onopen = () => { $("msg").textContent = ""; };
+}
+function trim() {
+  if (S.ev.length > 120000) S.ev.splice(0, S.ev.length - 100000);
+  if (S.gr.length > 120000) S.gr.splice(0, S.gr.length - 100000);
+}
+
+// ---- experts ----
+function onExperts(ex) {
+  const nl = ex.l.length;
+  const ne = S.layout ? S.layout.n_expert : 0;
+  if (!S.heat.length) S.heat = Array.from({ length: nl }, () => new Float32Array(ne));
+  if (ex.w) S.where = ex.w;
+  const prev = S.lprev;
+  S.lstat = ex.l;
+  // decayed recent counts for the layers view, and the counts since the last ubatch for the ubatch heatmaps
+  for (let il = 0; il < nl; il++) {
+    const h = S.heat[il];
+    const row = ex.h[il];
+    for (let e = 0; e < ne; e++) h[e] = h[e] * 0.9 + (row ? row[e] : 0);
+    if (row) {
+      const a = S.acc[il] || (S.acc[il] = new Float32Array(ne));
+      for (let e = 0; e < ne; e++) a[e] += row[e];
+    }
+  }
+  // the counts of the ticks up to a ubatch belong to it (the snapshot follows the drain): the largest one of this tick
+  if (S.pendUb.length) {
+    let tgt = S.pendUb[0];
+    for (const u of S.pendUb) if ((u.ty === T.RUN ? 1 : u.n[0]) >= (tgt.ty === T.RUN ? 1 : tgt.n[0])) tgt = u;
+    if (!tgt.heat) tgt.heat = [];
+    S.acc.forEach((a, il) => {
+      if (!a) return;
+      const h = tgt.heat[il] || (tgt.heat[il] = new Float32Array(ne));
+      for (let e = 0; e < ne; e++) h[e] += a[e];
+    });
+    S.acc = []; S.pendUb = [];
+  }
+  // per layer outcome (gpu tier / ram / read), decayed only when the layer got new counts
+  if (prev) {
+    for (let il = 0; il < nl; il++) {
+      const a = ex.l[il], b = prev[il];
+      const hg = a[1] - b[1], hr = a[2] - b[2], ms = a[3] - b[3];
+      if (hg + hr + ms > 0) {
+        const o = S.hm[il] || (S.hm[il] = [0, 0, 0]);
+        o[0] = o[0] * 0.7 + hg; o[1] = o[1] * 0.7 + hr; o[2] = o[2] * 0.7 + ms;
+      }
+    }
+  }
+  S.lprev = ex.l;
+}
+
+// ---- header: global state only ----
+function phase() {
+  const last = S.ev.length ? S.ev[S.ev.length - 1] : null;
+  const age = last ? S.now - (last.t + last.d) : 1e9;
+  for (let i = S.ev.length - 1; i >= 0 && i > S.ev.length - 50; i--) {
+    const e = S.ev[i];
+    if (e.ty === T.RUN && S.now - (e.t + e.d) < 1500) return ["decode", e.steps.length / Math.max(e.d / 1000, 0.25), "steps/s"];
+    if (e.ty === T.UBATCH && S.now - (e.t + e.d) < 1500) {
+      let n = 0, t0 = e.t;
+      for (let j = i; j >= 0 && S.ev[j].t > S.now - 5000; j--) if (S.ev[j].ty === T.UBATCH && S.ev[j].k !== 2) { n += S.ev[j].n[0]; t0 = S.ev[j].t; }
+      return ["prefill", n / Math.max((S.now - t0) / 1000, 0.25), "t/s"];
+    }
+  }
+  return [age < 1500 ? "busy" : "idle", 0, ""];
+}
+function header() {
+  const L = S.layout;
+  let h = "";
+  if (L) {
+    h += `<span>${L.arch}</span>`;
+    h += `<span><span class="k">ctx</span> ${S.cells >= 0 ? S.cells : "-"} / ${L.n_ctx}</span>`;
+  }
+  for (const [name, used, total] of S.mem) {
+    h += `<span class="dev">${name} <span class="bar"><i style="width:${(100 * used / total).toFixed(0)}%"></i></span> ${(used / 2**30).toFixed(1)} / ${(total / 2**30).toFixed(1)} GiB</span>`;
+  }
+  const [ph, rate, unit] = phase();
+  h += `<span><span class="k">${ph}</span>${rate ? " " + rate.toFixed(1) + " " + unit : ""}</span>`;
+  if (S.dropped) h += `<span><span class="k">dropped events</span> ${S.dropped}</span>`;
+  $("hdr").innerHTML = h;
+}
+
+// ---- timeline ----
+// lanes in sections: what the server did, what the model computed, memory; the expert i/o graphs below
+const SECTIONS = [
+  ["server", [["req", "requests", "--c-req"], ["state", "state", "--st-save"]]],
+  ["compute", [["dec", "decoder", "--c-dec"], ["enc", "encoder", "--c-enc"], ["full", "full model", "--c-full"], ["img", "images", "--c-img"]]],
+  ["memory", [["ws", "gpu buffers", "--c-ws"], ["hot", "gpu tier", "--c-hot"], ["kv", "kv cells", "--c-kv"]]],
+];
+const LANES = SECTIONS.flatMap((s) => s[1]);
+function laneOf(e) {
+  switch (e.ty) {
+    case T.UBATCH: return e.k === 2 ? "dec" : e.k === 1 ? "enc" : "full";
+    case T.RUN: return "full";
+    case T.CED_DEC: return "dec";
+    case T.MEDIA: return "img";
+    case T.STATE: return "state";
+    case T.WORKSPACE: return "ws";
+    case T.KV_GROW: return "kv";
+    case T.REQUEST: return "req";
+    case T.HOT: return "hot";
+  }
+  return null;
+}
+const tl = { c: $("tlc"), rects: [], M: null, gx: null, lanes: {} };
+const LW = 100, LH = 16, GH = 40, TR = 14, OH = 30, GAPW = 80, IDLE = 1500;
+const dur = (e) => e.open ? Math.max(0, S.now - e.t) : e.d;
+function evColor(e, key) {
+  if (e.ty === T.STATE) return css(e.k === 1 || e.k === 3 ? "--st-rest" : "--st-save");
+  return css(LANES.find((l) => l[0] === key)[2]);
+}
+function label(e, short) {
+  switch (e.ty) {
+    case T.UBATCH: case T.CED_DEC: case T.MEDIA: return String(e.n[0]);
+    case T.RUN: return short ? `${e.steps.length}` : `decode, ${e.steps.length} steps`;
+    case T.REQUEST:
+      if (e.open) return short ? `${e.n[0]}, running` : `${e.n[0]} tokens, running`;
+      return short ? `${e.n[0]}+${e.n[1]} in, ${e.n[2]} out` : `${e.n[0]} new + ${e.n[1]} cached, ${e.n[2]} out` + (e.x[0] ? `, drafts ${Math.round(100 * e.n[3] / e.x[0])}%` : "");
+    case T.STATE: return `${STL[e.k]} ${fmtB(e.x[0])}`;
+    case T.WORKSPACE: return e.k ? "to prefill" : "to decode";
+    case T.HOT: {
+      const mib = (b) => (b / 2**20).toFixed(0) + " MiB";
+      const moved = e.x[0] ? mib(e.x[0]) + " up" : e.x[1] ? mib(e.x[1]) + " down" : mib(e.x[2]) + " read";
+      return short ? moved : (e.n[0] ? `${e.n[0]} experts, ` : "") + moved;
+    }
+  }
+  return "";
+}
+// the time axis: spans without work for IDLE ms collapse into a column of GAPW px, the rest shares the width at one scale
+function timeMap(t0, t1, evs, gv, x0, pw) {
+  const busy = [];
+  for (const e of evs) {
+    if (e.ty === T.REQUEST || e.ty === T.HOT) continue;
+    if (e.ty === T.RUN) { for (const s of e.steps) busy.push([s.t, s.t + s.d]); continue; }
+    busy.push([e.t, e.t + dur(e)]);
+  }
+  for (const e of gv) busy.push([e.t, e.t + e.d]);
+  busy.sort((a, b) => a[0] - b[0]);
+  const all = [];
+  let cur = t0, segStart = t0;
+  for (const [a, b] of busy) {
+    if (b < t0 || a > t1) continue;
+    if (a - cur > IDLE) {
+      if (cur > segStart) all.push({ a: segStart, b: cur, gap: false });
+      all.push({ a: cur, b: a, gap: true });
+      segStart = a;
+    }
+    cur = Math.max(cur, b);
+  }
+  if (t1 - cur > IDLE) { if (cur > segStart) all.push({ a: segStart, b: cur, gap: false }); all.push({ a: cur, b: t1, gap: true }); }
+  else all.push({ a: segStart, b: t1, gap: false });
+  const nGap = all.filter((g) => g.gap).length;
+  const busyMs = all.reduce((s, g) => s + (g.gap ? 0 : g.b - g.a), 0);
+  const k = busyMs > 0 ? Math.max(0, pw - nGap * GAPW) / busyMs : 0;
+  const gw = busyMs > 0 ? GAPW : pw / Math.max(nGap, 1);
+  let x = x0;
+  for (const g of all) { g.x = x; g.w = g.gap ? gw : (g.b - g.a) * k; x += g.w; }
+  const X = (t) => {
+    if (t <= t0) return x0;
+    for (const g of all) if (t <= g.b) return g.x + (g.b > g.a ? (t - g.a) / (g.b - g.a) : 0) * g.w;
+    return x0 + pw;
+  };
+  const inv = (px) => {
+    for (const g of all) if (px <= g.x + g.w) return g.a + (g.w > 0 ? (px - g.x) / g.w : 0) * (g.b - g.a);
+    return t1;
+  };
+  return { all, X, inv, k };
+}
+// the view: "all" (the whole history, growing), "follow" (the last viewMs, scrolling), "hold" (a fixed window)
+function setMode(m) {
+  S.mode = m;
+  for (const k of ["all", "follow", "hold"]) $("m-" + k).classList.toggle("on", k === m);
+  dirty = true;
+}
+function updateView() {
+  if (S.tFirst === null) return;
+  const span = Math.max(1000, S.now - S.tFirst);
+  if (S.mode === "all") { S.viewMs = span * 1.02; S.tEnd = S.now; return; }
+  S.viewMs = Math.max(100, Math.min(S.viewMs, span * 1.02));
+  if (S.mode === "follow") { S.tEnd = S.now; return; }
+  S.tEnd = Math.max(S.tFirst + S.viewMs * 0.1, Math.min(S.tEnd, S.now + S.viewMs * 0.05));
+}
+function drawTimeline() {
+  const c = tl.c, dpr = window.devicePixelRatio || 1;
+  // the canvas is as tall as its content needs (from the last frame), at least the view: shorter windows scroll
+  const hh = Math.max($("tl").clientHeight, tl.need || 0);
+  if (c.style.height !== hh + "px") c.style.height = hh + "px";
+  const w = c.clientWidth, h = hh;
+  if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = css("--bg"); g.fillRect(0, 0, w, h);
+  g.font = "11px ui-monospace, monospace"; g.textBaseline = "middle";
+  updateView();
+  const t1 = S.tEnd, t0 = t1 - S.viewMs, pw = w - LW - 6;
+  const vis = (e) => e.t + dur(e) >= t0 && e.t <= t1;
+  const evs = S.ev.filter(vis), gv = S.gr.filter(vis);
+  const hot = evs.filter((e) => e.ty === T.HOT);
+  if (!S.ev.length && !S.gr.length) {
+    g.fillStyle = css("--dim"); g.fillText("no data yet", LW + 10, 40);
+    tl.M = null;
+    return;
+  }
+  const M = timeMap(t0, t1, evs, gv, LW, pw), X = M.X;
+  tl.M = M;
+  const by = {};
+  for (const e of evs) { const key = laneOf(e); if (key) (by[key] || (by[key] = [])).push(e); }
+  // lanes with data anywhere in the history stay, so that the layout does not jump while scrolling
+  const top = 20, SH = 15;
+  const laneH = (key) => key === "full" && S.expand ? 44 : LH;
+  let y = top;
+  const laneY = {}, secY = [];
+  for (const [sec, lanes] of SECTIONS) {
+    const shown = lanes.filter((l) => S.has[l[0]] && (l[0] !== "enc" && l[0] !== "dec" || S.ced));
+    if (!shown.length) continue;
+    secY.push([sec, y]); y += SH;
+    for (const [key, name] of shown) { laneY[key] = [y, name]; y += laneH(key) + 3; }
+    y += 4;
+  }
+  tl.lanes = laneY;
+  secY.push(["expert i/o", y]); y += SH;
+  const gTop = y;
+  tl.need = gTop + 3 * (GH + TR + 6) + OH + 24;
+  const plotBottom = h - OH - 6;
+  // axis (clock) and grid over the busy segments, idle columns
+  const steps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000, 60000, 300000, 600000];
+  const step = steps.find((s) => s * M.k >= 80) || 1800000;
+  g.strokeStyle = css("--rule"); g.fillStyle = css("--dim");
+  g.beginPath();
+  let lastLx = -1e9;
+  for (const sg of M.all) {
+    if (sg.gap) continue;
+    for (let t = Math.ceil(sg.a / step) * step; t <= sg.b; t += step) {
+      const x = Math.round(X(t)) + 0.5;
+      g.moveTo(x, top - 4); g.lineTo(x, plotBottom);
+      const lab = clock(t, step < 1000 ? 3 : 0);
+      if (x - lastLx > 70 && x + g.measureText(lab).width + 6 < sg.x + sg.w) { g.fillText(lab, x + 3, 9); lastLx = x; }
+    }
+  }
+  g.stroke();
+  for (const sg of M.all) {
+    if (!sg.gap) continue;
+    g.fillStyle = css("--gap"); g.fillRect(sg.x + 2, top - 4, sg.w - 4, plotBottom - top + 4);
+    const t = "idle " + fmtMs(sg.b - sg.a).replace(" ", "");
+    if (g.measureText(t).width < sg.w - 6) { g.fillStyle = css("--dim"); g.fillText(t, sg.x + 4, 9); }
+  }
+  for (const [, sy] of secY) { g.strokeStyle = css("--rule"); g.beginPath(); g.moveTo(LW, sy + 7.5); g.lineTo(w, sy + 7.5); g.stroke(); }
+  tl.rects = [];
+  g.save(); g.beginPath(); g.rect(LW, 0, w - LW, plotBottom); g.clip();
+  const cpu = css("--p-cpu"), gpuu = css("--p-gpu");
+  for (const key of Object.keys(laneY)) {
+    const ly = laneY[key][0], lh = laneH(key);
+    if (key === "kv") { drawKv(g, by.kv || [], ly, X, t0, t1); continue; }
+    let lastEnd = -1e9;
+    const list = (by[key] || []).slice().sort((a, b) => (b.ty === T.CED_DEC) - (a.ty === T.CED_DEC) || a.t - b.t);
+    for (const e of list) {
+      const x = X(e.t), bw = Math.max(1.5, X(e.t + dur(e)) - x);
+      const thin = key === "dec" && e.ty === T.UBATCH; // the chunks of a decoder pass: a strip under its block
+      g.fillStyle = evColor(e, key);
+      if (e.open || e.ty === T.HOT) g.globalAlpha = 0.5;
+      if (e.ty === T.RUN && S.expand) {
+        // the steps: height = tokens of the step (sampled + verified drafts)
+        g.globalAlpha = 0.25; g.fillRect(x, ly, bw, lh); g.globalAlpha = 1;
+        const mx = Math.max(...e.steps.map((s) => s.n[0]), 1);
+        for (const s of e.steps) {
+          const sx = X(s.t), sw = Math.max(1, X(s.t + s.d) - sx - 1), sh = (lh - 2) * s.n[0] / mx;
+          g.fillRect(sx, ly + lh - sh, sw, sh);
+        }
+      } else g.fillRect(x, thin ? ly + LH - 5 : ly, bw, thin ? 5 : lh);
+      g.globalAlpha = 1;
+      // the expert path of the graph: share of the layers with the experts on the CPU / uploaded to the GPU
+      if (e.ty === T.UBATCH && !thin && e.g && e.g.cpuL + e.g.gpuL > 0) {
+        const sh = e.g.cpuL / (e.g.cpuL + e.g.gpuL);
+        g.fillStyle = cpu; g.fillRect(x, ly + LH - 3, bw * sh, 3);
+        g.fillStyle = gpuu; g.fillRect(x + bw * sh, ly + LH - 3, bw * (1 - sh), 3);
+      }
+      if (S.sel === e) { g.strokeStyle = css("--sel"); g.strokeRect(x - 0.5, ly - 0.5, Math.max(bw, 2) + 1, lh + 1); }
+      let txt = label(e), tw = g.measureText(txt).width;
+      if (txt && bw <= tw + 6) { txt = label(e, true); tw = g.measureText(txt).width; }
+      if (txt && !thin && bw > tw + 6 && x >= lastEnd) { g.fillStyle = e.ty === T.HOT || e.open ? css("--fg") : css("--bg"); g.fillText(txt, Math.max(x, LW) + 3, ly + 8); }
+      if (!thin) lastEnd = Math.max(lastEnd, x + bw);
+      tl.rects.push([x, thin ? ly + LH - 5 : ly, Math.max(bw, 3), thin ? 5 : lh, e]);
+    }
+  }
+  // the expert i/o graphs: per graph the rate over its duration; the gpu tier refills over the span since their last report
+  const rate = (b, d) => b / 1e9 / (Math.max(d, 1) / 1000);
+  const graphs = [
+    ["SSD → RAM", "GB/s", [["used", "--ssd", "read ahead, used"], ["demand", "--demand", "on demand (waited)"], ["wasted", "--waste", "read ahead, not used"]]],
+    ["RAM → GPU", "GB/s", [["slot", "--ssd", "from read buffers"], ["res", "--ram", "from RAM cache"], ["hot", "--gpu", "gpu tier refills"]]],
+  ];
+  const gy = [];
+  const legend = (y0, items) => {
+    let lx = LW + 6;
+    for (const [n, col, line] of items) {
+      g.fillStyle = css(col);
+      if (line) g.fillRect(lx, y0 - TR + 6, 8, 2); else g.fillRect(lx, y0 - TR + 3, 8, 8);
+      g.fillStyle = css("--dim"); g.fillText(n, lx + 12, y0 - TR + 7); lx += g.measureText(n).width + 26;
+    }
+  };
+  graphs.forEach(([title, unit, series], gi) => {
+    const y0 = gTop + TR + gi * (GH + TR + 6);
+    gy.push([title, y0]);
+    let max = 0.05;
+    for (const ev of gv) max = Math.max(max, series.reduce((a, s) => a + (s[0] === "hot" ? 0 : rate(ev[s[0]], ev.d)), 0));
+    if (gi === 1) for (const e of hot) max = Math.max(max, rate(e.x[0], e.d));
+    g.strokeStyle = css("--rule"); g.strokeRect(LW + 0.5, y0 + 0.5, pw, GH);
+    if (gi === 1) for (const e of hot) {
+      const x = X(e.t), bw = Math.max(1, X(e.t + e.d) - x), hh = rate(e.x[0], e.d) / max * (GH - 2);
+      g.fillStyle = css("--gpu"); g.globalAlpha = 0.6; g.fillRect(x, y0 + GH - 1 - hh, bw, hh); g.globalAlpha = 1;
+    }
+    for (const ev of gv) {
+      const x = X(ev.t), bw = Math.max(1, X(ev.t + ev.d) - x);
+      let base = 0;
+      for (const s of series) {
+        if (s[0] === "hot") continue;
+        const hh = rate(ev[s[0]], ev.d) / max * (GH - 2);
+        g.fillStyle = css(s[1]); g.fillRect(x, y0 + GH - 1 - base - hh, bw, hh);
+        base += hh;
+      }
+    }
+    g.fillStyle = css("--dim"); g.fillText(`${max.toFixed(2)} ${unit} max`, w - 110, y0 - TR + 7);
+    legend(y0, series.map((s) => [s[2], s[1]]));
+  });
+  {
+    const y0 = gTop + TR + 2 * (GH + TR + 6);
+    gy.push(["waits", y0]);
+    let max = 1;
+    for (const ev of gv) max = Math.max(max, ev.stall);
+    g.strokeStyle = css("--rule"); g.strokeRect(LW + 0.5, y0 + 0.5, pw, GH);
+    for (const ev of gv) {
+      const x = X(ev.t), bw = Math.max(1, X(ev.t + ev.d) - x), hh = ev.stall / max * (GH - 2);
+      g.fillStyle = css("--demand"); g.fillRect(x, y0 + GH - 1 - hh, bw, hh);
+    }
+    g.strokeStyle = css("--fg"); g.beginPath();
+    let pen = false;
+    for (const ev of gv) {
+      const tot = ev.used + ev.demand;
+      if (!tot) { pen = false; continue; }
+      const yy = y0 + GH - 1 - (ev.used / tot) * (GH - 2), x = X(ev.t), x2 = X(ev.t + ev.d);
+      if (!pen) { g.moveTo(x, yy); pen = true; } else g.lineTo(x, yy);
+      g.lineTo(Math.max(x2, x + 1), yy);
+    }
+    g.stroke();
+    g.fillStyle = css("--dim"); g.fillText(max.toFixed(0) + " ms max", w - 110, y0 - TR + 7);
+    legend(y0, [["waited for expert reads (ms)", "--demand"], ["read ahead hit %", "--fg", true]]);
+  }
+  // the range being dragged
+  if (S.brush) {
+    const a = Math.min(S.brush.x0, S.brush.x1), b = Math.max(S.brush.x0, S.brush.x1);
+    g.fillStyle = css("--sel"); g.globalAlpha = 0.12; g.fillRect(a, top, b - a, plotBottom - top); g.globalAlpha = 1;
+  }
+  g.restore();
+  // names: sections, lanes, graphs
+  g.fillStyle = css("--bg"); g.fillRect(0, 0, LW - 2, h);
+  for (const [sec, sy] of secY) {
+    g.fillStyle = css("--dim"); g.fillText(sec, 4, sy + 7);
+    if (sec === "compute") {
+      const items = ["experts on the CPU", "uploaded to the GPU"];
+      const lw = items.reduce((a, n) => a + g.measureText(n).width + 22, 0);
+      let lx = w - lw - 6;
+      g.fillStyle = css("--bg"); g.fillRect(lx - 4, sy, lw + 8, 14);
+      for (const [n, col] of [["experts on the CPU", cpu], ["uploaded to the GPU", gpuu]]) {
+        g.fillStyle = col; g.fillRect(lx, sy + 5, 8, 3); g.fillStyle = css("--dim"); g.fillText(n, lx + 12, sy + 7); lx += g.measureText(n).width + 22;
+      }
+    }
+  }
+  g.fillStyle = css("--fg");
+  for (const key of Object.keys(laneY)) g.fillText(laneY[key][1], 12, laneY[key][0] + 8);
+  for (const [n, y0] of gy) g.fillText(n, 12, y0 - TR + 7);
+  g.strokeStyle = css("--rule"); g.beginPath(); g.moveTo(LW - 1.5, 0); g.lineTo(LW - 1.5, h); g.stroke();
+  tl.gx = { gy: gy.map((q) => q[1]), gv };
+  drawOverview(g, w, h, t0, t1);
+  if (S.cur && S.cur.x > LW && S.cur.y < plotBottom) {
+    g.strokeStyle = css("--fg"); g.globalAlpha = 0.35; g.beginPath(); g.moveTo(S.cur.x + 0.5, top); g.lineTo(S.cur.x + 0.5, plotBottom); g.stroke(); g.globalAlpha = 1;
+    g.fillStyle = css("--fg"); g.fillText(clock(M.inv(S.cur.x), 1), Math.min(S.cur.x + 4, w - 80), top - 8);
+  }
+}
+// the whole recorded history, linear in time, with the window of the view
+function drawOverview(g, w, h, t0, t1) {
+  const y0 = h - OH, a = S.tFirst, b = S.now, pw = w - LW - 6;
+  g.strokeStyle = css("--rule"); g.beginPath(); g.moveTo(0, y0 - 3.5); g.lineTo(w, y0 - 3.5); g.stroke();
+  g.fillStyle = css("--dim"); g.fillText("history", 4, y0 + OH / 2);
+  if (a === null || b <= a) return;
+  const ox = (t) => LW + (t - a) / (b - a) * pw;
+  tl.ov = { y0, a, b, pw };
+  const lanes = [["req", 0], ["dec", 1], ["enc", 1], ["full", 2]];
+  for (const e of S.ev) {
+    const key = laneOf(e), row = lanes.find((l) => l[0] === key);
+    if (!row) continue;
+    g.fillStyle = evColor(e, key);
+    g.fillRect(ox(e.t), y0 + 2 + row[1] * 8, Math.max(1, (dur(e)) / (b - a) * pw), 6);
+  }
+  const vx0 = ox(t0), vx1 = ox(t1);
+  g.strokeStyle = css("--sel"); g.strokeRect(Math.max(LW, vx0) + 0.5, y0 + 0.5, Math.max(3, vx1 - Math.max(LW, vx0)), OH - 4);
+  g.fillStyle = css("--dim"); g.fillText(clock(a), LW + 2, y0 + OH - 5); g.fillText(clock(b), w - 64, y0 + OH - 5);
+}
+// kv cells (only with LLAMA_KV_GROW): cells in use (area) and mapped (line), grow / shrink markers
+function drawKv(g, evs, y, X, t0, t1) {
+  const hh = LH;
+  const ub = S.ev.filter((e) => e.ty === T.UBATCH && e.n[2] >= 0 && e.t + e.d >= t0 - 60000 && e.t <= t1);
+  let max = 1;
+  for (const e of ub) max = Math.max(max, e.n[2], e.x[1]);
+  g.fillStyle = css("--dim"); g.globalAlpha = 0.45;
+  let prev = null;
+  g.beginPath(); g.moveTo(X(t0), y + hh);
+  for (const e of ub) { const yy = y + hh - (e.n[2] / max) * hh; g.lineTo(X(e.t), prev === null ? y + hh : prev); g.lineTo(X(e.t), yy); prev = yy; }
+  g.lineTo(X(t1), prev === null ? y + hh : prev); g.lineTo(X(t1), y + hh); g.closePath(); g.fill();
+  g.globalAlpha = 1;
+  for (const e of evs) {
+    g.fillStyle = css(e.k ? "--demand" : "--gpu");
+    const bw = Math.max(2, X(e.t + e.d) - X(e.t));
+    g.fillRect(X(e.t), y, bw, hh);
+    tl.rects.push([X(e.t), y, Math.max(3, bw), hh, e]);
+  }
+}
+
+// ---- side panel ----
+function ioOf(t0, t1) {
+  const s = { used: 0, demand: 0, wasted: 0, slot: 0, res: 0, stall: 0, cpuL: 0, gpuL: 0, n: 0 };
+  for (const g of S.gr) {
+    if (g.t < t0 - 1 || g.t > t1 + 1) continue;
+    for (const k of ["used", "demand", "wasted", "slot", "res", "stall", "cpuL", "gpuL"]) s[k] += g[k];
+    s.n++;
+  }
+  return s;
+}
+function ioRows(s) {
+  if (!s.n) return [];
+  const r = [["experts read SSD → RAM", `${fmtB(s.used + s.demand + s.wasted)}`], ["  read ahead, used", fmtB(s.used)], ["  on demand", fmtB(s.demand)], ["  read ahead, not used", fmtB(s.wasted)]];
+  r.push(["uploaded RAM → GPU", fmtB(s.slot + s.res)], ["waited for reads", fmtMs(s.stall)]);
+  if (s.cpuL + s.gpuL) r.push(["expert layers", `${s.cpuL} on the CPU, ${s.gpuL} uploaded`]);
+  return r;
+}
+function reqOf(t) { return S.ev.find((q) => q.ty === T.REQUEST && t >= q.t && t <= q.t + dur(q)); }
+function sumHeat(list) {
+  const ne = S.layout ? S.layout.n_expert : 0, out = [];
+  for (const e of list) if (e.heat) e.heat.forEach((a, il) => { if (!a) return; const o = out[il] || (out[il] = new Float32Array(ne)); for (let i = 0; i < ne; i++) o[i] += a[i]; });
+  return out.length ? out : null;
+}
+function rowsOf(e) {
+  const at = [["at", `${clock(e.t, 1)}, took ${fmtMs(dur(e))}`]];
+  switch (e.ty) {
+    case T.UBATCH: {
+      const kind = ["prefill ubatch, full model", "prefill ubatch, CED encoder", "CED decoder chunk", "encode"][e.k];
+      return [["", kind], ...at, ["tokens", e.n[0]], ["positions", `${e.x[0]} .. ${e.x[0] + e.n[0] - 1}`], ["rate", `${(e.n[0] / Math.max(e.d / 1000, 1e-3)).toFixed(0)} tokens/s`], ...ioRows(ioOf(e.t, e.t + e.d))];
+    }
+    case T.RUN: {
+      const q = reqOf(e.t), toks = e.steps.reduce((a, s) => a + s.n[0], 0);
+      const r = [["", "decode"], ...at, ["steps", `${e.steps.length}, ${(e.steps.length / Math.max(e.d / 1000, 1e-3)).toFixed(1)} per second`], ["tokens verified", `${toks}, ${(toks / e.steps.length).toFixed(2)} per step`]];
+      if (q && !q.open) r.push(["request generated", `${q.n[2]} tokens`]);
+      if (q && !q.open && q.x[0]) r.push(["drafts accepted", `${q.n[3]} of ${q.x[0]} (${Math.round(100 * q.n[3] / q.x[0])}%)`]);
+      return r.concat(ioRows(ioOf(e.t, e.t + e.d)));
+    }
+    case T.CED_DEC: return [["", "CED decoder pass"], ...at, ["needed for", TRIG[e.k]], ["rows", e.n[0]], ["chunks", e.n[1]], ...ioRows(ioOf(e.t, e.t + e.d))];
+    case T.REQUEST: return [["", e.open ? "request, running" : "request"], ...at, ["prompt", `${e.n[0]} tokens new` + (e.open ? "" : `, ${e.n[1]} from the cache`)], ...(e.open ? [] : [["generated", `${e.n[2]} tokens`], ["drafts accepted", e.x[0] ? `${e.n[3]} of ${e.x[0]} (${Math.round(100 * e.n[3] / e.x[0])}%)` : "-"]])];
+    case T.STATE: return [["", STK[e.k]], ...at, ["tokens", e.n[0]], ["size", fmtB(e.x[0])], ["rate", e.d > 0 ? fmtB(e.x[0] / (e.d / 1000)) + "/s" : "-"], ...(e.k === 0 && S.ced ? [["includes", "the CED decoder pass"]] : [])];
+    case T.WORKSPACE: return [["", "gpu buffers to the " + (e.k ? "prefill" : "decode") + " size"], ...at, ["for a batch of", e.n[0] + " tokens"], ...[1, 2, 3].filter((i) => e.n[i]).map((i) => [`device ${i - 1}`, e.n[i] + " MiB"])];
+    case T.KV_GROW: return [["", e.k ? "kv cells unmapped" : "kv cells mapped"], ...at, ["cells", `${e.n[0]} → ${e.n[1]}`]];
+    case T.MEDIA: return [["", ["image", "video", "audio"][e.k] + " encoded"], ...at, ["tokens", e.n[0]], ["chunks in the batch", e.n[1]], ["positions", `${e.x[0]} .. ${e.x[1]}`]];
+    case T.HOT: return [["", "gpu tier refills"], ...at, ["experts promoted", e.n[0]], ["failed", e.n[1]], ["RAM → GPU", fmtB(e.x[0])], ["GPU → RAM", fmtB(e.x[1])], ["SSD → RAM", fmtB(e.x[2])], ["rate RAM → GPU", fmtB(e.x[0] / Math.max(e.d / 1000, 1e-3)) + "/s"]];
+  }
+  return at;
+}
+function showSide(e) {
+  S.sel = e;
+  let r = "<table>";
+  for (const [a, b] of rowsOf(e)) r += a ? `<tr><td>${a}</td><td>${b}</td></tr>` : `<tr><td colspan="2" style="color:var(--fg)">${b}</td></tr>`;
+  r += "</table>";
+  // the experts this ubatch / run / pass used: one row per layer, a column per expert, scaled per layer
+  const heat = e.ty === T.CED_DEC ? sumHeat(S.ev.filter((u) => u.ty === T.UBATCH && u.k === 2 && u.t >= e.t - 1 && u.t <= e.t + e.d + 1)) : (e.heat ? e.heat : null);
+  if (heat && S.layout) r += `<div class="note">experts used, layer × expert</div><canvas id="uh"></canvas>`;
+  else if (e.ty === T.UBATCH || e.ty === T.RUN) r += `<div class="note">no expert counts: the page was closed then</div>`;
+  $("sidec").innerHTML = r;
+  document.querySelector("#side h4").textContent = "";
+  if (heat && S.layout) drawHeat($("uh"), heat);
+  dirty = true;
+}
+function drawHeat(c, heat) {
+  const L = S.layout, ne = L.n_expert, nl = L.n_layer, cw = 316, rh = 4;
+  const bin = Math.max(1, Math.ceil(ne / cw)), cols = Math.ceil(ne / bin);
+  c.width = cols; c.height = nl * rh; c.style.width = cw + "px"; c.style.height = nl * rh + "px";
+  const g = c.getContext("2d");
+  g.fillStyle = css("--bg"); g.fillRect(0, 0, cols, nl * rh);
+  for (let il = 0; il < nl; il++) {
+    const row = heat[il];
+    if (!row) continue;
+    let m = 0;
+    for (let i = 0; i < ne; i++) m = Math.max(m, row[i]);
+    for (let col = 0; col < cols; col++) {
+      let v = 0;
+      for (let i = col * bin; i < Math.min(ne, (col + 1) * bin); i++) v = Math.max(v, row[i]);
+      if (!v) continue;
+      g.fillStyle = heatCol(Math.sqrt(v / m));
+      g.fillRect(col, il * rh, 1, rh - 1);
+    }
+  }
+}
+// values under the cursor in the graphs
+function hover(x, y) {
+  const tip = $("tip"), G = tl.gx;
+  S.cur = { x, y };
+  if (!G || !tl.M || x < LW) { tip.style.display = "none"; return; }
+  const gi = G.gy.findIndex((y0) => y >= y0 && y <= y0 + GH);
+  if (gi < 0) { tip.style.display = "none"; return; }
+  const t = tl.M.inv(x);
+  const ev = G.gv.find((e) => t >= e.t - 2 && t <= e.t + e.d + 2);
+  if (!ev) { tip.style.display = "none"; return; }
+  const r = (f) => (ev[f] / 1e9 / (ev.d / 1000)).toFixed(2);
+  const tot = ev.used + ev.demand;
+  const txt = [
+    `read ahead used ${r("used")}, on demand ${r("demand")}, not used ${r("wasted")} GB/s`,
+    `uploaded from the read buffers ${r("slot")}, from the RAM cache ${r("res")} GB/s`,
+    `waited ${ev.stall.toFixed(0)} ms, read ahead hit ${tot ? (100 * ev.used / tot).toFixed(0) : "-"}%`,
+  ][gi];
+  tip.textContent = `${clock(ev.t, 1)}, graph of ${ev.tokens} tokens, ${fmtMs(ev.d)}\n` + txt;
+  tip.style.display = "block";
+  tip.style.left = Math.min(x + 12, tl.c.clientWidth - 420) + "px";
+  tip.style.top = (y + 12) + "px";
+}
+
+// ---- layers ----
+const HEAT = ["#1b1f26", "#2e4470", "#2a7f8e", "#7ac66b", "#f1e95a"].map((s) => [parseInt(s.slice(1, 3), 16), parseInt(s.slice(3, 5), 16), parseInt(s.slice(5, 7), 16)]);
+function heatCol(v) {
+  v = Math.max(0, Math.min(1, v));
+  const p = v * (HEAT.length - 1), i = Math.min(Math.floor(p), HEAT.length - 2), f = p - i;
+  const a = HEAT[i], b = HEAT[i + 1];
+  return `rgb(${Math.round(a[0] + (b[0] - a[0]) * f)},${Math.round(a[1] + (b[1] - a[1]) * f)},${Math.round(a[2] + (b[2] - a[2]) * f)})`;
+}
+const WCOL = ["--ssd-dim", "--ram", "--gpu"]; // where an expert is: 0 only in the file (SSD), 1 RAM cache, 2 GPU tier
+const WNAME = ["on SSD", "in the RAM cache", "in the GPU tier"];
+function heatScale() {
+  let m = 0;
+  for (const h of S.heat) for (let e = 0; e < h.length; e++) if (h[e] > m) m = h[e];
+  return Math.max(m, 1);
+}
+const RH = 14;
+function drawLayers() {
+  const L = S.layout;
+  const wrap = $("lyl"), c = $("lyc");
+  if (!L) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = wrap.clientWidth - 2, h = L.n_layer * RH + 20;
+  c.style.width = w + "px"; c.style.height = h + "px";
+  if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  const g = c.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = css("--bg"); g.fillRect(0, 0, w, h);
+  g.font = "11px ui-monospace, monospace"; g.textBaseline = "middle";
+  const ne = L.n_expert, x0 = 30, bx = w - 130, sw = bx - x0 - 6, max = heatScale();
+  g.fillStyle = css("--dim");
+  g.fillText("#", 2, 8); g.fillText("experts", x0 + 4, 8); g.fillText("served from", bx, 8);
+  for (let il = 0; il < L.n_layer; il++) {
+    const y = 16 + il * RH, row = S.heat[il];
+    g.fillStyle = css("--dim"); g.fillText(String(il), 2, y + RH / 2);
+    const lay = L.layers[il];
+    if (!lay || !lay[0]) { g.fillStyle = css("--rule"); g.fillRect(x0, y + RH / 2, sw, 1); continue; }
+    const cw = sw / ne;
+    for (let e = 0; e < ne; e++) {
+      g.fillStyle = heatCol(row ? Math.sqrt(row[e] / max) : 0);
+      g.fillRect(x0 + e * cw, y, Math.ceil(cw), RH - 3);
+    }
+    const wh = S.where[il];
+    if (wh) for (let e = 0; e < ne; e++) { g.fillStyle = css(WCOL[wh.charCodeAt(e) - 48]); g.fillRect(x0 + e * cw, y + RH - 3, Math.ceil(cw), 2); }
+    const [hg, hr, ms] = S.hm[il] || [0, 0, 0];
+    const tot = hg + hr + ms;
+    if (tot) {
+      const bw = 120;
+      g.fillStyle = css("--gpu"); g.fillRect(bx, y + 2, bw * hg / tot, RH - 6);
+      g.fillStyle = css("--ram"); g.fillRect(bx + bw * hg / tot, y + 2, bw * hr / tot, RH - 6);
+      g.fillStyle = css("--ssd"); g.fillRect(bx + bw * (hg + hr) / tot, y + 2, bw * ms / tot, RH - 6);
+    }
+    if (il === S.selLayer) { g.strokeStyle = css("--sel"); g.strokeRect(0.5, y - 0.5, w - 1, RH - 1); }
+  }
+  detail();
+}
+let detailHtml = "";
+function detail() {
+  const L = S.layout, il = S.selLayer, box = $("lyd");
+  const leg = `<div class="leg" style="margin-bottom:6px">${WNAME.map((n, i) => `<span><i style="background:${css(WCOL[i])}"></i>${n}</span>`).join("")}</div>`;
+  if (!L || il < 0) { if (!detailHtml) box.innerHTML = leg + '<span style="color:var(--dim)">click a layer</span>'; detailHtml = "-"; return; }
+  detailHtml = "";
+  const lay = L.layers[il], ne = L.n_expert, row = S.heat[il], st = S.lstat[il], wh = S.where[il] || "";
+  let s = leg + `<div>layer ${il}`;
+  if (lay && lay[0]) {
+    const cnt = [0, 0, 0];
+    for (let e = 0; e < wh.length; e++) cnt[wh.charCodeAt(e) - 48]++;
+    s += `: ${lay[1]} experts` + (wh ? `, ${cnt[2]} in the GPU tier, ${cnt[1]} in the RAM cache, ${cnt[0]} on SSD` : ", where they are: not known yet");
+    if (st) s += `<br>${st[4]} selections, ${st[0]} distinct in the last ubatch`;
+  } else s += " (not a tracked MoE layer)";
+  s += "</div>";
+  if (row && lay && lay[0]) {
+    const max = Math.max(...row, 1), cols = Math.ceil(Math.sqrt(ne)), cs = 14;
+    s += `<div style="margin-top:6px;display:grid;grid-template-columns:repeat(${cols},${cs}px);gap:1px">`;
+    for (let e = 0; e < ne; e++) {
+      const v = wh ? wh.charCodeAt(e) - 48 : -1;
+      const ol = v >= 0 ? `outline:1px solid ${css(WCOL[v])};outline-offset:-1px;` : "";
+      s += `<div title="expert ${e}${v >= 0 ? ", " + WNAME[v] : ""}: ${row[e].toFixed(1)}" style="width:${cs}px;height:${cs}px;background:${heatCol(Math.sqrt(row[e] / max))};${ol}"></div>`;
+    }
+    s += `</div>`;
+  }
+  box.innerHTML = s;
+}
+
+// ---- ui ----
+let dirty = true;
+function setView(v) {
+  S.view = v;
+  for (const a of document.querySelectorAll("#tabs a")) a.classList.toggle("on", a.dataset.v === v);
+  $("v-timeline").classList.toggle("on", v === "timeline");
+  $("v-layers").classList.toggle("on", v === "layers");
+  history.replaceState(null, "", location.search + "#" + v + (v === "layers" && S.selLayer >= 0 ? "/" + S.selLayer : ""));
+  dirty = true;
+}
+for (const a of document.querySelectorAll("#tabs a")) a.onclick = () => setView(a.dataset.v);
+function unfollow() { setMode("hold"); }
+function setRange(a, b) {
+  S.viewMs = Math.max(100, b - a); S.tEnd = b;
+  setMode("hold");
+}
+$("m-all").onclick = () => setMode("all");
+$("m-follow").onclick = () => { if (S.mode === "all") S.viewMs = 60000; setMode("follow"); };
+$("m-hold").onclick = () => setMode("hold");
+$("bclear").onclick = () => { S.ev = []; S.gr = []; S.sel = null; S.hm = []; S.has = {}; S.run = null; S.tFirst = null; dirty = true; };
+const plotBottom = () => tl.c.clientHeight - OH - 6;
+tl.c.addEventListener("wheel", (e) => {
+  if (e.offsetX < LW) return; // over the names: scroll the page (short windows)
+  e.preventDefault();
+  if (!tl.M) return;
+  if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+    unfollow();
+    S.tEnd += ((e.deltaX || e.deltaY) / 100) * S.viewMs * 0.1;
+  } else {
+    // zoom around the time under the cursor
+    const pw = tl.c.clientWidth - LW - 6, r = Math.max(0, Math.min(1, (e.offsetX - LW) / pw));
+    const tc = tl.M.inv(e.offsetX), v = S.viewMs * (e.deltaY > 0 ? 1.25 : 0.8);
+    const a = tc - r * v;
+    unfollow();
+    S.viewMs = v; S.tEnd = a + v;
+  }
+  dirty = true;
+}, { passive: false });
+function ovTime(x) { const o = tl.ov; return o ? o.a + (x - LW) / o.pw * (o.b - o.a) : 0; }
+tl.c.addEventListener("mousedown", (e) => {
+  if (e.offsetY >= plotBottom() + 6) {
+    S.ovDrag = true; unfollow(); S.tEnd = ovTime(e.offsetX) + S.viewMs / 2; dirty = true; return;
+  }
+  if (e.offsetX > LW) S.brush = { x0: e.offsetX, x1: e.offsetX };
+});
+tl.c.addEventListener("mousemove", (e) => {
+  if (S.ovDrag) { S.tEnd = ovTime(e.offsetX) + S.viewMs / 2; dirty = true; return; }
+  if (S.brush) S.brush.x1 = e.offsetX;
+  hover(e.offsetX, e.offsetY);
+  dirty = true;
+});
+tl.c.addEventListener("mouseleave", () => { S.cur = null; $("tip").style.display = "none"; dirty = true; });
+window.addEventListener("mouseup", (e) => {
+  if (S.ovDrag) { S.ovDrag = false; return; }
+  const b = S.brush;
+  S.brush = null;
+  if (!b || !tl.M) return;
+  if (Math.abs(b.x1 - b.x0) > 5) {
+    setRange(tl.M.inv(Math.min(b.x0, b.x1)), tl.M.inv(Math.max(b.x0, b.x1)));
+    return;
+  }
+  let hit = null;
+  for (let i = tl.rects.length - 1; i >= 0; i--) {
+    const q = tl.rects[i];
+    if (b.x0 >= q[0] - 1 && b.x0 <= q[0] + q[2] + 1 && e.offsetY >= q[1] - 1 && e.offsetY <= q[1] + q[3] + 1 && e.target === tl.c) { hit = q[4]; break; }
+  }
+  if (hit) showSide(hit);
+  dirty = true;
+});
+tl.c.addEventListener("dblclick", (e) => {
+  const f = tl.lanes.full;
+  if (f && e.offsetY >= f[0] - 2 && e.offsetY <= f[0] + (S.expand ? 46 : 18)) { S.expand = !S.expand; dirty = true; }
+});
+$("lyc").addEventListener("click", (e) => {
+  const il = Math.floor((e.offsetY - 16) / RH);
+  if (S.layout && il >= 0 && il < S.layout.n_layer) { S.selLayer = il; history.replaceState(null, "", location.search + "#layers/" + il); dirty = true; }
+});
+
+function frame() {
+  if (dirty || S.mode !== "hold") {
+    dirty = false;
+    header();
+    if (S.view === "timeline") drawTimeline(); else drawLayers();
+  }
+  requestAnimationFrame(frame);
+}
+setInterval(() => { dirty = true; }, 250);
+window.addEventListener("resize", () => { dirty = true; });
+
+fetch("/api/layout").then((r) => r.json()).then((l) => {
+  S.layout = l;
+  const m = location.hash.match(/^#(timeline|layers)(?:\/(\d+))?/);
+  if (m && m[2]) S.selLayer = +m[2];
+  setView(m ? m[1] : "timeline");
+  setMode(S.mode);
+  connect();
+  frame();
+});
+</script>
+</body>
+</html>

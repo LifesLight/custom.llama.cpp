@@ -42,6 +42,14 @@ target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(${TARGET} PRIVATE vendor::hash)
 
+# the monitor page (monitor.html) as bytes in a generated header, no UI download involved
+set(MONITOR_HTML ${CMAKE_CURRENT_SOURCE_DIR}/monitor.html)
+set(MONITOR_HPP  ${CMAKE_CURRENT_BINARY_DIR}/monitor-page.hpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MONITOR_HTML})
+file(READ ${MONITOR_HTML} MONITOR_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," MONITOR_HEX "${MONITOR_HEX}")
+file(WRITE ${MONITOR_HPP} "static const unsigned char monitor_page[] = {${MONITOR_HEX}};\n")
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
@@ -56,6 +64,8 @@ add_library(${TARGET}
     server-models.h
     server-models-sched.cpp
     server-models-sched.h
+    server-monitor.cpp
+    server-monitor.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
