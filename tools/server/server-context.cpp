@@ -5137,6 +5137,26 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // the last checkpoint for the spacing of the breaks below: the checkpoint at the start of this batch is
+                    // created only after the batch is filled, but counts already (otherwise every checkpointed user message
+                    // is followed by a break at the next user message, a short batch without a checkpoint)
+                    int64_t ckpt_last = -1;
+                    {
+                        const int32_t start = slot.prompt.n_tokens();
+                        const auto & checkpoints = slot.prompt.checkpoints;
+                        const int64_t back = checkpoints.empty() ? -1 : checkpoints.back()->n_tokens;
+                        const bool at_user = spans.is_user_start(start) &&
+                            (back < 0 || start == last_user_pos || start > back + params_base.checkpoint_min_step);
+                        const bool at_end = slot.task->n_tokens() - start <= 4 + n_ubatch;
+                        ckpt_last = do_checkpoint && start > 0 && (at_user || at_end) ? start : back;
+                    }
+
+                    // a user message where the server breaks a batch to checkpoint its start
+                    const auto ckpt_break = [&](int32_t pos, int64_t last) {
+                        return (params_base.checkpoint_user_split && (pos == last_user_pos || last < 0)) ||
+                               pos > std::max<int64_t>(last, 0) + params_base.checkpoint_min_step;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -5190,16 +5210,8 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
-                            const auto pos = slot.prompt.n_tokens();
-                            const auto & checkpoints = slot.prompt.checkpoints;
-
-                            const bool user_split = params_base.checkpoint_user_split && (pos == last_user_pos || checkpoints.empty());
-                            const bool spaced     = pos > (checkpoints.empty() ? 0 : checkpoints.back()->n_tokens) + params_base.checkpoint_min_step;
-
-                            if (user_split || spaced) {
-                                break;
-                            }
+                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens()) && ckpt_break(slot.prompt.n_tokens(), ckpt_last)) {
+                            break;
                         }
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
