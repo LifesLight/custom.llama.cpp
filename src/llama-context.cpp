@@ -1103,6 +1103,7 @@ void llama_context::prefill_end() {
             __func__, (unsigned long long) n_tokens, (unsigned long long) prefill.n_from, n_ubatch, ubs.c_str(),
             prefill.n_res, prefill.t_res/1000.0, kv.c_str(), (ggml_time_us() - prefill.t_start)/1e6);
     prefill.ubatches.clear();
+
 }
 
 bool llama_context::sched_reserve_for_batch(uint32_t n_tokens, bool media, bool startup_probe, bool force_large) {
@@ -2815,92 +2816,133 @@ int llama_context::ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bo
         kv_dsv4->ced_extract_tail_range(s, p_start, tail_h, tail_pre, tail_pos, tail_is_embd);
 
         const uint32_t n_tail = (uint32_t) tail_pos.size();
-        const uint32_t n_ub   = std::max<uint32_t>(1, ced_dec_n_ubatch > 0 ? ced_dec_n_ubatch : cparams.n_ubatch);
-        const uint32_t rem    = n_tail % n_ub;
+        uint32_t n_ub = std::max<uint32_t>(1, ced_dec_n_ubatch > 0 ? ced_dec_n_ubatch : cparams.n_ubatch);
 
         std::vector<llama_ubatch>        ubatches;
         std::vector<llama_dsv4_ced_plan> ced_plans;
-        for (uint32_t cbeg = 0; cbeg < n_tail; ) {
-            const uint32_t nc   = (cbeg == 0 && rem > 0) ? rem : std::min(n_ub, n_tail - cbeg);
-            const uint32_t cend = cbeg + nc;
 
-            llama_ubatch ub = {};
-            auto data = std::make_shared<llama_ubatch::data_t>();
-            data->pos.assign(tail_pos.begin() + cbeg, tail_pos.begin() + cend);
-            data->n_seq_id.assign(nc, 1);
-            data->seq_id_data.assign(nc, s);
-            data->seq_id.resize(nc);
-            for (uint32_t k = 0; k < nc; ++k) {
-                data->seq_id[k] = &data->seq_id_data[k];
+        // the chunks are pruned, each a graph of its own shape, and the allocator lays each out on its own: the layouts
+        // of the prompt workspace must hold them (the dec_ub of the reservation is measured on one unpruned shape; DS4.1
+        // at 176k cells: a 1536-row chunk needed 9.2 GB with 6.9 GB reserved). measured at the cells of the reservation,
+        // as the chunks are laid out below; a chunk that does not fit lowers the chunk size by 256 rows
+        const auto chunks_fit = [&]() -> bool {
+            if (!ubatch_res_valid || sched_workspace_small) {
+                return true;
             }
-            data->seq_id_unq = { s };
-            data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
-            data->seq_idx[s] = 0;
-            data->output.assign(nc, 0);
-            if (req.out_pos >= 0 && cend == n_tail && tail_pos.back() == req.out_pos) {
-                data->output[nc - 1] = 1;
-            }
-            data->batch_idxs.resize(nc);
-            for (uint32_t k = 0; k < nc; ++k) {
-                data->batch_idxs[k] = (int32_t) k;
-            }
-
-            ub.b_equal_seqs   = 1;
-            ub.n_tokens       = nc;
-            ub.n_seq_tokens   = nc;
-            ub.n_seqs         = 1;
-            ub.n_seqs_unq     = 1;
-            ub.n_pos          = 1;
-            ub.token          = nullptr;
-            ub.embd           = nullptr;
-            ub.embd_state     = nullptr;
-            ub.embd_row       = nullptr;
-            ub.pos            = data->pos.data();
-            ub.n_seq_id       = data->n_seq_id.data();
-            ub.seq_id         = data->seq_id.data();
-            ub.seq_id_unq     = data->seq_id_unq.data();
-            ub.seq_idx        = data->seq_idx.data();
-            ub.output         = data->output.data();
-            ub.type           = nullptr;
-            ub.decision_order = nullptr;
-            ub.data           = std::move(data);
-
-            llama_dsv4_ced_plan plan;
-            plan.mode = LLAMA_DSV4_CED_DEC_ONLY;
-            kv_dsv4->ced_map_chunk_bounds(tail_pos.data() + cbeg, nc, K_min, O_min, plan.k_start, plan.o_start);
-            plan.dec_h_enc    = tail_h.data()   + (size_t) cbeg * h_stride;
-            plan.dec_pre_prev = tail_pre.data() + (size_t) cbeg * hc;
-            plan.dec_is_embd  = tail_is_embd.data() + cbeg;
-
-            bool has_vl = false;
-            bool all_vl = true;
-            for (uint32_t k = 0; k < nc; ++k) {
-                if (tail_is_embd[cbeg + k] != 0) {
-                    has_vl = true;
-                } else {
-                    all_vl = false;
+            llama_memory_reserve_scope scope(ubatch_res_cells);
+            for (size_t u = 0; u < ubatches.size(); ++u) {
+                const auto & ub = ubatches[u];
+                const uint32_t n_out = (req.out_pos >= 0 && ub.output[ub.n_tokens - 1] != 0) ? 1 : 0;
+                const auto mctx_res = kv_dsv4->init_dec_only(s, { ub }, { ced_plans[u] });
+                std::vector<size_t> sizes(backend_ptrs.size(), 0);
+                if (!mctx_res || mctx_res->get_status() != LLAMA_MEMORY_STATUS_SUCCESS ||
+                        !graph_reserve(ub.n_tokens, 1, n_out, mctx_res.get(), true, sizes.data(), true)) {
+                    return false;
+                }
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+                    if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                            sizes[i] > ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i])) {
+                        return false;
+                    }
                 }
             }
-            plan.dec_has_vl = has_vl;
-            plan.dec_all_vl = all_vl;
+            return true;
+        };
 
-            if (want_li && li_pos_beg <= p_enc) {
-                const int32_t li_s = (int32_t) (std::lower_bound(tail_pos.data() + cbeg, tail_pos.data() + cend, li_pos_beg) - (tail_pos.data() + cbeg));
-                if (li_s < (int32_t) nc) {
-                    plan.li_start      = li_s;
-                    plan.li_dst_offset = req.li_row_base + (int64_t) (tail_pos[cbeg + li_s] - li_pos_beg);
+        while (true) {
+            ubatches.clear();
+            ced_plans.clear();
+            const uint32_t rem = n_tail % n_ub;
+            for (uint32_t cbeg = 0; cbeg < n_tail; ) {
+                const uint32_t nc   = (cbeg == 0 && rem > 0) ? rem : std::min(n_ub, n_tail - cbeg);
+                const uint32_t cend = cbeg + nc;
+
+                llama_ubatch ub = {};
+                auto data = std::make_shared<llama_ubatch::data_t>();
+                data->pos.assign(tail_pos.begin() + cbeg, tail_pos.begin() + cend);
+                data->n_seq_id.assign(nc, 1);
+                data->seq_id_data.assign(nc, s);
+                data->seq_id.resize(nc);
+                for (uint32_t k = 0; k < nc; ++k) {
+                    data->seq_id[k] = &data->seq_id_data[k];
+                }
+                data->seq_id_unq = { s };
+                data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
+                data->seq_idx[s] = 0;
+                data->output.assign(nc, 0);
+                if (req.out_pos >= 0 && cend == n_tail && tail_pos.back() == req.out_pos) {
+                    data->output[nc - 1] = 1;
+                }
+                data->batch_idxs.resize(nc);
+                for (uint32_t k = 0; k < nc; ++k) {
+                    data->batch_idxs[k] = (int32_t) k;
+                }
+
+                ub.b_equal_seqs   = 1;
+                ub.n_tokens       = nc;
+                ub.n_seq_tokens   = nc;
+                ub.n_seqs         = 1;
+                ub.n_seqs_unq     = 1;
+                ub.n_pos          = 1;
+                ub.token          = nullptr;
+                ub.embd           = nullptr;
+                ub.embd_state     = nullptr;
+                ub.embd_row       = nullptr;
+                ub.pos            = data->pos.data();
+                ub.n_seq_id       = data->n_seq_id.data();
+                ub.seq_id         = data->seq_id.data();
+                ub.seq_id_unq     = data->seq_id_unq.data();
+                ub.seq_idx        = data->seq_idx.data();
+                ub.output         = data->output.data();
+                ub.type           = nullptr;
+                ub.decision_order = nullptr;
+                ub.data           = std::move(data);
+
+                llama_dsv4_ced_plan plan;
+                plan.mode = LLAMA_DSV4_CED_DEC_ONLY;
+                kv_dsv4->ced_map_chunk_bounds(tail_pos.data() + cbeg, nc, K_min, O_min, plan.k_start, plan.o_start);
+                plan.dec_h_enc    = tail_h.data()   + (size_t) cbeg * h_stride;
+                plan.dec_pre_prev = tail_pre.data() + (size_t) cbeg * hc;
+                plan.dec_is_embd  = tail_is_embd.data() + cbeg;
+
+                bool has_vl = false;
+                bool all_vl = true;
+                for (uint32_t k = 0; k < nc; ++k) {
+                    if (tail_is_embd[cbeg + k] != 0) {
+                        has_vl = true;
+                    } else {
+                        all_vl = false;
+                    }
+                }
+                plan.dec_has_vl = has_vl;
+                plan.dec_all_vl = all_vl;
+
+                if (want_li && li_pos_beg <= p_enc) {
+                    const int32_t li_s = (int32_t) (std::lower_bound(tail_pos.data() + cbeg, tail_pos.data() + cend, li_pos_beg) - (tail_pos.data() + cbeg));
+                    if (li_s < (int32_t) nc) {
+                        plan.li_start      = li_s;
+                        plan.li_dst_offset = req.li_row_base + (int64_t) (tail_pos[cbeg + li_s] - li_pos_beg);
+                    } else {
+                        plan.li_start      = (int32_t) nc;
+                        plan.li_dst_offset = 0;
+                    }
                 } else {
                     plan.li_start      = (int32_t) nc;
                     plan.li_dst_offset = 0;
                 }
-            } else {
-                plan.li_start      = (int32_t) nc;
-                plan.li_dst_offset = 0;
-            }
 
-            ubatches.push_back(std::move(ub));
-            ced_plans.push_back(std::move(plan));
-            cbeg = cend;
+                ubatches.push_back(std::move(ub));
+                ced_plans.push_back(std::move(plan));
+                cbeg = cend;
+            }
+            if (n_ub <= 256 || chunks_fit()) {
+                break;
+            }
+            n_ub = std::max<uint32_t>(256, (n_ub - 1)/256*256);
+            ced_dec_n_ubatch = n_ub;
+            LLAMA_LOG_INFO("%s: CED: decoder chunks of %u rows (the workspace does not hold larger ones at %u cells)\n",
+                    __func__, n_ub, ubatch_res_cells);
         }
 
         auto mctx_dec = kv_dsv4->init_dec_only(s, std::move(ubatches), std::move(ced_plans));
@@ -2911,6 +2953,19 @@ int llama_context::ced_flush_decoder(const std::vector<ced_flush_req> & reqs, bo
         do {
             const auto & ub = mctx_dec->get_ubatch();
             n_outputs = (req.out_pos >= 0 && ub.output[ub.n_tokens - 1] != 0) ? 1 : 0;
+
+            // the chunk (pruned: a shape of its own) is laid out at the cells of the prompt reservation first, so that the
+            // allocator reuses that layout for it. otherwise it lays the new graph out at the current sizes, and that
+            // layout is not monotonic in them: DS4.1 at 176k cells, a 1536-row chunk took 8.7 GB with 6.9 GB reserved
+            if (ubatch_res_valid && !sched_workspace_small) {
+                const auto & plan = static_cast<const llama_kv_cache_dsv4_context *>(mctx_dec.get())->get_ced_plan();
+                llama_memory_reserve_scope scope(ubatch_res_cells);
+                const auto mctx_res = kv_dsv4->init_dec_only(s, { ub }, { plan });
+                if (!mctx_res || mctx_res->get_status() != LLAMA_MEMORY_STATUS_SUCCESS ||
+                        !graph_reserve(ub.n_tokens, 1, n_outputs, mctx_res.get(), false, nullptr, true)) {
+                    LLAMA_LOG_WARN("%s: CED: no layout of the decoder chunk at the reserved cells\n", __func__);
+                }
+            }
 
             ggml_status status;
             const auto * res = process_ubatch(ub, ctx_type_to_graph_type(cparams.ctx_type), mctx_dec.get(), status);
@@ -4988,9 +5043,10 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        bool no_outputs) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    GGML_ASSERT(n_outputs >= 1 || no_outputs);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs

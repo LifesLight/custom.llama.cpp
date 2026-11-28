@@ -1668,6 +1668,10 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_dec_only(
             max_nv = std::max(max_nv, nv);
         }
         plan.n_kv = std::min<int64_t>(kv_hca_size, std::max<int64_t>(GGML_PAD(max_nv, 256u), 256));
+        // a reservation for more cells (ubatch_auto): the rows visible after them, as dsv4_build_reserve_comp_plan
+        if (const uint32_t n_cells = llama_memory_reserve_n_cells(); n_cells > 0) {
+            plan.n_kv = std::min<int64_t>(kv_hca_size, std::max<int64_t>(plan.n_kv, GGML_PAD((n_cells + ratio_hca - 1)/ratio_hca, 256u)));
+        }
         ced_plans[u].mode = LLAMA_DSV4_CED_DEC_ONLY;
     }
 
